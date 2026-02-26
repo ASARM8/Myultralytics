@@ -23,10 +23,10 @@ CONFIG = {
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,              # 训练总轮数
-    "batch": 16,                # 批次大小（RTX 5090 32GB 显存，yolo11l + 1024 尝试 32，OOM 则降回 16）
+    "batch": -1,                # 批次大小（RTX 5090 32GB 显存，yolo11l + 1024 尝试 32，OOM 则降回 16）
     "imgsz": 1024,              # 输入图片尺寸
     "device": 0,                # GPU 设备编号
-    "workers": 8,               # 数据加载线程数（5090 性能强，可用更多线程）
+    "workers": 16,               # 数据加载线程数（5090 性能强，可用更多线程）
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
@@ -48,9 +48,9 @@ CONFIG = {
     "lrf": 0.01,                # 最终学习率 = lr0 * lrf
     "momentum": 0.937,          # Adam beta1
     "weight_decay": 0.0005,     # 权重衰减（L2 正则化）
-    "warmup_epochs": 5.0,       # 预热轮数（从零训练建议更长的预热）
+    "warmup_epochs": 10.0,       # 预热轮数（从零训练建议更长的预热）
     "cos_lr": True,             # 余弦退火学习率调度（平滑降低学习率，提升收敛质量）
-    "patience": 100,            # 早停：连续 N 个 epoch 验证指标不提升则停止
+    "patience":20,            # 早停：连续 N 个 epoch 验证指标不提升则停止
     "close_mosaic": 15,         # 最后 15 个 epoch 关闭 mosaic（让模型更好适应真实图片）
 
     # ---------- 数据增强配置 ----------
