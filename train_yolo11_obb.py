@@ -5,6 +5,9 @@ YOLOv11-OBB 自定义数据集训练脚本
     修改下方 CONFIG 字典中的参数即可自定义训练配置
 """
 
+import os
+os.environ["OMP_NUM_THREADS"] = "8"  # 修复 libgomp 警告
+
 from ultralytics import YOLO
 
 # ========================== 训练配置 ==========================
@@ -16,7 +19,7 @@ CONFIG = {
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
-    "data": "root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,              # 训练总轮数
@@ -26,7 +29,7 @@ CONFIG = {
     "workers": 8,               # 数据加载线程数（5090 性能强，可用更多线程）
 
     # ---------- 输出目录配置 ----------
-    "project": "root/autodl-tmp//work-dirs/",                  # 输出主目录
+    "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
     "name": "yolo11_obb",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
