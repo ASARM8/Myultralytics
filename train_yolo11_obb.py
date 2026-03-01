@@ -15,7 +15,8 @@ CONFIG = {
     # ---------- 模型配置 ----------
     # 使用 .yaml 文件从零开始训练（不使用预训练权重）
     # 可选规模: yolo11n-obb.yaml / yolo11s-obb.yaml / yolo11m-obb.yaml / yolo11l-obb.yaml / yolo11x-obb.yaml
-    "model": "yolo11l-obb.yaml",
+    #"model": "yolo11l-obb.yaml",
+    "model": "/root/autodl-tmp/work-dirs/yolo11_obb2/weights/last.pt",
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
@@ -38,7 +39,7 @@ CONFIG = {
     "save_period": 50,          # 每隔 N 个 epoch 额外保存一次权重（-1 表示不额外保存）
 
     # ---------- 验证与可视化 ----------
-    "val": False,                # 训练过程中进行验证
+    "val": True,                # 训练过程中进行验证
     "plots": True,              # 保存训练曲线图（loss、mAP 等）
 
     # ---------- 训练策略 ----------
@@ -68,7 +69,7 @@ CONFIG = {
     # ---------- 其他 ----------
     "amp": False,               # 排雷期关闭混合精度，使用 Float32 排除数值不稳定（验证通过后可改回 True）
     "cache": True,              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
-    "resume": False,            # 是否从上次中断处恢复训练
+    "resume": True,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
     "verbose": True,            # 输出详细日志
 
