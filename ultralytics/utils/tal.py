@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 
 from . import LOGGER
-from .metrics import bbox_iou, probiou
+from .metrics import bbox_iou, nwd_obb, probiou
 from .ops import xywh2xyxy, xywhr2xyxyxyxy, xyxy2xywh
 from .torch_utils import TORCH_1_11
 
@@ -358,9 +358,28 @@ class TaskAlignedAssigner(nn.Module):
 class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     """Assigns ground-truth objects to rotated bounding boxes using a task-aligned metric."""
 
+    # ===== D-OBB + NWD 配置参数 =====
+    # epsilon: 退化宽度（像素），控制高斯概率云在垂直于电线方向上的宽度
+    # C: NWD 指数衰减常量（像素），控制 Wasserstein 距离映射到 [0,1] 的灵敏度
+    # 两个参数均在像素坐标系下工作（assigner 中的 bbox 已乘以 stride）
+    DOBB_EPSILON = 11.0  # 退化宽度（像素）
+    NWD_C = 12.8         # NWD 衰减常量（像素）
+
     def iou_calculation(self, gt_bboxes, pd_bboxes):
-        """Calculate IoU for rotated bounding boxes."""
-        return probiou(gt_bboxes, pd_bboxes).squeeze(-1).clamp_(0)
+        """使用 NWD 替代 ProbIoU 计算旋转框相似度（D-OBB 退化宽度注入）。
+
+        在计算度量前，将预测框和真实框的宽度通道强制覆写为固定的退化宽度 epsilon，
+        将 2D 旋转框降维为 1D 骨架表示，然后使用归一化 Wasserstein 距离 (NWD)
+        代替 ProbIoU 作为正样本分配的依据。
+
+        注意：在克隆的张量上操作，不修改原始张量以保持梯度流。
+        """
+        # D-OBB 退化：克隆张量，强制将宽度通道 (索引 2) 覆写为 epsilon
+        gt_mod = gt_bboxes.clone()
+        pd_mod = pd_bboxes.clone()
+        gt_mod[..., 2] = self.DOBB_EPSILON
+        pd_mod[..., 2] = self.DOBB_EPSILON
+        return nwd_obb(gt_mod, pd_mod, C=self.NWD_C).clamp_(0)
 
     def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt):
         """Select the positive anchor center in gt for rotated bounding boxes.

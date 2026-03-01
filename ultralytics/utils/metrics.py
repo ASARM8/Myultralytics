@@ -289,6 +289,76 @@ def batch_probiou(obb1: torch.Tensor | np.ndarray, obb2: torch.Tensor | np.ndarr
     return 1 - hd
 
 
+def nwd_obb(obb1: torch.Tensor, obb2: torch.Tensor, C: float = 12.8, eps: float = 1e-6) -> torch.Tensor:
+    """计算旋转框的归一化 Wasserstein 距离 (NWD)。
+
+    使用高斯模型将 OBB 表示为 2D 高斯分布，利用 2×2 矩阵的闭式解
+    计算 Wasserstein 距离，避免矩阵求根的数值不稳定问题。
+
+    与 ProbIoU 的 _get_covariance_matrix（使用 w²/12 均匀分布近似）不同，
+    NWD 使用 (w/2)² 和 (h/2)² 作为协方差矩阵的特征值，
+    对应 Σ = R(θ) · diag((w/2)², (h/2)²) · R(θ)ᵀ。
+
+    W₂² 闭式解（2×2 正定矩阵）:
+        W₂² = ||μ₁ - μ₂||² + Tr(Σ₁) + Tr(Σ₂) - 2·√(Tr(Σ₁Σ₂) + 2·√(det(Σ₁)·det(Σ₂)))
+
+    Args:
+        obb1 (torch.Tensor): 第一组 OBB, 形状 (..., 5), 格式 [x, y, w, h, θ]。
+        obb2 (torch.Tensor): 第二组 OBB, 形状 (..., 5), 格式 [x, y, w, h, θ]。
+        C (float): NWD 指数衰减常量（应与坐标尺度一致，像素坐标系下默认 12.8）。
+        eps (float): 数值稳定性保护值。
+
+    Returns:
+        (torch.Tensor): NWD 相似度, 形状 (...,), 值域 [0, 1]。
+    """
+    # 1. 提取中心点作为均值 μ
+    x1, y1 = obb1[..., :2].split(1, dim=-1)
+    x2, y2 = obb2[..., :2].split(1, dim=-1)
+
+    # 2. 构建协方差矩阵 Σ = R(θ)·diag((w/2)², (h/2)²)·R(θ)ᵀ
+    #    矩阵元素: [[a, c], [c, b]]
+    def _nwd_cov(boxes):
+        """从 OBB 构建 NWD 协方差矩阵（使用 /4 而非 ProbIoU 的 /12）。"""
+        wh_sq = boxes[..., 2:4].pow(2) / 4.0  # (w/2)², (h/2)²
+        theta = boxes[..., 4:5]
+        cos = theta.cos()
+        sin = theta.sin()
+        cos2 = cos.pow(2)
+        sin2 = sin.pow(2)
+        a = wh_sq[..., 0:1] * cos2 + wh_sq[..., 1:2] * sin2  # Σ₁₁
+        b = wh_sq[..., 0:1] * sin2 + wh_sq[..., 1:2] * cos2  # Σ₂₂
+        c = (wh_sq[..., 0:1] - wh_sq[..., 1:2]) * cos * sin   # Σ₁₂
+        return a, b, c
+
+    a1, b1, c1 = _nwd_cov(obb1)
+    a2, b2, c2 = _nwd_cov(obb2)
+
+    # 3. 中心点距离 ||μ₁ - μ₂||²
+    center_dist_sq = (x1 - x2).pow(2) + (y1 - y2).pow(2)
+
+    # 4. Tr(Σ₁) + Tr(Σ₂)
+    trace_sum = (a1 + b1) + (a2 + b2)
+
+    # 5. W₂² 闭式解中的矩阵平方根项
+    #    Tr(Σ₁Σ₂) = a₁a₂ + b₁b₂ + 2c₁c₂
+    trace_prod = a1 * a2 + b1 * b2 + 2 * c1 * c2
+    #    det(Σ) = a·b - c²
+    det1 = (a1 * b1 - c1.pow(2)).clamp(min=0)
+    det2 = (a2 * b2 - c2.pow(2)).clamp(min=0)
+    det_prod_sqrt = (det1 * det2).clamp(min=0).sqrt()
+    #    √(Tr(Σ₁Σ₂) + 2·√(det(Σ₁)·det(Σ₂)))
+    sqrt_term = (trace_prod + 2 * det_prod_sqrt + eps).clamp(min=0).sqrt()
+
+    # 6. W₂² = ||μ₁ - μ₂||² + Tr(Σ₁) + Tr(Σ₂) - 2·sqrt_term
+    w2_sq = (center_dist_sq + trace_sum - 2 * sqrt_term).clamp(min=0)
+
+    # 7. NWD = exp(-√W₂² / C)
+    w2 = w2_sq.sqrt()
+    nwd = torch.exp(-w2 / (C + eps))
+
+    return nwd.squeeze(-1)
+
+
 def smooth_bce(eps: float = 0.1) -> tuple[float, float]:
     """Compute smoothed positive and negative Binary Cross-Entropy targets.
 
