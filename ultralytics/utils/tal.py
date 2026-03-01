@@ -368,29 +368,33 @@ class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     NWD_TAU = 0.5        # NWD 融合权重
 
     def iou_calculation(self, gt_bboxes, pd_bboxes):
-        """使用 ProbIoU + τ·NWD 混合度量计算旋转框相似度。
-
-        修复 1 (下限截断): 不再强制将宽度覆写为 epsilon，改为 clamp(min=epsilon)。
-            - 正常框 (w=30px) → 保留 30px，维持真实几何形状
-            - 极细框 (w=2px) → 托底到 11px，消除矩阵奇异性
-
-        修复 2 (度量融合): ProbIoU 主导回归信号 + NWD 保底辅助。
-            - 常规目标: ProbIoU 正常工作，主导梯度
-            - 极细/极长目标: ProbIoU 因奇异性掉到 0，NWD 提供平滑软梯度，
-              将本会被判为负样本的框"捞回"为正样本
+        """
+        使用带门控机制的 ProbIoU & NWD 混合度量。
+        杜绝 NWD 的高斯长尾效应引发的正样本泛滥 (NMS 卡死元凶)。
         """
         # 1. 原始 ProbIoU 计算（保持不变）
         probiou_score = probiou(gt_bboxes, pd_bboxes).squeeze(-1).clamp_(0)
 
-        # 2. NWD 计算：使用 clamp 下限截断宽度（而非强制覆写）
+        # 2. NWD 计算：使用 clamp 下限截断宽度防 NaN
         gt_mod = gt_bboxes.clone()
         pd_mod = pd_bboxes.clone()
         gt_mod[..., 2] = gt_mod[..., 2].clamp(min=self.DOBB_EPSILON)
         pd_mod[..., 2] = pd_mod[..., 2].clamp(min=self.DOBB_EPSILON)
         nwd_score = nwd_obb(gt_mod, pd_mod, C=self.NWD_C).clamp_(0)
 
-        # 3. 混合度量: Metric = ProbIoU + τ · NWD
-        return (probiou_score + self.NWD_TAU * nwd_score).clamp_(0)
+        # 3. 致命修复：门控条件融合 (Gated Fusion)
+        # 设定严苛的"复活"条件：
+        # 条件 A: ProbIoU 几乎失效 (比如小于 0.2，说明发生了极窄奇异性或轻微偏离)
+        # 条件 B: NWD 非常确信它们在拓扑上是贴合的 (比如大于 0.6，排除远处的垃圾框)
+        rescue_mask = (probiou_score < 0.2) & (nwd_score > 0.6)
+
+        # 核心逻辑：以 ProbIoU 为绝对主导。
+        # 只有满足 rescue_mask 的极少数框，才允许使用 (NWD * τ) 进行分数抢救。
+        # 其他的纯背景垃圾框，严格保持 ProbIoU 的 0 分，直接绝杀！
+        metric = torch.where(rescue_mask, nwd_score * self.NWD_TAU, probiou_score)
+
+        return metric
+
 
     def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt):
         """Select the positive anchor center in gt for rotated bounding boxes.
