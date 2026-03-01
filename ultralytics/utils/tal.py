@@ -359,27 +359,38 @@ class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     """Assigns ground-truth objects to rotated bounding boxes using a task-aligned metric."""
 
     # ===== D-OBB + NWD 配置参数 =====
-    # epsilon: 退化宽度（像素），控制高斯概率云在垂直于电线方向上的宽度
+    # epsilon: 宽度下限阈值（像素），防止极细目标导致协方差矩阵奇异
     # C: NWD 指数衰减常量（像素），控制 Wasserstein 距离映射到 [0,1] 的灵敏度
-    # 两个参数均在像素坐标系下工作（assigner 中的 bbox 已乘以 stride）
-    DOBB_EPSILON = 11.0  # 退化宽度（像素）
+    # tau: NWD 融合权重，控制 NWD 在混合度量中的贡献比例
+    # 所有参数均在像素坐标系下工作（assigner 中的 bbox 已乘以 stride）
+    DOBB_EPSILON = 11.0  # 宽度下限（像素）
     NWD_C = 12.8         # NWD 衰减常量（像素）
+    NWD_TAU = 0.5        # NWD 融合权重
 
     def iou_calculation(self, gt_bboxes, pd_bboxes):
-        """使用 NWD 替代 ProbIoU 计算旋转框相似度（D-OBB 退化宽度注入）。
+        """使用 ProbIoU + τ·NWD 混合度量计算旋转框相似度。
 
-        在计算度量前，将预测框和真实框的宽度通道强制覆写为固定的退化宽度 epsilon，
-        将 2D 旋转框降维为 1D 骨架表示，然后使用归一化 Wasserstein 距离 (NWD)
-        代替 ProbIoU 作为正样本分配的依据。
+        修复 1 (下限截断): 不再强制将宽度覆写为 epsilon，改为 clamp(min=epsilon)。
+            - 正常框 (w=30px) → 保留 30px，维持真实几何形状
+            - 极细框 (w=2px) → 托底到 11px，消除矩阵奇异性
 
-        注意：在克隆的张量上操作，不修改原始张量以保持梯度流。
+        修复 2 (度量融合): ProbIoU 主导回归信号 + NWD 保底辅助。
+            - 常规目标: ProbIoU 正常工作，主导梯度
+            - 极细/极长目标: ProbIoU 因奇异性掉到 0，NWD 提供平滑软梯度，
+              将本会被判为负样本的框"捞回"为正样本
         """
-        # D-OBB 退化：克隆张量，强制将宽度通道 (索引 2) 覆写为 epsilon
+        # 1. 原始 ProbIoU 计算（保持不变）
+        probiou_score = probiou(gt_bboxes, pd_bboxes).squeeze(-1).clamp_(0)
+
+        # 2. NWD 计算：使用 clamp 下限截断宽度（而非强制覆写）
         gt_mod = gt_bboxes.clone()
         pd_mod = pd_bboxes.clone()
-        gt_mod[..., 2] = self.DOBB_EPSILON
-        pd_mod[..., 2] = self.DOBB_EPSILON
-        return nwd_obb(gt_mod, pd_mod, C=self.NWD_C).clamp_(0)
+        gt_mod[..., 2] = gt_mod[..., 2].clamp(min=self.DOBB_EPSILON)
+        pd_mod[..., 2] = pd_mod[..., 2].clamp(min=self.DOBB_EPSILON)
+        nwd_score = nwd_obb(gt_mod, pd_mod, C=self.NWD_C).clamp_(0)
+
+        # 3. 混合度量: Metric = ProbIoU + τ · NWD
+        return (probiou_score + self.NWD_TAU * nwd_score).clamp_(0)
 
     def select_candidates_in_gts(self, xy_centers, gt_bboxes, mask_gt):
         """Select the positive anchor center in gt for rotated bounding boxes.

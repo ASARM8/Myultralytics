@@ -66,7 +66,7 @@ CONFIG = {
     "mixup": 0.0,               # MixUp 增强概率
 
     # ---------- 其他 ----------
-    "amp": True,                # 自动混合精度训练（FP16 加速，5090 原生支持）
+    "amp": False,               # 排雷期关闭混合精度，使用 Float32 排除数值不稳定（验证通过后可改回 True）
     "cache": True,              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
     "resume": False,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
