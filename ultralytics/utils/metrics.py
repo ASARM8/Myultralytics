@@ -237,7 +237,7 @@ def probiou(obb1: torch.Tensor, obb2: torch.Tensor, CIoU: bool = False, eps: flo
     t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
     t3 = (
         ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
-        / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)
+        / (4 * (((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)) + eps).sqrt() + eps)
         + eps
     ).log() * 0.5
     bd = (t1 + t2 + t3).clamp(eps, 100.0)
@@ -281,7 +281,7 @@ def batch_probiou(obb1: torch.Tensor | np.ndarray, obb2: torch.Tensor | np.ndarr
     t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
     t3 = (
         ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
-        / (4 * ((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)).sqrt() + eps)
+        / (4 * (((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)) + eps).sqrt() + eps)
         + eps
     ).log() * 0.5
     bd = (t1 + t2 + t3).clamp(eps, 100.0)
@@ -320,6 +320,7 @@ def nwd_obb(obb1: torch.Tensor, obb2: torch.Tensor, C: float = 12.8, eps: float 
     def _nwd_cov(boxes):
         """从 OBB 构建 NWD 协方差矩阵（使用 /4 而非 ProbIoU 的 /12）。"""
         wh_sq = boxes[..., 2:4].pow(2) / 4.0  # (w/2)², (h/2)²
+        wh_sq = wh_sq + 1e-3  # Tikhonov regularization (防病态矩阵死锁)
         theta = boxes[..., 4:5]
         cos = theta.cos()
         sin = theta.sin()
@@ -342,18 +343,20 @@ def nwd_obb(obb1: torch.Tensor, obb2: torch.Tensor, C: float = 12.8, eps: float 
     # 5. W₂² 闭式解中的矩阵平方根项
     #    Tr(Σ₁Σ₂) = a₁a₂ + b₁b₂ + 2c₁c₂
     trace_prod = a1 * a2 + b1 * b2 + 2 * c1 * c2
-    #    det(Σ) = a·b - c²
-    det1 = (a1 * b1 - c1.pow(2)).clamp(min=0)
-    det2 = (a2 * b2 - c2.pow(2)).clamp(min=0)
-    det_prod_sqrt = (det1 * det2).clamp(min=0).sqrt()
+    #    det(Σ) 闭式解：利用旋转不变性 det(R·D·Rᵀ) = det(D)
+    #    det(Σ) = (w/2)² · (h/2)² = (wh/4)²
+    #    彻底避免 a·b - c² 的灾难性抵消 (Catastrophic Cancellation)
+    det1 = (obb1[..., 2:3] * obb1[..., 3:4] / 4.0).pow(2)
+    det2 = (obb2[..., 2:3] * obb2[..., 3:4] / 4.0).pow(2)
+    det_prod_sqrt = (det1 * det2 + eps).sqrt()
     #    √(Tr(Σ₁Σ₂) + 2·√(det(Σ₁)·det(Σ₂)))
-    sqrt_term = (trace_prod + 2 * det_prod_sqrt + eps).clamp(min=0).sqrt()
+    sqrt_term = ((trace_prod + 2 * det_prod_sqrt + eps).clamp(min=0) + eps).sqrt()
 
     # 6. W₂² = ||μ₁ - μ₂||² + Tr(Σ₁) + Tr(Σ₂) - 2·sqrt_term
     w2_sq = (center_dist_sq + trace_sum - 2 * sqrt_term).clamp(min=0)
 
     # 7. NWD = exp(-√W₂² / C)
-    w2 = w2_sq.sqrt()
+    w2 = (w2_sq + eps).sqrt()
     nwd = torch.exp(-w2 / (C + eps))
 
     return nwd.squeeze(-1)

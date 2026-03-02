@@ -68,7 +68,7 @@ CONFIG = {
 
     # ---------- 其他 ----------
     "amp": False,               # 排雷期关闭混合精度，使用 Float32 排除数值不稳定（验证通过后可改回 True）
-    "cache": True,              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
+    "cache": 'disk',              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
     "resume": True,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
     "verbose": True,            # 输出详细日志

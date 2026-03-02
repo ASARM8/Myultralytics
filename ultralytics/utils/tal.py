@@ -373,14 +373,10 @@ class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
         杜绝 NWD 的高斯长尾效应引发的正样本泛滥 (NMS 卡死元凶)。
         """
         # 1. 原始 ProbIoU 计算（保持不变）
-        probiou_score = probiou(gt_bboxes, pd_bboxes).squeeze(-1).clamp_(0)
+        probiou_score = probiou(gt_bboxes, pd_bboxes).squeeze(-1).clamp(min=0)
 
-        # 2. NWD 计算：使用 clamp 下限截断宽度防 NaN
-        gt_mod = gt_bboxes.clone()
-        pd_mod = pd_bboxes.clone()
-        gt_mod[..., 2] = gt_mod[..., 2].clamp(min=self.DOBB_EPSILON)
-        pd_mod[..., 2] = pd_mod[..., 2].clamp(min=self.DOBB_EPSILON)
-        nwd_score = nwd_obb(gt_mod, pd_mod, C=self.NWD_C).clamp_(0)
+        # 2. NWD 计算
+        nwd_score = nwd_obb(gt_bboxes, pd_bboxes, C=self.NWD_C).clamp(min=0)
 
         # 3. 致命修复：门控条件融合 (Gated Fusion)
         # 设定严苛的"复活"条件：
