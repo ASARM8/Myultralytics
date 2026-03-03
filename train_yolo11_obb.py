@@ -45,13 +45,13 @@ CONFIG = {
     # ---------- 训练策略 ----------
     "pretrained": False,        # 不使用预训练权重（从零训练）
     "optimizer": "AdamW",       # AdamW 优化器（从零训练时收敛更稳定）
-    "lr0": 0.0001,               # 初始学习率（AdamW 推荐 1e-3）
+    "lr0": 3e-4,               # 初始学习率（AdamW 推荐 1e-3）
     "lrf": 0.1,                # 最终学习率 = lr0 * lrf
     "momentum": 0.937,          # Adam beta1
     "weight_decay": 0.0005,     # 权重衰减（L2 正则化）
     "warmup_epochs": 0,       # 预热轮数（从零训练建议更长的预热）
     "cos_lr": True,             # 余弦退火学习率调度（平滑降低学习率，提升收敛质量）
-    "patience":15,            # 早停：连续 N 个 epoch 验证指标不提升则停止
+    # "patience":15,            # 早停：连续 N 个 epoch 验证指标不提升则停止
     "close_mosaic": 10,         # 最后 15 个 epoch 关闭 mosaic（让模型更好适应真实图片）
 
     # ---------- 数据增强配置 ----------

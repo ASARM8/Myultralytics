@@ -17,6 +17,22 @@ from .metrics import bbox_iou, probiou
 from .tal import bbox2dist, rbox2dist
 
 
+def _long_axis_repr_xywhr(rboxes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """将 xywhr 旋转框转换为长轴表示（长边长度、长轴方向角）。"""
+    w = rboxes[..., 2]
+    h = rboxes[..., 3]
+    theta = rboxes[..., 4]
+    w_is_long = w >= h
+    long_len = torch.where(w_is_long, w, h)
+    theta_long = theta + torch.where(w_is_long, torch.zeros_like(theta), torch.full_like(theta, torch.pi / 2))
+    return long_len, theta_long
+
+
+def _periodic_angle_diff_pi(theta1: torch.Tensor, theta2: torch.Tensor) -> torch.Tensor:
+    """计算以 pi 为周期的最小角差，输出范围 [-pi/2, pi/2)。"""
+    return torch.remainder(theta1 - theta2 + torch.pi / 2, torch.pi) - torch.pi / 2
+
+
 class VarifocalLoss(nn.Module):
     """Varifocal loss by Zhang et al.
 
@@ -210,7 +226,9 @@ class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
 
     IOU_BRANCH_WEIGHT = 1.0
-    LENGTH_BRANCH_WEIGHT = 2.0
+    LENGTH_BRANCH_WEIGHT = 3.0
+    LENGTH_UNDER_WEIGHT = 3.0
+    LENGTH_OVER_WEIGHT = 1.0
     LENGTH_EPS = 1e-6
 
     def __init__(self, reg_max: int):
@@ -238,10 +256,14 @@ class RotatedBboxLoss(BboxLoss):
         iou = probiou(pred_fg, target_fg)
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
-        pred_long = torch.maximum(pred_fg[:, 2], pred_fg[:, 3])
-        target_long = torch.maximum(target_fg[:, 2], target_fg[:, 3]).clamp(min=self.LENGTH_EPS)
-        length_ratio = pred_long / target_long
-        loss_length = (length_ratio - 1.0).abs().unsqueeze(-1)
+        pred_long, _ = _long_axis_repr_xywhr(pred_fg)
+        target_long, _ = _long_axis_repr_xywhr(target_fg)
+        target_long = target_long.clamp(min=self.LENGTH_EPS)
+
+        length_ratio = (pred_long / target_long).clamp(min=self.LENGTH_EPS)
+        under_error = F.relu(1.0 - length_ratio)
+        over_error = F.relu(length_ratio - 1.0)
+        loss_length = (self.LENGTH_UNDER_WEIGHT * under_error + self.LENGTH_OVER_WEIGHT * over_error).unsqueeze(-1)
         loss_length = (loss_length * weight).sum() / target_scores_sum
         loss_box = self.IOU_BRANCH_WEIGHT * loss_iou + self.LENGTH_BRANCH_WEIGHT * loss_length
 
@@ -1121,7 +1143,9 @@ class v8OBBLoss(v8DetectionLoss):
         Returns:
             (torch.Tensor): The calculated angle loss.
         """
-        delta_theta = pred_bboxes[..., 4] - target_bboxes[..., 4]
+        _, pred_theta_long = _long_axis_repr_xywhr(pred_bboxes)
+        _, target_theta_long = _long_axis_repr_xywhr(target_bboxes)
+        delta_theta = _periodic_angle_diff_pi(pred_theta_long, target_theta_long)
         ang_loss = 1.0 - torch.cos(2.0 * delta_theta)
         ang_loss = ang_loss[fg_mask] * weight
         return self.ANGLE_BRANCH_WEIGHT * ang_loss.sum() / target_scores_sum
