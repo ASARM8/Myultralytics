@@ -66,6 +66,7 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
+    StripPooling,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -1606,6 +1607,7 @@ def parse_model(d, ch, verbose=True):
             RepC3,
             PSA,
             SCDown,
+            StripPooling,
             C2fCIB,
             A2C2f,
         }

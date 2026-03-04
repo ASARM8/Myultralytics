@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 import torch
@@ -225,12 +226,6 @@ class RLELoss(nn.Module):
 class RotatedBboxLoss(BboxLoss):
     """Criterion class for computing training losses for rotated bounding boxes."""
 
-    IOU_BRANCH_WEIGHT = 1.0
-    LENGTH_BRANCH_WEIGHT = 3.0
-    LENGTH_UNDER_WEIGHT = 3.0
-    LENGTH_OVER_WEIGHT = 1.0
-    LENGTH_EPS = 1e-6
-
     def __init__(self, reg_max: int):
         """Initialize the RotatedBboxLoss module with regularization maximum and DFL settings."""
         super().__init__(reg_max)
@@ -247,25 +242,10 @@ class RotatedBboxLoss(BboxLoss):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """计算旋转框解耦几何损失（ProbIoU + 相对长度惩罚）与 DFL 损失。"""
+        """Compute IoU and DFL losses for rotated bounding boxes."""
         weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-
-        pred_fg = pred_bboxes[fg_mask]
-        target_fg = target_bboxes[fg_mask]
-
-        iou = probiou(pred_fg, target_fg)
+        iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
         loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
-
-        pred_long, _ = _long_axis_repr_xywhr(pred_fg)
-        target_long, _ = _long_axis_repr_xywhr(target_fg)
-        target_long = target_long.clamp(min=self.LENGTH_EPS)
-
-        length_ratio = (pred_long / target_long).clamp(min=self.LENGTH_EPS)
-        under_error = F.relu(1.0 - length_ratio)
-        over_error = F.relu(length_ratio - 1.0)
-        loss_length = (self.LENGTH_UNDER_WEIGHT * under_error + self.LENGTH_OVER_WEIGHT * over_error).unsqueeze(-1)
-        loss_length = (loss_length * weight).sum() / target_scores_sum
-        loss_box = self.IOU_BRANCH_WEIGHT * loss_iou + self.LENGTH_BRANCH_WEIGHT * loss_length
 
         # DFL loss
         if self.dfl_loss:
@@ -287,7 +267,7 @@ class RotatedBboxLoss(BboxLoss):
             )
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
-        return loss_box, loss_dfl
+        return loss_iou, loss_dfl
 
 
 class MultiChannelDiceLoss(nn.Module):
@@ -999,8 +979,6 @@ class v8ClassificationLoss:
 class v8OBBLoss(v8DetectionLoss):
     """Calculates losses for object detection, classification, and box distribution in rotated YOLO models."""
 
-    ANGLE_BRANCH_WEIGHT = 1.5
-
     def __init__(self, model, tal_topk=10, tal_topk2: int | None = None):
         """Initialize v8OBBLoss with model, assigner, and rotated bbox loss; model must be de-paralleled."""
         super().__init__(model, tal_topk=tal_topk)
@@ -1130,8 +1108,8 @@ class v8OBBLoss(v8DetectionLoss):
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
 
-    def calculate_angle_loss(self, pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum):
-        """计算旋转框的周期角度损失。
+    def calculate_angle_loss(self, pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, lambda_val=3):
+        """Calculate oriented angle loss.
 
         Args:
             pred_bboxes (torch.Tensor): Predicted bounding boxes with shape [N, 5] (x, y, w, h, theta).
@@ -1139,16 +1117,27 @@ class v8OBBLoss(v8DetectionLoss):
             fg_mask (torch.Tensor): Foreground mask indicating valid predictions.
             weight (torch.Tensor): Loss weights for each prediction.
             target_scores_sum (torch.Tensor): Sum of target scores for normalization.
+            lambda_val (int): Controls the sensitivity to aspect ratio.
 
         Returns:
             (torch.Tensor): The calculated angle loss.
         """
-        _, pred_theta_long = _long_axis_repr_xywhr(pred_bboxes)
-        _, target_theta_long = _long_axis_repr_xywhr(target_bboxes)
-        delta_theta = _periodic_angle_diff_pi(pred_theta_long, target_theta_long)
-        ang_loss = 1.0 - torch.cos(2.0 * delta_theta)
-        ang_loss = ang_loss[fg_mask] * weight
-        return self.ANGLE_BRANCH_WEIGHT * ang_loss.sum() / target_scores_sum
+        w_gt = target_bboxes[..., 2]
+        h_gt = target_bboxes[..., 3]
+        pred_theta = pred_bboxes[..., 4]
+        target_theta = target_bboxes[..., 4]
+
+        log_ar = torch.log((w_gt + 1e-9) / (h_gt + 1e-9))
+        scale_weight = torch.exp(-(log_ar**2) / (lambda_val**2))
+
+        delta_theta = pred_theta - target_theta
+        delta_theta_wrapped = delta_theta - torch.round(delta_theta / math.pi) * math.pi
+        ang_loss = torch.sin(2 * delta_theta_wrapped[fg_mask]) ** 2
+
+        ang_loss = scale_weight[fg_mask] * ang_loss
+        ang_loss = ang_loss * weight
+
+        return ang_loss.sum() / target_scores_sum
 
 
 class E2EDetectLoss:

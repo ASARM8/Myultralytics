@@ -51,6 +51,7 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "StripPooling",
     "TorchVision",
 )
 
@@ -235,6 +236,60 @@ class SPPF(nn.Module):
         y.extend(self.m(y[-1]) for _ in range(getattr(self, "n", 3)))
         y = self.cv2(torch.cat(y, 1))
         return y + x if getattr(self, "add", False) else y
+
+
+class StripPooling(nn.Module):
+    """条状池化注意力模块 (Strip Pooling Attention Module)。
+
+    通过水平和垂直方向的条状平均池化建立长程空间连接，生成注意力权重图，
+    用于强化水平/垂直方向的线状特征（如电线、铁塔边缘）。
+
+    融合卷积采用零初始化策略，使得训练初期 Sigmoid(0)=0.5，
+    模块对原网络仅产生温和的缩放作用，保证权重迁移时的平稳过渡。
+
+    Args:
+        c1 (int): 输入通道数。
+        c2 (int): 输出通道数（应等于 c1，注意力模块不改变通道数）。
+    """
+
+    def __init__(self, c1: int, c2: int):
+        """初始化条状池化注意力模块。"""
+        super().__init__()
+        c_ = max(c1 // 4, 32)  # 中间层通道数（降低计算量）
+        # 水平分支：沿宽度方向池化 → 1×1 卷积降维
+        self.h_conv = nn.Sequential(
+            nn.Conv2d(c1, c_, 1, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU(inplace=True),
+        )
+        # 垂直分支：沿高度方向池化 → 1×1 卷积降维
+        self.v_conv = nn.Sequential(
+            nn.Conv2d(c1, c_, 1, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU(inplace=True),
+        )
+        # 融合卷积：将水平+垂直特征映射回原始通道数，生成注意力图
+        self.fuse = nn.Sequential(
+            nn.Conv2d(c_, c1, 1, bias=False),
+            nn.BatchNorm2d(c1),
+        )
+        # 零初始化融合卷积权重，确保训练初期 attn ≈ sigmoid(0) = 0.5
+        nn.init.zeros_(self.fuse[0].weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """前向传播：水平/垂直条状池化 → 特征融合 → Sigmoid 注意力 → 残差加权。"""
+        _, _, h, w = x.shape
+        # 水平分支：C×H×W → C×H×1 → C_×H×1 → 双线性插值回 C_×H×W
+        x_h = F.adaptive_avg_pool2d(x, (h, 1))
+        x_h = self.h_conv(x_h)
+        x_h = F.interpolate(x_h, size=(h, w), mode="bilinear", align_corners=False)
+        # 垂直分支：C×H×W → C×1×W → C_×1×W → 双线性插值回 C_×H×W
+        x_v = F.adaptive_avg_pool2d(x, (1, w))
+        x_v = self.v_conv(x_v)
+        x_v = F.interpolate(x_v, size=(h, w), mode="bilinear", align_corners=False)
+        # 融合 → Sigmoid 注意力 → 逐像素加权
+        attn = torch.sigmoid(self.fuse(x_h + x_v))
+        return x * attn
 
 
 class C1(nn.Module):
