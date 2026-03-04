@@ -26,14 +26,19 @@ from ultralytics.utils.torch_utils import intersect_dicts
 # 匹配 ANSI 转义序列（如颜色代码、光标清除命令等）
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 # 匹配类似 "1/150      30.4G     2.124" 这种含有进度更新特征的行
-# 或者是带有 tqdm 专属横线 ━━━━的片段
-TQDM_BAR = re.compile(r'(\d+/\d+\s+[\d.]+G\s+[\d.]+)|(━━━━━)')
+# 以及 "Class     Images  Instances      Box(P          R      mAP50  mAP50-95): 32% ━━━" 这样的验证进度条
+TQDM_BAR = re.compile(
+    r'(\d+/\d+\s+[\d.]+G\s+[\d.]+)'          # 训练进度条特征
+    r'|(━━━━━|━━━╸|━━╸|━╸|━)'                # 进度条专属符号
+    r'|(\d+%\s*\|?[█▉▊▋▌▍▎▏]+)'              # 其他形式的进度条 (可选)
+    r'|(Class\s+Images\s+Instances.*?:\s*\d+%)' # 验证期特定的类目+百分比前缀
+)
 
 class Logger(object):
     """
-    带缓冲与正则过滤的日志类：
+    带缓冲与过滤的日志类：
     1. 过滤 ANSI 颜色代码与 tqdm 进度条
-    2. 初期缓存在内存中，直到 `set_log_file` 被调用才真正写入文件，解决目录抢占和输出丢失问题。
+    2. 初期缓存在内存中，直到 `set_log_file` 被调用才真正写入文件
     """
     def __init__(self, stream):
         self.terminal = stream
@@ -56,21 +61,26 @@ class Logger(object):
         # 2. 对文件内容进行剥离和过滤
         # 去除 ANSI 转义
         clean_msg = ANSI_ESCAPE.sub('', message)
-        
-        # 判断是否像是进度条刷新片段（包含进度比分、多余的大空格和连续字符等）
-        # 特别是带有 \r 的行且包含进度条特征时，我们直接抛弃该消息的落盘
-        if '\r' in clean_msg:
-            if TQDM_BAR.search(clean_msg):
-                return  # 典型的进度条更新，直接舍弃
-            # 如果不是典型的进度条，可能是单行覆盖的正常信息，保留但剥离 \r（或者原样保存）
-            clean_msg = clean_msg.replace('\r', '')
 
-        # 若经过 \r 分裂由于连续拼接导致单纯只有一条 tqdm 信息，也拦截
+        # 核心逻辑：拦截任何被识别为“进度刷新”的片段
+        # 很多时候 tqdm 每刷新一下都会带 \r，我们直接丢弃带有 tqdm 痕迹的文本
         if TQDM_BAR.search(clean_msg):
-             return
-             
-        # 其他空消息或只有不可见字符直接跳过
-        if not clean_msg:
+            return
+
+        # 对于剩下的包含 \r 的文本：
+        # 如果不是进度条，\r 的出现意味着终端前面的内容被当前内容覆写。
+        # 为了避免日志文件中积累 `旧内容\r新内容` 导致排版混乱，我们将其替换为换行，或者提取最后一部分有效内容。
+        # 这里最安全的做法是将 \r 替换为空字符串（如果它只是用来刷新单行提示）或使用正则只取 \r 后的最后一段
+        if '\r' in clean_msg:
+            # 取 \r 分割后的最后一段非空内容（即最终在屏幕上显示的最终态）
+            parts = [p for p in clean_msg.split('\r') if p]
+            if parts:
+                clean_msg = parts[-1]
+            else:
+                return
+
+        # 空消息跳过
+        if not clean_msg.strip('\n'):
             return
 
         # 写入文件或缓冲

@@ -239,10 +239,14 @@ class SPPF(nn.Module):
 
 
 class StripPooling(nn.Module):
-    """条状池化注意力模块 (Strip Pooling Attention Module)。
+    """四方向条状池化注意力模块 (4-Direction Strip Pooling Attention Module)。
 
-    通过水平和垂直方向的条状平均池化建立长程空间连接，生成注意力权重图，
-    用于强化水平/垂直方向的线状特征（如电线、铁塔边缘）。
+    通过水平、垂直及对角线（45°/135°）四个方向的条状池化建立多方向长程空间连接，
+    生成注意力权重图，用于强化各方向的线状特征（如电线、铁塔边缘）。
+
+    对角线分支采用张量错位法（Tensor Shift & Roll）：
+      - 45° 主对角线：将第 i 行左移 i 格，使对角线对齐为竖线 → 垂直池化 → 反向右移复位
+      - 135° 副对角线：将第 i 行右移 i 格，使对角线对齐为竖线 → 垂直池化 → 反向左移复位
 
     融合卷积采用零初始化策略，使得训练初期 Sigmoid(0)=0.5，
     模块对原网络仅产生温和的缩放作用，保证权重迁移时的平稳过渡。
@@ -253,7 +257,7 @@ class StripPooling(nn.Module):
     """
 
     def __init__(self, c1: int, c2: int):
-        """初始化条状池化注意力模块。"""
+        """初始化四方向条状池化注意力模块。"""
         super().__init__()
         c_ = max(c1 // 4, 32)  # 中间层通道数（降低计算量）
         # 水平分支：沿宽度方向池化 → 1×1 卷积降维
@@ -268,7 +272,19 @@ class StripPooling(nn.Module):
             nn.BatchNorm2d(c_),
             nn.SiLU(inplace=True),
         )
-        # 融合卷积：将水平+垂直特征映射回原始通道数，生成注意力图
+        # 主对角线分支（45°）：错位 → 垂直池化 → 1×1 卷积降维
+        self.d45_conv = nn.Sequential(
+            nn.Conv2d(c1, c_, 1, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU(inplace=True),
+        )
+        # 副对角线分支（135°）：错位 → 垂直池化 → 1×1 卷积降维
+        self.d135_conv = nn.Sequential(
+            nn.Conv2d(c1, c_, 1, bias=False),
+            nn.BatchNorm2d(c_),
+            nn.SiLU(inplace=True),
+        )
+        # 融合卷积：将四方向特征映射回原始通道数，生成注意力图
         self.fuse = nn.Sequential(
             nn.Conv2d(c_, c1, 1, bias=False),
             nn.BatchNorm2d(c1),
@@ -276,8 +292,27 @@ class StripPooling(nn.Module):
         # 零初始化融合卷积权重，确保训练初期 attn ≈ sigmoid(0) = 0.5
         nn.init.zeros_(self.fuse[0].weight)
 
+    @staticmethod
+    def _diag_shift(x: torch.Tensor, direction: int) -> torch.Tensor:
+        """对特征图按行循环平移，将对角线特征对齐为竖线（或反向复位）。
+
+        Args:
+            x: 输入张量 (B, C, H, W)。
+            direction: 1 表示主对角线（45°，第 i 行左移 i 格），
+                      -1 表示副对角线（135°，第 i 行右移 i 格）。
+        Returns:
+            错位后的张量，形状不变 (B, C, H, W)。
+        """
+        B, C, H, W = x.shape
+        rows = torch.arange(H, device=x.device)  # [0, 1, ..., H-1]
+        cols = torch.arange(W, device=x.device)  # [0, 1, ..., W-1]
+        # direction=1: (j + i) % W → 左移 i 格；direction=-1: (j - i) % W → 右移 i 格
+        shifted_cols = (cols.unsqueeze(0) + direction * rows.unsqueeze(1)) % W  # (H, W)
+        shifted_cols = shifted_cols.long().unsqueeze(0).unsqueeze(0).expand(B, C, H, W)
+        return torch.gather(x, 3, shifted_cols)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """前向传播：水平/垂直条状池化 → 特征融合 → Sigmoid 注意力 → 残差加权。"""
+        """前向传播：四方向条状池化 → 特征融合 → Sigmoid 注意力 → 残差加权。"""
         _, _, h, w = x.shape
         # 水平分支：C×H×W → C×H×1 → C_×H×1 → 双线性插值回 C_×H×W
         x_h = F.adaptive_avg_pool2d(x, (h, 1))
@@ -287,8 +322,20 @@ class StripPooling(nn.Module):
         x_v = F.adaptive_avg_pool2d(x, (1, w))
         x_v = self.v_conv(x_v)
         x_v = F.interpolate(x_v, size=(h, w), mode="bilinear", align_corners=False)
-        # 融合 → Sigmoid 注意力 → 逐像素加权
-        attn = torch.sigmoid(self.fuse(x_h + x_v))
+        # 主对角线分支（45°）：错位 → 沿高度池化 → 卷积 → 插值 → 反向复位
+        x_d45 = self._diag_shift(x, direction=1)          # 左移对齐主对角线
+        x_d45 = F.adaptive_avg_pool2d(x_d45, (1, w))      # 沿高度池化 → (B,C,1,W)
+        x_d45 = self.d45_conv(x_d45)
+        x_d45 = F.interpolate(x_d45, size=(h, w), mode="bilinear", align_corners=False)
+        x_d45 = self._diag_shift(x_d45, direction=-1)     # 右移复位
+        # 副对角线分支（135°）：错位 → 沿高度池化 → 卷积 → 插值 → 反向复位
+        x_d135 = self._diag_shift(x, direction=-1)        # 右移对齐副对角线
+        x_d135 = F.adaptive_avg_pool2d(x_d135, (1, w))    # 沿高度池化 → (B,C,1,W)
+        x_d135 = self.d135_conv(x_d135)
+        x_d135 = F.interpolate(x_d135, size=(h, w), mode="bilinear", align_corners=False)
+        x_d135 = self._diag_shift(x_d135, direction=1)    # 左移复位
+        # 四方向融合 → Sigmoid 注意力 → 逐像素加权
+        attn = torch.sigmoid(self.fuse(x_h + x_v + x_d45 + x_d135))
         return x * attn
 
 
