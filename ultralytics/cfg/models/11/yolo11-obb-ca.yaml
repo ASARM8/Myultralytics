@@ -1,0 +1,55 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO11-obb + Coverage-Aware (覆盖感知分配 + reg_max=32)
+# 基于 yolo11-obb.yaml，将 reg_max 从 16 提升到 32：
+#   P3 (stride=8):  D_max = 8  × 31 = 248 px
+#   P4 (stride=16): D_max = 16 × 31 = 496 px
+#   P5 (stride=32): D_max = 32 × 31 = 992 px
+# 配合 RotatedTaskAlignedAssigner 中的 Coverage-Aware 逻辑，
+# 自动将长目标从浅层（P3）赶到深层（P5），解决 H1 截断 + H2 层级错配问题。
+
+# Parameters
+nc: 80 # number of classes
+reg_max: 32 # Maximum DFL channels
+scales: # model compound scaling constants, i.e. 'model=yolo11n-obb-ca.yaml' will call yolo11-obb-ca.yaml with scale 'n'
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # summary: YOLO11n-obb-ca
+  s: [0.50, 0.50, 1024] # summary: YOLO11s-obb-ca
+  m: [0.50, 1.00, 512] # summary: YOLO11m-obb-ca
+  l: [1.00, 1.00, 512] # summary: YOLO11l-obb-ca
+  x: [1.00, 1.50, 512] # summary: YOLO11x-obb-ca
+
+# YOLO11n backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+# YOLO11n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, C3k2, [512, False]] # 13
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C3k2, [256, False]] # 16 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]] # cat head P4
+  - [-1, 2, C3k2, [512, False]] # 19 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C3k2, [1024, True]] # 22 (P5/32-large)
+
+  - [[16, 19, 22], 1, OBB, [nc, 1]] # OBB(P3, P4, P5), reg_max is handled globally

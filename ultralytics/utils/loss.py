@@ -989,6 +989,7 @@ class v8OBBLoss(v8DetectionLoss):
             beta=6.0,
             stride=self.stride.tolist(),
             topk2=tal_topk2,
+            reg_max=self.reg_max if self.reg_max > 16 else None,  # Coverage-Aware: 仅 reg_max>16 时启用
         )
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
 
@@ -1047,6 +1048,8 @@ class v8OBBLoss(v8DetectionLoss):
         bboxes_for_assigner = pred_bboxes.clone().detach()
         # Only the first four elements need to be scaled
         bboxes_for_assigner[..., :4] *= stride_tensor
+        # Coverage-Aware: 传递 stride_tensor 给 assigner 用于覆盖感知掩码计算
+        self.assigner._stride_tensor = stride_tensor
         _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
             pred_scores.detach().sigmoid(),
             bboxes_for_assigner.type(gt_bboxes.dtype),

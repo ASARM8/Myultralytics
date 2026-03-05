@@ -37,7 +37,7 @@ from ultralytics.utils.tal import make_anchors
 CONFIG = {
     # ---------- 模型 ----------
     # 可选 "yolo11l-obb.yaml"（原版）或 "yolo11l-obb-sp.yaml"（含 StripPooling）
-    "model": "yolo11l-obb.yaml",
+    "model": "yolo11l-obb-ca.yaml",
     # 迁移权重（留空则从零开始；SP 模型需要层索引重映射，脚本自动处理）
     "pretrained_weights": "/root/autodl-tmp/work-dirs/yolo11_obb-v2.1full/weights/best.pt",
 
@@ -46,15 +46,15 @@ CONFIG = {
 
     # ---------- 训练参数（仅用于统计，跑 1~3 个 epoch 即可） ----------
     "epochs": 3,
-    "batch": 20,
+    "batch": 8,
     "imgsz": 1024,
     "device": 0,
     "workers": 16,
 
     # ---------- 输出 ----------
     "project": "/root/autodl-tmp/work-dirs",
-    "name": "check_h1h2-2",
-    "exist_ok": True,
+    "name": "check_h1h2-3",
+    "exist_ok": False,
 
     # ---------- 节省资源：关闭不需要的功能 ----------
     "save": False,

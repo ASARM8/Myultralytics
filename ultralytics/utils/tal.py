@@ -367,6 +367,96 @@ class RotatedTaskAlignedAssigner(TaskAlignedAssigner):
     NWD_C = 12.8         # NWD 衰减常量（像素）
     NWD_TAU = 0.5        # NWD 融合权重
 
+    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0,
+                 stride=(8, 16, 32), eps=1e-9, topk2=None, reg_max=None):
+        """初始化旋转框分配器，支持 Coverage-Aware 覆盖感知分配。
+
+        Args:
+            reg_max (int | None): DFL 最大回归值。设置后启用覆盖感知过滤，
+                自动剔除回归距离超出 D_max = reg_max - 1 的 anchor-GT 对，
+                将长目标从浅层（P3）赶到深层（P5）。
+        """
+        super().__init__(topk, num_classes, alpha, beta, list(stride), eps, topk2)
+        self.reg_max = reg_max
+        self._stride_tensor = None  # 由 v8OBBLoss.loss() 在每次调用前设置
+
+    def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
+        """获取正样本掩码，集成 Coverage-Aware 覆盖感知过滤。
+
+        在原始 TAL 流程基础上，增加一步覆盖感知过滤：
+        对每个 (GT, anchor) 对，计算旋转回归距离 D_req（grid 单位），
+        若 D_req > D_max = reg_max - 1，则将该 anchor 从候选中剔除。
+        这迫使长目标只能在 D_max 足够大的深层 FPN 获取正样本。
+
+        包含 fallback 安全网：若某 GT 过滤后完全没有候选 anchor，
+        则对该 GT 放宽限制，保留原始分配，避免训练信号丢失。
+        """
+        mask_in_gts = self.select_candidates_in_gts(anc_points, gt_bboxes, mask_gt)
+
+        # ===== Coverage-Aware: 剔除超出 DFL 回归范围的 anchor =====
+        if self.reg_max is not None and self._stride_tensor is not None:
+            mask_cov = self._compute_coverage_mask(anc_points, gt_bboxes)
+            # Fallback: 若某 GT 过滤后无候选 anchor，保留原始 mask（允许截断但不丢目标）
+            cand_after = (mask_in_gts * mask_cov).sum(dim=-1)  # (B, N_max)
+            valid_gt = mask_gt.squeeze(-1).bool()  # (B, N_max)
+            no_cand = (cand_after == 0) & valid_gt
+            if no_cand.any():
+                mask_cov = mask_cov | no_cand.unsqueeze(-1)
+            mask_in_gts = mask_in_gts * mask_cov
+
+        align_metric, overlaps = self.get_box_metrics(
+            pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt
+        )
+        mask_topk = self.select_topk_candidates(
+            align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool()
+        )
+        mask_pos = mask_topk * mask_in_gts * mask_gt
+        return mask_pos, align_metric, overlaps
+
+    def _compute_coverage_mask(self, anc_points, gt_bboxes):
+        """计算覆盖感知掩码：剔除 D_req > D_max 的 (GT, anchor) 对。
+
+        原理：将 anchor→GT 的偏移旋转到 GT 局部坐标系，利用恒等式
+            D_req = max(l, t, r, b) = max(w/2 + |xf|, h/2 + |yf|)
+        避免创建 4 通道中间张量，节省显存。然后除以每个 anchor 的 stride
+        得到 grid 单位的 D_req，与 D_max = reg_max - 1 比较。
+
+        Args:
+            anc_points: (H*W, 2) 像素坐标
+            gt_bboxes: (B, N_max, 5) xywhr 像素坐标
+
+        Returns:
+            mask: (B, N_max, H*W) bool，True 表示该 anchor 在 DFL 覆盖范围内
+        """
+        stride_t = self._stride_tensor  # (H*W, 1)
+        d_max = float(self.reg_max - 1)
+
+        gt_xy = gt_bboxes[..., :2]       # (B, N, 2)
+        gt_wh = gt_bboxes[..., 2:4]      # (B, N, 2)
+        gt_angle = gt_bboxes[..., 4:5]   # (B, N, 1)
+
+        # 偏移量 (GT_center - anchor) in pixel coords
+        # (B, N, 1, 2) - (1, 1, H*W, 2) → (B, N, H*W, 2)
+        offset = gt_xy.unsqueeze(2) - anc_points.unsqueeze(0).unsqueeze(0)
+        ox, oy = offset[..., 0:1], offset[..., 1:2]  # (B, N, H*W, 1)
+
+        # 旋转到 GT 局部坐标系
+        cos_a = torch.cos(gt_angle).unsqueeze(2)  # (B, N, 1, 1)
+        sin_a = torch.sin(gt_angle).unsqueeze(2)
+        xf = ox * cos_a + oy * sin_a       # 局部 x 偏移
+        yf = -ox * sin_a + oy * cos_a      # 局部 y 偏移
+
+        w = gt_wh[..., 0:1].unsqueeze(2)   # (B, N, 1, 1)
+        h = gt_wh[..., 1:2].unsqueeze(2)
+
+        # D_req (pixel) = max(w/2 + |xf|, h/2 + |yf|)
+        d_req_px = torch.max(w / 2 + xf.abs(), h / 2 + yf.abs()).squeeze(-1)  # (B, N, H*W)
+
+        # 转为 grid 单位：除以每个 anchor 的 stride
+        d_req_grid = d_req_px / stride_t.squeeze(-1)  # broadcast → (B, N, H*W)
+
+        return d_req_grid <= d_max
+
     def iou_calculation(self, gt_bboxes, pd_bboxes):
         """
         使用带门控机制的 ProbIoU & NWD 混合度量。
