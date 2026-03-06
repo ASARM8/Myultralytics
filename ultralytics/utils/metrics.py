@@ -231,15 +231,14 @@ def probiou(obb1: torch.Tensor, obb2: torch.Tensor, CIoU: bool = False, eps: flo
     a1, b1, c1 = _get_covariance_matrix(obb1)
     a2, b2, c2 = _get_covariance_matrix(obb2)
 
-    t1 = (
-        ((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)
-    ) * 0.25
-    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2) + eps)) * 0.5
-    t3 = (
-        ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2))
-        / (4 * (((a1 * b1 - c1.pow(2)).clamp_(0) * (a2 * b2 - c2.pow(2)).clamp_(0)) + eps).sqrt() + eps)
-        + eps
-    ).log() * 0.5
+    # 混合概率模型中的协方差行列式必须严格大于 0，使用 clamp(eps) 避免除零和由于浮点精度漂移引发负数再求 log 产生的 NaN 崩溃
+    det1 = (a1 * b1 - c1.pow(2)).clamp_(0)
+    det2 = (a2 * b2 - c2.pow(2)).clamp_(0)
+    det_mix = ((a1 + a2) * (b1 + b2) - (c1 + c2).pow(2)).clamp_(eps)
+
+    t1 = (((a1 + a2) * (y1 - y2).pow(2) + (b1 + b2) * (x1 - x2).pow(2)) / det_mix) * 0.25
+    t2 = (((c1 + c2) * (x2 - x1) * (y1 - y2)) / det_mix) * 0.5
+    t3 = (det_mix / (4 * ((det1 * det2) + eps).sqrt() + eps) + eps).log() * 0.5
     bd = (t1 + t2 + t3).clamp(eps, 100.0)
     hd = (1.0 - (-bd).exp() + eps).sqrt()
     iou = 1 - hd

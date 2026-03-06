@@ -99,9 +99,9 @@ class Logger(object):
 # ========================== 训练配置 ==========================
 CONFIG = {
     # ---------- 模型配置 ----------
-    # 使用带条状池化的 YAML 配置文件
-    # 可选规模: yolo11n-obb-sp.yaml / yolo11s-obb-sp.yaml / yolo11m-obb-sp.yaml / yolo11l-obb-sp.yaml / yolo11x-obb-sp.yaml
-    "model": "yolo11l-obb-sp.yaml",
+    # ---------- 模型配置 ----------
+    # 使用带条状池化和覆盖感知(reg_max=32)的 YAML 配置文件
+    "model": "yolo11l-obb-sp-ca.yaml",
 
     # ---------- 迁移学习配置 ----------
     # 指定已有权重路径，用于迁移训练（留空或注释掉则从零训练）
@@ -114,14 +114,14 @@ CONFIG = {
 
     # ---------- 训练基本参数 ----------
     "epochs": 150,              # 迁移训练建议 100~150 轮（主干已成熟，不需要 300 轮）
-    "batch": 20,                # 批次大小（RTX 5090 32GB 显存，新增 StripPooling 参数量极小，不影响显存）
+    "batch": 16,                # 批次大小（RTX 5090 32GB 显存，新增 StripPooling 参数量极小，不影响显存）
     "imgsz": 1024,              # 输入图片尺寸
     "device": 0,                # GPU 设备编号
     "workers": 16,              # 数据加载线程数
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
-    "name": "yolo11_obb_sp",    # 实验名称（子目录）—— 区分于原版
+    "name": "yolo11_obb_sp_ca",    # 实验名称（子目录）—— 区分于原版和 CA 版
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
     # ---------- 模型保存配置 ----------
