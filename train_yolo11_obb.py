@@ -102,7 +102,7 @@ CONFIG = {
     "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
-    "epochs": 150,              # 训练总轮数
+    "epochs": 50,              # 训练总轮数
     "batch": 16,                # 批次大小（RTX 5090 32GB 显存，yolo11l + 1024 尝试 32，OOM 则降回 16）
     "imgsz": 1024,              # 输入图片尺寸
     "device": 0,                # GPU 设备编号
@@ -110,7 +110,7 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
-    "name": "yolo11_obb-ca",        # 实验名称（子目录）
+    "name": "yolo11_obb-ca-continue",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
     # ---------- 模型保存配置 ----------
@@ -124,7 +124,7 @@ CONFIG = {
     # ---------- 训练策略 ----------
     "pretrained": False,        # 不使用预训练权重（从零训练）
     "optimizer": "AdamW",       # AdamW 优化器（从零训练时收敛更稳定）
-    "lr0": 0.001,               # 初始学习率（AdamW 推荐 1e-3）
+    "lr0": 0.0001,               # 初始学习率（AdamW 推荐 1e-3）
     "lrf": 0.01,                # 最终学习率 = lr0 * lrf
     "momentum": 0.937,          # Adam beta1
     "weight_decay": 0.0005,     # 权重衰减（L2 正则化）
@@ -148,7 +148,7 @@ CONFIG = {
     # ---------- 其他 ----------
     "amp": True,               # 排雷期关闭混合精度，使用 Float32 排除数值不稳定（验证通过后可改回 True）
     "cache": 'disk',              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
-    "resume": True,            # 是否从上次中断处恢复训练
+    "resume": False,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
     "verbose": True,            # 输出详细日志
 
