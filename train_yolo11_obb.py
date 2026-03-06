@@ -93,8 +93,9 @@ CONFIG = {
     # ---------- 模型配置 ----------
     # 使用 .yaml 文件从零开始训练（不使用预训练权重）
     # 可选规模: yolo11n-obb.yaml / yolo11s-obb.yaml / yolo11m-obb.yaml / yolo11l-obb.yaml / yolo11x-obb.yaml
-    "model": "yolo11l-obb-ca.yaml",
+    # "model": "yolo11l-obb-ca.yaml",
     # "model": "/root/autodl-tmp/work-dirs/yolo11_obb2/weights/last.pt",
+    "model": "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/last.pt",
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
@@ -147,7 +148,7 @@ CONFIG = {
     # ---------- 其他 ----------
     "amp": True,               # 排雷期关闭混合精度，使用 Float32 排除数值不稳定（验证通过后可改回 True）
     "cache": 'disk',              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
-    "resume": False,            # 是否从上次中断处恢复训练
+    "resume": True,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
     "verbose": True,            # 输出详细日志
 
@@ -160,6 +161,12 @@ CONFIG = {
 
 def main():
     """主训练函数"""
+    # --- 拦截控制台输出（暂存在内存） ---
+    sys.stdout = Logger(sys.stdout)
+    sys.stderr = Logger(sys.stderr)
+    print("\n[*] 终端日志拦截器已启动（将在验证最终目录后落地存盘，并已开启进度条剥离保护）\n")
+    # ----------------------------------
+
     # 1. 创建模型（从 yaml 配置文件构建，随机初始化权重）
     model = YOLO(CONFIG["model"])
 
@@ -172,6 +179,18 @@ def main():
     print(f"  图片尺寸: {CONFIG['imgsz']}")
     print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
     print("=" * 60)
+
+    # 注册回调函数：在 Trainer 确定了 save_dir 后，将暂存的日志吐出到由系统建立的目录中
+    def on_train_start(trainer):
+        # 此时已经存在类似 work-dirs/yolo11_obb 等最终准确确定的训练目录
+        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_log_file = os.path.join(trainer.save_dir, f"train_terminal_{time_str}.log")
+        print(f"\n[*] YOLO 目录已确定，开始将暂存日志刷入文件: {final_log_file}\n")
+        # 为两个流设置真实的文件句柄
+        sys.stdout.set_log_file(final_log_file)
+        sys.stderr.set_log_file(final_log_file)
+
+    model.add_callback("on_train_start", on_train_start)
 
     results = model.train(**CONFIG)
 
