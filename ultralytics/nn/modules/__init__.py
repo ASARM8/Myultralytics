@@ -80,6 +80,7 @@ from .conv import (
 from .head import (
     OBB,
     OBB26,
+    AsymmetricOBB,
     Classify,
     Detect,
     LRPCHead,

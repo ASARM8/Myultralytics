@@ -1,0 +1,54 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO11-obb-SDA: Scale-Decoupled Asymmetric Head + Coverage-Aware (reg_max=32)
+# 基于 yolo11-obb-ca.yaml，将检测头从 OBB 替换为 AsymmetricOBB：
+#   - 回归分支和角度分支：注入 P3 高频微观特征（PixelUnshuffle + 1x1 Conv 融合）
+#   - 分类分支：保持原始宏观特征不变
+#   - 保留 reg_max=32 和 Coverage-Aware TAL 逻辑
+# 目标：解决 P4/P5 层宽度和角度精修不足的问题
+
+# Parameters
+nc: 80 # number of classes
+reg_max: 32 # Maximum DFL channels
+scales: # model compound scaling constants, i.e. 'model=yolo11n-obb-sda.yaml' will call yolo11-obb-sda.yaml with scale 'n'
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024] # summary: YOLO11n-obb-sda
+  s: [0.50, 0.50, 1024] # summary: YOLO11s-obb-sda
+  m: [0.50, 1.00, 512] # summary: YOLO11m-obb-sda
+  l: [1.00, 1.00, 512] # summary: YOLO11l-obb-sda
+  x: [1.00, 1.50, 512] # summary: YOLO11x-obb-sda
+
+# YOLO11n backbone
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C3k2, [256, False, 0.25]]
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C3k2, [512, False, 0.25]]
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 2, C3k2, [1024, True]]
+  - [-1, 1, SPPF, [1024, 5]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+# YOLO11n head
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, C3k2, [512, False]] # 13
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C3k2, [256, False]] # 16 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]] # cat head P4
+  - [-1, 2, C3k2, [512, False]] # 19 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C3k2, [1024, True]] # 22 (P5/32-large)
+
+  - [[16, 19, 22], 1, AsymmetricOBB, [nc, 1]] # AsymmetricOBB(P3, P4, P5), SDA-Head

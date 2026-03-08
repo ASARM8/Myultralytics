@@ -20,7 +20,7 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "AsymmetricOBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
 
 
 class Detect(nn.Module):
@@ -541,6 +541,106 @@ class OBB26(OBB):
                 [angle_head[i](x[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2
             )  # OBB theta logits (raw output without sigmoid transformation)
             preds["angle"] = angle
+        return preds
+
+
+class AsymmetricOBB(OBB):
+    """Scale-Decoupled Asymmetric OBB Head (SDA-Head).
+
+    跨尺度非对称解耦头：利用 PixelUnshuffle 将 P3 的高频微观特征无损注入 P4/P5 的回归分支，
+    解决极细长目标在深层网络中宽度和角度特征丢失的问题。
+
+    核心机制：
+      - 分类分支（cv3）保持原样，使用原始宏观特征 x
+      - 回归分支（cv2）和角度分支（cv4）使用注入 P3 高频细节后的特征
+      - P3→P4 通过 PixelUnshuffle(2) + 1x1 Conv 融合
+      - P3→P5 通过 PixelUnshuffle(4) + 1x1 Conv 融合
+
+    Attributes:
+        unshuffle_p4 (nn.PixelUnshuffle): P3→P4 亚像素重排（下采样 2x）。
+        unshuffle_p5 (nn.PixelUnshuffle): P3→P5 亚像素重排（下采样 4x）。
+        fusion_p4 (Conv): P4 特征融合投影层（1x1 卷积）。
+        fusion_p5 (Conv): P5 特征融合投影层（1x1 卷积）。
+
+    Examples:
+        >>> sda = AsymmetricOBB(nc=80, ne=1, ch=(256, 512, 512))
+        >>> x = [torch.randn(1, 256, 128, 128), torch.randn(1, 512, 64, 64), torch.randn(1, 512, 32, 32)]
+        >>> outputs = sda(x)
+    """
+
+    def __init__(self, nc: int = 80, ne: int = 1, reg_max=16, end2end=False, ch: tuple = ()):
+        """初始化 AsymmetricOBB，在 OBB 基础上添加跨尺度特征注入模块。
+
+        Args:
+            nc (int): 类别数。
+            ne (int): 额外参数数（角度维度）。
+            reg_max (int): DFL 最大通道数。
+            end2end (bool): 是否使用端到端 NMS-free 检测。
+            ch (tuple): 各层输入特征通道数，例如 (c3, c4, c5)。
+        """
+        super().__init__(nc, ne, reg_max, end2end, ch)
+
+        # ch = [c3, c4, c5]，分别对应 P3/P4/P5 的通道数
+        c3_ch, c4_ch, c5_ch = ch[0], ch[1], ch[2]
+
+        # 亚像素重排：将空间分辨率转化为通道数，实现空间无损下采样
+        self.unshuffle_p4 = nn.PixelUnshuffle(downscale_factor=2)  # P3(stride=8) → P4(stride=16)
+        self.unshuffle_p5 = nn.PixelUnshuffle(downscale_factor=4)  # P3(stride=8) → P5(stride=32)
+
+        # 特征融合投影层：将拼接后的高低频特征降维回原通道数
+        # PixelUnshuffle(2) 让通道数 ×4，PixelUnshuffle(4) 让通道数 ×16
+        self.fusion_p4 = Conv(c4_ch + c3_ch * 4, c4_ch, k=1, s=1)
+        self.fusion_p5 = Conv(c5_ch + c3_ch * 16, c5_ch, k=1, s=1)
+
+    def forward_head(
+        self,
+        x: list[torch.Tensor],
+        box_head: torch.nn.Module = None,
+        cls_head: torch.nn.Module = None,
+        angle_head: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """非对称前向传播：回归/角度分支使用注入 P3 高频细节的特征，分类分支保持原始特征。
+
+        Args:
+            x (list[torch.Tensor]): 多尺度特征列表 [P3, P4, P5]。
+            box_head (nn.Module): 回归分支卷积组。
+            cls_head (nn.Module): 分类分支卷积组。
+            angle_head (nn.Module): 角度分支卷积组。
+
+        Returns:
+            (dict[str, torch.Tensor]): 包含 boxes, scores, feats, angle 的预测字典。
+        """
+        if box_head is None or cls_head is None:
+            return dict()
+
+        bs = x[0].shape[0]
+
+        # --- 核心：构建注入 P3 高频细节的回归特征 ---
+        reg_inputs = list(x)  # 浅拷贝 [P3, P4, P5]
+
+        # P3 → P4：PixelUnshuffle(2) + Concat + 1x1 Conv
+        p3_to_p4 = self.unshuffle_p4(x[0])  # (B, C3*4, H/16, W/16)
+        reg_inputs[1] = self.fusion_p4(torch.cat([x[1], p3_to_p4], dim=1))
+
+        # P3 → P5：PixelUnshuffle(4) + Concat + 1x1 Conv
+        p3_to_p5 = self.unshuffle_p5(x[0])  # (B, C3*16, H/32, W/32)
+        reg_inputs[2] = self.fusion_p5(torch.cat([x[2], p3_to_p5], dim=1))
+
+        # 回归分支：使用注入后的特征
+        boxes = torch.cat([box_head[i](reg_inputs[i]).view(bs, 4 * self.reg_max, -1) for i in range(self.nl)], dim=-1)
+        # 分类分支：保持原始宏观特征
+        scores = torch.cat([cls_head[i](x[i]).view(bs, self.nc, -1) for i in range(self.nl)], dim=-1)
+
+        preds = dict(boxes=boxes, scores=scores, feats=x)
+
+        # 角度分支：也使用注入后的特征（角度精修需要高频细节）
+        if angle_head is not None:
+            angle = torch.cat(
+                [angle_head[i](reg_inputs[i]).view(bs, self.ne, -1) for i in range(self.nl)], 2
+            )
+            angle = (angle.sigmoid() - 0.25) * math.pi  # [-pi/4, 3pi/4]
+            preds["angle"] = angle
+
         return preds
 
 
