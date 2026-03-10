@@ -1,14 +1,18 @@
 """
-YOLOv11-OBB-SDA 训练脚本（Scale-Decoupled Asymmetric Head）
-基于 CA (reg_max=32) 预训练权重，加载到 AsymmetricOBB 架构：
-  - 主干网络和 FPN 权重完美继承
-  - 回归头（cv2）、分类头（cv3）、角度头（cv4）权重完美继承
-  - 新增的 fusion_p4 / fusion_p5 层随机初始化（新模块）
-  - unshuffle 层无参数，不影响权重加载
+YOLOv11-OBB-SDA v2 训练脚本（Scale-Decoupled Asymmetric Head）
+
+分阶段冻结训练策略：
+  Stage 1 (epoch 0~9):   仅训练新增模块（p3_reduce, fuse, alpha gates）
+  Stage 2 (epoch 10~49):  解冻回归头(cv2) + 角度头(cv4)
+  Stage 3 (epoch 50~199): 全模型小学习率微调
+
+权重迁移：
+  - backbone / FPN / cv2 / cv3 / cv4 / dfl → 从 CA best.pt 完美继承
+  - p3_reduce / fuse_p4 / fuse_p5 → 随机初始化
+  - alpha gates → 初始化为 0（训练开始时等价于原始 CA 模型）
 
 使用方法:
     直接运行: python train_yolo11_obb_sda.py
-    修改下方 CONFIG 字典中的参数即可自定义训练配置
 """
 
 import os
@@ -83,6 +87,7 @@ CONFIG = {
 
     # ---------- 训练基本参数 ----------
     "epochs": 200,
+    "patience": 0,              # 0 表示完全关闭早停，强制跑完 epochs
     "batch": 16,
     "imgsz": 1024,
     "device": 0,
@@ -90,7 +95,7 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",
-    "name": "yolo11_obb-sda",
+    "name": "yolo11_obb-sda-v2",
     "exist_ok": False,
 
     # ---------- 模型保存配置 ----------
@@ -104,7 +109,7 @@ CONFIG = {
     # ---------- 训练策略 ----------
     "pretrained": False,
     "optimizer": "AdamW",
-    "lr0": 0.0005,              # 稍低的学习率：主干已收敛，新模块需要温和学习
+    "lr0": 0.0001,              # 保守全局 LR，配合分阶段冻结策略使用
     "lrf": 0.01,
     "momentum": 0.937,
     "weight_decay": 0.0005,
@@ -134,13 +139,15 @@ CONFIG = {
 
 
 def load_pretrained_weights(model, pretrain_path):
-    """从 CA 预训练模型加载权重到 SDA 模型。
+    """从 CA 预训练模型加载权重到 SDA v2 模型。
 
-    AsymmetricOBB 继承自 OBB，新增的层：
+    AsymmetricOBB v2 新增的层：
+      - p3_reduce: 1x1 Conv，随机初始化
       - unshuffle_p4 / unshuffle_p5: PixelUnshuffle，无可学习参数
-      - fusion_p4 / fusion_p5: 1x1 Conv，随机初始化
+      - fuse_p4 / fuse_p5: 1x1 Conv，随机初始化
+      - alpha_box_p4/p5, alpha_ang_p4/p5: 标量 gate，初始化为 0
 
-    其余层（backbone, FPN, cv2, cv3, cv4, dfl）均可从 CA 模型完美迁移。
+    其余层（backbone, FPN, cv2, cv3, cv4, dfl）均从 CA 模型完美迁移。
     """
     print(f"\n[*] 加载预训练权重: {pretrain_path}")
 
@@ -176,15 +183,76 @@ def load_pretrained_weights(model, pretrain_path):
     return model
 
 
+# ========================== 分阶段冻结配置 ==========================
+# Stage 1: 仅训练新增 SDA 模块，让新模块先学会"不添乱"
+# Stage 2: 解冻回归头(cv2) + 角度头(cv4)，让它们适应注入后的特征
+# Stage 3: 全模型小学习率微调
+STAGE_CONFIG = {
+    "stage1_end": 10,    # Stage 1 持续到第 10 个 epoch
+    "stage2_end": 50,    # Stage 2 持续到第 50 个 epoch
+    # Stage 3: epoch 50 ~ 结束
+}
+
+# SDA 新增模块的关键字（用于识别需要在 Stage 1 解冻的参数）
+SDA_NEW_KEYWORDS = ("p3_reduce", "fuse_p4", "fuse_p5", "alpha_box", "alpha_ang",
+                    "unshuffle")  # unshuffle 无参数，但保险起见也列出
+
+
+def get_sda_freeze_list(model, stage):
+    """根据训练阶段返回需要冻结的参数名列表。
+
+    Args:
+        model: YOLO 模型对象。
+        stage (int): 当前训练阶段 (1, 2, 3)。
+
+    Returns:
+        list[str]: 需要冻结的参数名列表。
+    """
+    freeze_names = []
+
+    for name, param in model.model.named_parameters():
+        is_sda_new = any(kw in name for kw in SDA_NEW_KEYWORDS)
+        is_cv2 = ".cv2." in name
+        is_cv4 = ".cv4." in name
+
+        if stage == 1:
+            # Stage 1: 仅训练 SDA 新模块，冻结其他所有
+            if not is_sda_new:
+                freeze_names.append(name)
+        elif stage == 2:
+            # Stage 2: SDA 新模块 + cv2 + cv4 可训练，冻结其余
+            if not is_sda_new and not is_cv2 and not is_cv4:
+                freeze_names.append(name)
+        # stage == 3: 全部解冻，返回空列表
+
+    return freeze_names
+
+
+def apply_freeze(model, freeze_names, stage_label):
+    """应用冻结策略：冻结指定参数，解冻其余。"""
+    n_frozen = 0
+    n_total = 0
+    for name, param in model.model.named_parameters():
+        n_total += 1
+        if name in freeze_names:
+            param.requires_grad = False
+            n_frozen += 1
+        else:
+            param.requires_grad = True
+
+    print(f"\n[*] {stage_label}: 冻结 {n_frozen}/{n_total} 参数组, "
+          f"可训练 {n_total - n_frozen}/{n_total}")
+
+
 def main():
-    """主训练函数"""
+    """主训练函数：分阶段冻结训练"""
     sys.stdout = Logger(sys.stdout)
     sys.stderr = Logger(sys.stderr)
     print("\n[*] 终端日志拦截器已启动\n")
 
     # 1. 从 YAML 构建 SDA 模型架构
     print("=" * 60)
-    print("  YOLOv11-OBB-SDA 训练")
+    print("  YOLOv11-OBB-SDA v2 训练（分阶段冻结策略）")
     print("=" * 60)
     print(f"  模型架构: {CONFIG['model']}")
     print(f"  预训练权重: {PRETRAIN_WEIGHTS}")
@@ -193,6 +261,9 @@ def main():
     print(f"  批次大小: {CONFIG['batch']}")
     print(f"  图片尺寸: {CONFIG['imgsz']}")
     print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
+    print(f"  Stage 1 (epoch 0~{STAGE_CONFIG['stage1_end']-1}): 仅训练 SDA 新模块")
+    print(f"  Stage 2 (epoch {STAGE_CONFIG['stage1_end']}~{STAGE_CONFIG['stage2_end']-1}): + cv2 + cv4")
+    print(f"  Stage 3 (epoch {STAGE_CONFIG['stage2_end']}~{CONFIG['epochs']-1}): 全模型微调")
     print("=" * 60)
 
     model = YOLO(CONFIG["model"])
@@ -200,7 +271,12 @@ def main():
     # 2. 加载 CA 预训练权重
     model = load_pretrained_weights(model, PRETRAIN_WEIGHTS)
 
-    # 3. 注册日志回调
+    # 3. 注册回调：日志 + 阶段切换
+    # 注意：不能在 model.train() 之前冻结参数！
+    # 因为 trainer._setup_train() 会重置所有 requires_grad=False 的参数为 True。
+    # 必须在 on_pretrain_routine_end 回调中应用冻结（在 _setup_train 之后、训练循环之前）。
+    current_stage = [1]  # 用列表包装以便闭包修改
+
     def on_train_start(trainer):
         time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         final_log_file = os.path.join(trainer.save_dir, f"train_terminal_{time_str}.log")
@@ -208,12 +284,45 @@ def main():
         sys.stdout.set_log_file(final_log_file)
         sys.stderr.set_log_file(final_log_file)
 
-    model.add_callback("on_train_start", on_train_start)
+    def on_pretrain_routine_end(trainer):
+        """在 trainer._setup_train() 完成后、训练循环开始前，应用 Stage 1 冻结。"""
+        stage1_freeze = get_sda_freeze_list(model, stage=1)
+        apply_freeze(model, stage1_freeze, "Stage 1")
 
-    # 4. 开始训练
+    def on_train_epoch_start(trainer):
+        """在每个 epoch 开始时检查是否需要切换训练阶段。"""
+        epoch = trainer.epoch  # 当前 epoch（0-indexed）
+
+        if epoch == STAGE_CONFIG["stage1_end"] and current_stage[0] == 1:
+            # 切换到 Stage 2
+            current_stage[0] = 2
+            stage2_freeze = get_sda_freeze_list(model, stage=2)
+            apply_freeze(model, stage2_freeze, "Stage 2")
+            # 打印 gate 值监控
+            _print_gate_values(model)
+
+        elif epoch == STAGE_CONFIG["stage2_end"] and current_stage[0] == 2:
+            # 切换到 Stage 3
+            current_stage[0] = 3
+            apply_freeze(model, [], "Stage 3 (全部解冻)")
+            _print_gate_values(model)
+
+    def on_train_epoch_end(trainer):
+        """每个 epoch 结束时打印 gate 值（便于监控注入强度变化）。"""
+        epoch = trainer.epoch
+        # 每 10 个 epoch 打印一次 gate 值
+        if (epoch + 1) % 10 == 0:
+            _print_gate_values(model)
+
+    model.add_callback("on_train_start", on_train_start)
+    model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
+    model.add_callback("on_train_epoch_start", on_train_epoch_start)
+    model.add_callback("on_train_epoch_end", on_train_epoch_end)
+
+    # 5. 设置 freeze 参数（Ultralytics 内置冻结支持，这里通过回调实现更灵活的阶段切换）
     results = model.train(**CONFIG)
 
-    # 5. 完成
+    # 6. 完成
     print("\n" + "=" * 60)
     print("  训练完成！")
     print(f"  结果保存在: {CONFIG['project']}/{CONFIG['name']}")
@@ -225,7 +334,15 @@ def main():
     print("    - args.yaml           : 完整训练参数记录")
     print("=" * 60)
 
+    _print_gate_values(model)
     return results
+
+
+def _print_gate_values(model):
+    """打印当前 gate 参数值，监控注入强度。"""
+    for name, param in model.model.named_parameters():
+        if "alpha_" in name:
+            print(f"  [gate] {name} = {param.data.item():.6f}")
 
 
 if __name__ == "__main__":
