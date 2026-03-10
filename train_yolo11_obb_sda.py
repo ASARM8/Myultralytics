@@ -138,8 +138,8 @@ CONFIG = {
 }
 
 
-def load_pretrained_weights(model, pretrain_path):
-    """从 CA 预训练模型加载权重到 SDA v2 模型。
+def load_pretrained_weights(nn_model, pretrain_path, device=None):
+    """从 CA 预训练模型加载权重到 SDA v2 模型的 nn.Module。
 
     AsymmetricOBB v2 新增的层：
       - p3_reduce: 1x1 Conv，随机初始化
@@ -148,24 +148,29 @@ def load_pretrained_weights(model, pretrain_path):
       - alpha_box_p4/p5, alpha_ang_p4/p5: 标量 gate，初始化为 0
 
     其余层（backbone, FPN, cv2, cv3, cv4, dfl）均从 CA 模型完美迁移。
+
+    Args:
+        nn_model (torch.nn.Module): 目标模型的 nn.Module（trainer.model）。
+        pretrain_path (str): CA 预训练权重路径。
+        device: 模型所在设备，用于加载权重到正确设备。
     """
     print(f"\n[*] 加载预训练权重: {pretrain_path}")
 
+    map_location = device if device else "cpu"
     ckpt = torch.load(pretrain_path, map_location="cpu", weights_only=False)
     if "model" in ckpt:
-        # .pt 文件包含完整 checkpoint
         pretrain_sd = ckpt["model"].float().state_dict()
     else:
         pretrain_sd = ckpt
 
-    model_sd = model.model.state_dict()
+    model_sd = nn_model.state_dict()
 
     # 使用 intersect_dicts 匹配形状兼容的权重
     matched = intersect_dicts(pretrain_sd, model_sd, exclude=[])
     n_total = len(model_sd)
     n_matched = len(matched)
 
-    model.model.load_state_dict(matched, strict=False)
+    nn_model.load_state_dict(matched, strict=False)
 
     # 统计新增层（未匹配的参数）
     new_keys = [k for k in model_sd if k not in matched]
@@ -179,8 +184,6 @@ def load_pretrained_weights(model, pretrain_path):
         print(f"  新增层明细:")
         for k in new_keys:
             print(f"    - {k}  shape={list(model_sd[k].shape)}")
-
-    return model
 
 
 # ========================== 分阶段冻结配置 ==========================
@@ -198,11 +201,11 @@ SDA_NEW_KEYWORDS = ("p3_reduce", "fuse_p4", "fuse_p5", "alpha_box", "alpha_ang",
                     "unshuffle")  # unshuffle 无参数，但保险起见也列出
 
 
-def get_sda_freeze_list(model, stage):
+def get_sda_freeze_list(nn_model, stage):
     """根据训练阶段返回需要冻结的参数名列表。
 
     Args:
-        model: YOLO 模型对象。
+        nn_model (torch.nn.Module): 模型的 nn.Module（trainer.model）。
         stage (int): 当前训练阶段 (1, 2, 3)。
 
     Returns:
@@ -210,7 +213,7 @@ def get_sda_freeze_list(model, stage):
     """
     freeze_names = []
 
-    for name, param in model.model.named_parameters():
+    for name, param in nn_model.named_parameters():
         is_sda_new = any(kw in name for kw in SDA_NEW_KEYWORDS)
         is_cv2 = ".cv2." in name
         is_cv4 = ".cv4." in name
@@ -228,11 +231,11 @@ def get_sda_freeze_list(model, stage):
     return freeze_names
 
 
-def apply_freeze(model, freeze_names, stage_label):
+def apply_freeze(nn_model, freeze_names, stage_label):
     """应用冻结策略：冻结指定参数，解冻其余。"""
     n_frozen = 0
     n_total = 0
-    for name, param in model.model.named_parameters():
+    for name, param in nn_model.named_parameters():
         n_total += 1
         if name in freeze_names:
             param.requires_grad = False
@@ -268,13 +271,11 @@ def main():
 
     model = YOLO(CONFIG["model"])
 
-    # 2. 加载 CA 预训练权重
-    model = load_pretrained_weights(model, PRETRAIN_WEIGHTS)
-
-    # 3. 注册回调：日志 + 阶段切换
-    # 注意：不能在 model.train() 之前冻结参数！
-    # 因为 trainer._setup_train() 会重置所有 requires_grad=False 的参数为 True。
-    # 必须在 on_pretrain_routine_end 回调中应用冻结（在 _setup_train 之后、训练循环之前）。
+    # 2. 注意：不能在 model.train() 之前加载权重或冻结参数！
+    # 原因：YOLO.train() 内部会通过 get_model() 重新构建 nn.Module（见 engine/model.py L774）：
+    #   self.trainer.model = self.trainer.get_model(weights=self.model if self.ckpt else None, ...)
+    # 当从 YAML 构建时 self.ckpt=None → weights=None → 全新随机模型，手动加载的权重被丢弃！
+    # 解决方案：在 on_pretrain_routine_end 回调中加载权重（trainer 已完成模型构建后）。
     current_stage = [1]  # 用列表包装以便闭包修改
 
     def on_train_start(trainer):
@@ -285,9 +286,23 @@ def main():
         sys.stderr.set_log_file(final_log_file)
 
     def on_pretrain_routine_end(trainer):
-        """在 trainer._setup_train() 完成后、训练循环开始前，应用 Stage 1 冻结。"""
-        stage1_freeze = get_sda_freeze_list(model, stage=1)
-        apply_freeze(model, stage1_freeze, "Stage 1")
+        """在 trainer._setup_train() 完成后、训练循环开始前：
+        1. 加载 CA 预训练权重到 trainer.model
+        2. 同步更新 EMA 模型
+        3. 应用 Stage 1 冻结
+        """
+        # (a) 加载 CA 预训练权重到 trainer 的实际模型
+        load_pretrained_weights(trainer.model, PRETRAIN_WEIGHTS, device=trainer.device)
+
+        # (b) 同步更新 EMA 模型（EMA 在 _setup_train 中已从随机模型初始化，需要覆盖）
+        if hasattr(trainer, 'ema') and trainer.ema is not None:
+            trainer.ema.ema.load_state_dict(trainer.model.state_dict())
+            trainer.ema.updates = 0  # 重置 EMA 更新计数
+            print("[*] EMA 模型已同步更新为 CA 预训练权重")
+
+        # (c) 应用 Stage 1 冻结
+        stage1_freeze = get_sda_freeze_list(trainer.model, stage=1)
+        apply_freeze(trainer.model, stage1_freeze, "Stage 1")
 
     def on_train_epoch_start(trainer):
         """在每个 epoch 开始时检查是否需要切换训练阶段。"""
@@ -296,30 +311,30 @@ def main():
         if epoch == STAGE_CONFIG["stage1_end"] and current_stage[0] == 1:
             # 切换到 Stage 2
             current_stage[0] = 2
-            stage2_freeze = get_sda_freeze_list(model, stage=2)
-            apply_freeze(model, stage2_freeze, "Stage 2")
+            stage2_freeze = get_sda_freeze_list(trainer.model, stage=2)
+            apply_freeze(trainer.model, stage2_freeze, "Stage 2")
             # 打印 gate 值监控
-            _print_gate_values(model)
+            _print_gate_values(trainer.model)
 
         elif epoch == STAGE_CONFIG["stage2_end"] and current_stage[0] == 2:
             # 切换到 Stage 3
             current_stage[0] = 3
-            apply_freeze(model, [], "Stage 3 (全部解冻)")
-            _print_gate_values(model)
+            apply_freeze(trainer.model, [], "Stage 3 (全部解冻)")
+            _print_gate_values(trainer.model)
 
     def on_train_epoch_end(trainer):
         """每个 epoch 结束时打印 gate 值（便于监控注入强度变化）。"""
         epoch = trainer.epoch
         # 每 10 个 epoch 打印一次 gate 值
         if (epoch + 1) % 10 == 0:
-            _print_gate_values(model)
+            _print_gate_values(trainer.model)
 
     model.add_callback("on_train_start", on_train_start)
     model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
     model.add_callback("on_train_epoch_start", on_train_epoch_start)
     model.add_callback("on_train_epoch_end", on_train_epoch_end)
 
-    # 5. 设置 freeze 参数（Ultralytics 内置冻结支持，这里通过回调实现更灵活的阶段切换）
+    # 4. 开始训练（权重加载和冻结都在回调中完成）
     results = model.train(**CONFIG)
 
     # 6. 完成
@@ -334,13 +349,13 @@ def main():
     print("    - args.yaml           : 完整训练参数记录")
     print("=" * 60)
 
-    _print_gate_values(model)
+    _print_gate_values(model.model)
     return results
 
 
-def _print_gate_values(model):
+def _print_gate_values(nn_model):
     """打印当前 gate 参数值，监控注入强度。"""
-    for name, param in model.model.named_parameters():
+    for name, param in nn_model.named_parameters():
         if "alpha_" in name:
             print(f"  [gate] {name} = {param.data.item():.6f}")
 
