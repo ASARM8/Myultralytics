@@ -129,10 +129,14 @@ def draw_obb_boxes(img, boxes, color, line_width=2, font_scale=0.5, label_prefix
         cv2.polylines(img, [pts], isClosed=True, color=color, thickness=line_width)
 
         if label:
-            # 在第一个顶点上方绘制标签
-            x, y = pts[0]
-            y_text = max(y - 5, 15)
-            cv2.putText(img, label, (x, y_text),
+            # 计算文字的尺寸以便居中
+            (text_w, text_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, 1)
+            # 在框的中心绘制标签
+            center_x, center_y = np.mean(pts, axis=0).astype(int)
+            # 左下角对齐坐标
+            text_x = center_x - text_w // 2
+            text_y = center_y + text_h // 2
+            cv2.putText(img, label, (text_x, text_y),
                         cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, 1, cv2.LINE_AA)
     return img
 
@@ -199,6 +203,7 @@ def process_single_image(img_path, model_a, model_b, gt_label_dir, config):
             gt_boxes.append((cls_id, pts))
         draw_obb_boxes(panel_gt, gt_boxes, COLOR_GT, lw, fs, label_prefix="GT ")
     panel_gt = add_title_bar(panel_gt, f"Ground Truth ({len(gt_boxes)} objs)", th)
+    print(f"  [-] GT 真实框数量: {len(gt_boxes)}")
 
     # --- 面板 3：模型 A 检测 ---
     panel_a = img.copy()
@@ -209,6 +214,7 @@ def process_single_image(img_path, model_a, model_b, gt_label_dir, config):
     boxes_a = extract_obb_results(results_a)
     draw_obb_boxes(panel_a, boxes_a, COLOR_A, lw, fs)
     panel_a = add_title_bar(panel_a, f"{config['label_a']} ({len(boxes_a)} dets)", th)
+    print(f"  [-] {config['label_a']} 预测框数量: {len(boxes_a)}")
 
     # --- 面板 4：模型 B 检测 ---
     panel_b = img.copy()
@@ -219,6 +225,7 @@ def process_single_image(img_path, model_a, model_b, gt_label_dir, config):
     boxes_b = extract_obb_results(results_b)
     draw_obb_boxes(panel_b, boxes_b, COLOR_B, lw, fs)
     panel_b = add_title_bar(panel_b, f"{config['label_b']} ({len(boxes_b)} dets)", th)
+    print(f"  [-] {config['label_b']} 预测框数量: {len(boxes_b)}")
 
     # --- 拼接 2×2 ---
     top_row = np.hstack([panel_orig, panel_gt])

@@ -1012,7 +1012,7 @@ class v8OBBLoss(v8DetectionLoss):
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
-        loss = torch.zeros(4, device=self.device)  # box, cls, dfl, angle
+        loss = torch.zeros(5, device=self.device)  # box, cls, dfl, angle, aux_geo
         pred_distri, pred_scores, pred_angle = (
             preds["boxes"].permute(0, 2, 1).contiguous(),
             preds["scores"].permute(0, 2, 1).contiguous(),
@@ -1067,6 +1067,11 @@ class v8OBBLoss(v8DetectionLoss):
 
         # Bbox loss
         if fg_mask.sum():
+            weight = target_scores.sum(-1)[fg_mask]
+            # Width-Aware 辅助几何损失（在 stride 归一化前计算，此时 target_bboxes 为 pixel 坐标）
+            loss[4] = self.calculate_aux_geo_loss(
+                pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, stride_tensor
+            )
             target_bboxes[..., :4] /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
@@ -1079,7 +1084,6 @@ class v8OBBLoss(v8DetectionLoss):
                 imgsz,
                 stride_tensor,
             )
-            weight = target_scores.sum(-1)[fg_mask]
             loss[3] = self.calculate_angle_loss(
                 pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum
             )  # angle loss
@@ -1090,8 +1094,9 @@ class v8OBBLoss(v8DetectionLoss):
         loss[1] *= self.hyp.cls  # cls gain
         loss[2] *= self.hyp.dfl  # dfl gain
         loss[3] *= self.hyp.angle  # angle gain
+        loss[4] *= self.hyp.aux_geo  # aux_geo gain
 
-        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, angle)
+        return loss * batch_size, loss.detach()  # loss(box, cls, dfl, angle, aux_geo)
 
     def bbox_decode(
         self, anchor_points: torch.Tensor, pred_dist: torch.Tensor, pred_angle: torch.Tensor
@@ -1110,6 +1115,77 @@ class v8OBBLoss(v8DetectionLoss):
             b, a, c = pred_dist.shape  # batch, anchors, channels
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
+
+    def calculate_aux_geo_loss(self, pred_bboxes, target_bboxes, fg_mask,
+                                weight, target_scores_sum, stride_tensor):
+        """Width-Aware 辅助几何损失：仅对细长目标 (AR>30 或短边<12px) 施加额外监督。
+
+        包含三个分量：
+        1. 法向偏移损失 L_perp：惩罚垂直于长轴方向的中心偏移，按短边归一化
+        2. 宽度损失 L_w：对数尺度的短边相对误差
+        3. 角度损失 L_theta：1 - cos(Δθ)，对小角度误差高灵敏
+
+        Args:
+            pred_bboxes: (B, H*W, 5) 预测框 [x,y,w,h,θ] grid 单位
+            target_bboxes: (B, H*W, 5) 目标框 [x,y,w,h,θ] pixel 单位（stride 归一化之前）
+            fg_mask: (B, H*W) 前景掩码
+            weight: (N_fg,) TAL 分配权重
+            target_scores_sum: 归一化因子
+            stride_tensor: (H*W, 1) 每个 anchor 的 stride
+        """
+        eps = 1e-6
+
+        # 取前景样本的目标框（pixel 坐标）
+        tgt = target_bboxes[fg_mask]  # (N_fg, 5)
+        # 预测框转 pixel 坐标
+        pred_px = pred_bboxes.clone()
+        pred_px[..., :4] *= stride_tensor
+        pred = pred_px[fg_mask]  # (N_fg, 5)
+
+        w_gt, h_gt = tgt[:, 2], tgt[:, 3]
+        w_pred, h_pred = pred[:, 2], pred[:, 3]
+        theta_gt, theta_pred = tgt[:, 4], pred[:, 4]
+
+        # 确定长短边和长轴方向
+        w_is_long = w_gt >= h_gt
+        short_gt = torch.where(w_is_long, h_gt, w_gt)
+        long_gt = torch.where(w_is_long, w_gt, h_gt)
+        # 长轴方向角
+        theta_long = theta_gt + torch.where(
+            w_is_long, torch.zeros_like(theta_gt), torch.full_like(theta_gt, math.pi / 2)
+        )
+
+        # 门控：仅对 AR>阈值 或 短边<阈值 的目标启用（阈值从 hyp 读取）
+        ar_thresh = self.hyp.aux_geo_ar   # 默认 30.0
+        ws_thresh = self.hyp.aux_geo_ws   # 默认 12.0
+        ar = long_gt / (short_gt + eps)
+        gate = ((ar > ar_thresh) | (short_gt < ws_thresh)).float()
+
+        if gate.sum() == 0:
+            return torch.tensor(0.0, device=pred_bboxes.device)
+
+        # 1) 法向偏移损失：|(c_pred - c_gt) · n_gt| / (w_short + ε)
+        center_offset = pred[:, :2] - tgt[:, :2]
+        n_x = -torch.sin(theta_long)
+        n_y = torch.cos(theta_long)
+        d_perp = (center_offset[:, 0] * n_x + center_offset[:, 1] * n_y).abs()
+        loss_perp = d_perp / (short_gt + eps)
+
+        # 2) 宽度损失：|log(w_short_pred / w_short_gt)|
+        short_pred = torch.min(w_pred, h_pred)
+        loss_w = torch.abs(torch.log((short_pred + eps) / (short_gt + eps)))
+
+        # 3) 角度损失：1 - cos(θ_pred - θ_gt)
+        loss_theta = 1.0 - torch.cos(theta_pred - theta_gt)
+
+        # 组合：gate × (λ_perp·L_perp + λ_w·L_w + λ_θ·L_θ) × TAL 权重（权重从 hyp 读取）
+        lp = self.hyp.aux_geo_lp  # 默认 1.0
+        lw = self.hyp.aux_geo_lw  # 默认 2.0
+        lt = self.hyp.aux_geo_lt  # 默认 0.5
+        aux = gate * (lp * loss_perp + lw * loss_w + lt * loss_theta)
+        aux = aux * weight
+
+        return aux.sum() / target_scores_sum
 
     def calculate_angle_loss(self, pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, lambda_val=3):
         """Calculate oriented angle loss.
