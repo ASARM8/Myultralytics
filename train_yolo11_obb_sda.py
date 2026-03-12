@@ -22,6 +22,8 @@ import re
 os.environ["OMP_NUM_THREADS"] = "8"
 
 import torch
+import numpy as np
+from collections import defaultdict
 from ultralytics import YOLO
 from ultralytics.utils.torch_utils import intersect_dicts
 
@@ -95,7 +97,7 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",
-    "name": "yolo11_obb-sda-v2",
+    "name": "check_yolo11_obb-sda-v2",
     "exist_ok": False,
 
     # ---------- 模型保存配置 ----------
@@ -130,7 +132,7 @@ CONFIG = {
     "mixup": 0.0,
 
     # ---------- 其他 ----------
-    "amp": True,
+    "amp": False,
     "cache": 'disk',
     "resume": False,
     "seed": 0,
@@ -199,6 +201,15 @@ STAGE_CONFIG = {
 # SDA 新增模块的关键字（用于识别需要在 Stage 1 解冻的参数）
 SDA_NEW_KEYWORDS = ("p3_reduce", "fuse_p4", "fuse_p5", "alpha_box", "alpha_ang",
                     "unshuffle")  # unshuffle 无参数，但保险起见也列出
+
+# 诊断 2：需要监控梯度的模块关键字
+GRAD_MONITOR_KEYWORDS = ("p3_reduce", "fuse_p4", "fuse_p5",
+                         "alpha_box_p4", "alpha_box_p5",
+                         "alpha_ang_p4", "alpha_ang_p5")
+
+# 梯度范数累积器（闭包共享）
+# 每个参数存储: {"norms": [...], "nan_count": int, "inf_count": int, "total": int}
+_grad_norms = {}
 
 
 def get_sda_freeze_list(nn_model, stage):
@@ -290,6 +301,7 @@ def main():
         1. 加载 CA 预训练权重到 trainer.model
         2. 同步更新 EMA 模型
         3. 应用 Stage 1 冻结
+        4. 注册梯度监控 hooks（诊断 2）
         """
         # (a) 加载 CA 预训练权重到 trainer 的实际模型
         load_pretrained_weights(trainer.model, PRETRAIN_WEIGHTS, device=trainer.device)
@@ -303,6 +315,9 @@ def main():
         # (c) 应用 Stage 1 冻结
         stage1_freeze = get_sda_freeze_list(trainer.model, stage=1)
         apply_freeze(trainer.model, stage1_freeze, "Stage 1")
+
+        # (d) 诊断 2：注册梯度监控 hooks
+        _register_grad_hooks(trainer.model)
 
     def on_train_epoch_start(trainer):
         """在每个 epoch 开始时检查是否需要切换训练阶段。"""
@@ -323,11 +338,13 @@ def main():
             _print_gate_values(trainer.model)
 
     def on_train_epoch_end(trainer):
-        """每个 epoch 结束时打印 gate 值（便于监控注入强度变化）。"""
+        """每个 epoch 结束时打印 gate 值和梯度统计。"""
         epoch = trainer.epoch
         # 每 10 个 epoch 打印一次 gate 值
         if (epoch + 1) % 10 == 0:
             _print_gate_values(trainer.model)
+        # 每个 epoch 打印梯度范数统计（诊断 2）
+        _report_grad_norms(epoch)
 
     model.add_callback("on_train_start", on_train_start)
     model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
@@ -358,6 +375,99 @@ def _print_gate_values(nn_model):
     for name, param in nn_model.named_parameters():
         if "alpha_" in name:
             print(f"  [gate] {name} = {param.data.item():.6f}")
+
+
+def _register_grad_hooks(nn_model):
+    """诊断 2：为 SDA 关键模块的参数注册梯度 hooks，累积梯度范数。
+
+    注意：
+    - param.register_hook 在 backward() 期间触发，此时梯度尚未被 zero_grad() 清除
+    - AMP 训练中梯度是 scaled 的，fp16 溢出会导致 inf/nan
+    - 此处先统计 nan/inf 比例，再用 nan_to_num 过滤后计算有效 norm
+    """
+    _grad_norms.clear()
+    hook_count = 0
+    for name, param in nn_model.named_parameters():
+        if any(kw in name for kw in GRAD_MONITOR_KEYWORDS):
+            def make_hook(param_name):
+                def hook_fn(grad):
+                    if param_name not in _grad_norms:
+                        _grad_norms[param_name] = {"norms": [], "nan_count": 0, "inf_count": 0, "total": 0}
+                    entry = _grad_norms[param_name]
+                    entry["total"] += 1
+                    has_nan = torch.isnan(grad).any().item()
+                    has_inf = torch.isinf(grad).any().item()
+                    if has_nan:
+                        entry["nan_count"] += 1
+                    if has_inf:
+                        entry["inf_count"] += 1
+                    # 过滤 nan/inf 后计算有效 norm
+                    clean_grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                    entry["norms"].append(clean_grad.norm().item())
+                return hook_fn
+            param.register_hook(make_hook(name))
+            hook_count += 1
+    print(f"[*] 诊断 2：已为 {hook_count} 个 SDA 参数注册梯度监控 hooks")
+
+
+def _report_grad_norms(epoch):
+    """诊断 2：汇总并打印当前 epoch 的 SDA 模块梯度范数统计。"""
+    if not _grad_norms:
+        return
+
+    print(f"\n  [诊断2] Epoch {epoch} SDA 模块梯度范数 (nan/inf 已过滤后统计):")
+    print(f"  {'参数名':>45s}  {'batches':>7s}  {'nan%':>6s}  {'inf%':>6s}  "
+          f"{'mean':>10s}  {'max':>10s}  {'min':>10s}  {'状态':>8s}")
+    print(f"  {'-'*45}  {'-'*7}  {'-'*6}  {'-'*6}  "
+          f"{'-'*10}  {'-'*10}  {'-'*10}  {'-'*8}")
+
+    for name in sorted(_grad_norms.keys()):
+        entry = _grad_norms[name]
+        norms = entry["norms"]
+        total = entry["total"]
+        if total == 0:
+            continue
+
+        nan_pct = entry["nan_count"] / total * 100
+        inf_pct = entry["inf_count"] / total * 100
+        arr = np.array(norms)
+        mean_val = arr.mean()
+        max_val = arr.max()
+        min_val = arr.min()
+
+        # 判断梯度状态（优先检测 nan/inf）
+        if nan_pct > 50:
+            status = "⚠️ 全nan"
+        elif nan_pct > 10:
+            status = "⚠️ 多nan"
+        elif inf_pct > 10:
+            status = "⚠️ 多inf"
+        elif mean_val < 1e-8:
+            status = "⚠️ 零"
+        elif mean_val < 1e-5:
+            status = "极小"
+        elif mean_val > 100:
+            status = "⚠️ 爆"
+        else:
+            status = "正常"
+
+        short_name = name.replace("model.", "") if len(name) > 45 else name
+        print(f"  {short_name:>45s}  {total:7d}  {nan_pct:5.1f}%  {inf_pct:5.1f}%  "
+              f"{mean_val:10.2e}  {max_val:10.2e}  {min_val:10.2e}  {status:>8s}")
+
+    # 诊断建议
+    any_nan = any(e["nan_count"] > 0 for e in _grad_norms.values())
+    any_all_nan = any(e["nan_count"] == e["total"] for e in _grad_norms.values() if e["total"] > 0)
+    if any_all_nan:
+        print(f"  [!] 所有 batch 梯度均含 nan → 可能原因:")
+        print(f"      1. AMP fp16 溢出（随机初始化的 SDA 模块输出值域与预训练特征不匹配）")
+        print(f"      2. loss 本身为 nan（检查训练日志中的 loss 值）")
+        print(f"      3. 尝试: 关闭 AMP (amp=False) 或降低 lr0")
+    elif any_nan:
+        print(f"  [!] 部分 batch 梯度含 nan → AMP 偶发溢出，通常无害（scaler 会自动跳过）")
+
+    # 清空累积器，为下一个 epoch 准备
+    _grad_norms.clear()
 
 
 if __name__ == "__main__":
