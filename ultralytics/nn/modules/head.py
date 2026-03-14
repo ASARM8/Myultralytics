@@ -510,6 +510,123 @@ class OBB(Detect):
         self.cv2 = self.cv3 = self.cv4 = None
 
 
+class OBBRefine(OBB):
+    """OBB 检测头 + 轻量宽度/角度精修分支。
+
+    在原有 OBB 头（DFL box + cls + angle）基础上，新增 cv5 分支预测 [Δw, Δh, Δθ]，
+    绕过 DFL 离散化瓶颈，直接用连续回归修正短边宽度和角度。
+
+    Attributes:
+        ne_refine (int): 精修通道数（默认 3 = [Δw, Δh, Δθ]）。
+        cv5 (nn.ModuleList): 精修分支卷积层。
+        refine_tau (float): 角度修正上限（弧度，默认 5° ≈ 0.087）。
+        refine_clamp (float): Δw/Δh clamp 范围（默认 1.0 → [e⁻¹, e¹]）。
+    """
+
+    def __init__(self, nc: int = 80, ne: int = 1, ne_refine: int = 3, reg_max=16, end2end=False, ch: tuple = ()):
+        """初始化 OBBRefine，在 OBB 基础上增加精修分支。
+
+        Args:
+            nc (int): 类别数。
+            ne (int): 角度预测通道数。
+            ne_refine (int): 精修通道数（[Δw, Δh, Δθ]）。
+            reg_max (int): DFL 通道数。
+            end2end (bool): 是否使用端到端检测。
+            ch (tuple): 各 FPN 层的通道数。
+        """
+        super().__init__(nc, ne, reg_max, end2end, ch)
+        self.ne_refine = ne_refine
+        self.refine_tau = 5 * math.pi / 180  # 5° 角度修正上限
+        self.refine_clamp = 1.0  # Δw/Δh clamp 范围
+
+        # 轻量精修分支：结构与 cv4 (angle head) 相同
+        c5 = max(ch[0] // 4, ne_refine)
+        self.cv5 = nn.ModuleList(
+            nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, ne_refine, 1)) for x in ch
+        )
+        # 零初始化最后一层 → 训练开始时 refine = 0 → identity（exp(0)=1, tanh(0)=0）
+        for seq in self.cv5:
+            nn.init.zeros_(seq[-1].weight)
+            nn.init.zeros_(seq[-1].bias)
+
+        if end2end:
+            self.one2one_cv5 = copy.deepcopy(self.cv5)
+
+    @property
+    def one2many(self):
+        """返回 one-to-many 头组件（含精修分支）。"""
+        return dict(box_head=self.cv2, cls_head=self.cv3, angle_head=self.cv4, refine_head=self.cv5)
+
+    @property
+    def one2one(self):
+        """返回 one-to-one 头组件（含精修分支）。"""
+        return dict(
+            box_head=self.one2one_cv2, cls_head=self.one2one_cv3,
+            angle_head=self.one2one_cv4, refine_head=self.one2one_cv5,
+        )
+
+    def forward_head(
+        self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module,
+        angle_head: torch.nn.Module, refine_head: torch.nn.Module = None,
+    ) -> dict[str, torch.Tensor]:
+        """前向传播：在 OBB 输出基础上额外输出精修 delta。"""
+        preds = super().forward_head(x, box_head, cls_head, angle_head)
+        if refine_head is not None:
+            bs = x[0].shape[0]
+            refine = torch.cat(
+                [refine_head[i](x[i]).view(bs, self.ne_refine, -1) for i in range(self.nl)], 2
+            )  # (B, ne_refine, H*W) — raw deltas，不加激活
+            preds["refine"] = refine
+        return preds
+
+    def _apply_wh_refine(self, dbox: torch.Tensor, refine: torch.Tensor) -> torch.Tensor:
+        """对解码后的 xywh 框（pixel 单位）应用 Δw/Δh 修正。
+
+        Args:
+            dbox (torch.Tensor): (B, 4, H*W) 解码后的 [x, y, w, h]，pixel 单位。
+            refine (torch.Tensor): (B, ne_refine, H*W) 精修 delta。
+
+        Returns:
+            (torch.Tensor): 修正后的 (B, 4, H*W) [x, y, w_ref, h_ref]。
+        """
+        dw = refine[:, 0:1, :].clamp(-self.refine_clamp, self.refine_clamp)
+        dh = refine[:, 1:2, :].clamp(-self.refine_clamp, self.refine_clamp)
+        return torch.cat([
+            dbox[:, 0:2, :],                          # x, y 不变
+            dbox[:, 2:3, :] * torch.exp(dw),           # w × exp(Δw)
+            dbox[:, 3:4, :] * torch.exp(dh),           # h × exp(Δh)
+        ], dim=1)
+
+    def _get_decode_boxes(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """解码边框并应用 Δw/Δh 精修。"""
+        dbox = super()._get_decode_boxes(x)  # (B, 4, H*W) xywh pixel 单位
+        refine = x.get("refine")
+        if refine is not None:
+            dbox = self._apply_wh_refine(dbox, refine)
+        return dbox
+
+    def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
+        """推理路径：解码框 + 分类 + 精修角度。"""
+        self.angle = x["angle"]  # decode_bboxes 需要
+        # 调用 Detect._inference（跳过 OBB._inference，避免重复拼接 angle）
+        preds = Detect._inference(self, x)  # (B, 4+nc, H*W)，dbox 已含 Δw/Δh 修正
+
+        # 角度修正
+        refine = x.get("refine")
+        if refine is not None and self.ne_refine >= 3:
+            dt = refine[:, 2:3, :]
+            angle_out = x["angle"] + self.refine_tau * torch.tanh(dt)
+        else:
+            angle_out = x["angle"]
+
+        return torch.cat([preds, angle_out], dim=1)
+
+    def fuse(self) -> None:
+        """移除 one2many 头以优化推理。"""
+        super().fuse()
+        self.cv5 = None
+
+
 class OBB26(OBB):
     """YOLO26 OBB detection head for detection with rotation models. This class extends the OBB head with modified angle
     processing that outputs raw angle predictions without sigmoid transformation, compared to the original

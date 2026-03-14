@@ -1043,7 +1043,23 @@ class v8OBBLoss(v8DetectionLoss):
             ) from e
 
         # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xyxy, (b, h*w, 4)
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xywhr, (b, h*w, 5)
+
+        # Refine Head：若 preds 包含 "refine" 键，应用 Δw/Δh/Δθ 修正（绕过 DFL 离散化瓶颈）
+        pred_refine = preds.get("refine")
+        if pred_refine is not None:
+            rf = pred_refine.permute(0, 2, 1)  # (B, H*W, ne_refine)
+            refine_clamp = 1.0  # [e⁻¹, e¹] ≈ [0.37, 2.72]
+            refine_tau = 5 * math.pi / 180  # 5° 角度修正上限
+            dw = rf[..., 0:1].clamp(-refine_clamp, refine_clamp)
+            dh = rf[..., 1:2].clamp(-refine_clamp, refine_clamp)
+            pred_bboxes = torch.cat([
+                pred_bboxes[..., 0:2],                          # x, y 不变
+                pred_bboxes[..., 2:3] * torch.exp(dw),          # w × exp(Δw)
+                pred_bboxes[..., 3:4] * torch.exp(dh),          # h × exp(Δh)
+                pred_bboxes[..., 4:5] + refine_tau * torch.tanh(rf[..., 2:3]) if rf.shape[-1] >= 3
+                else pred_bboxes[..., 4:5],                     # θ + τ·tanh(Δθ)
+            ], dim=-1)
 
         bboxes_for_assigner = pred_bboxes.clone().detach()
         # Only the first four elements need to be scaled
@@ -1089,6 +1105,9 @@ class v8OBBLoss(v8DetectionLoss):
             )  # angle loss
         else:
             loss[0] += (pred_angle * 0).sum()
+            # Refine Head：确保 cv5 参数在计算图中（DDP 兼容）
+            if pred_refine is not None:
+                loss[0] += (pred_refine * 0).sum()
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
