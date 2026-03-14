@@ -92,7 +92,7 @@ CONFIG = {
     "batch": 16,
     "imgsz": 1024,
     "device": 0,
-    "workers": 16,
+    "workers": 16,  # 临时设为 0 排查多进程崩溃根因；确认无误后改回 8
     "patience": 0,
 
     # ---------- 输出目录配置 ----------
@@ -163,7 +163,7 @@ def main():
         """在模型构建完成后、训练循环开始前，注入 WAG 预训练权重。"""
         print(f"\n[*] 加载预训练权重: {PRETRAIN_WEIGHTS}")
 
-        ckpt = torch.load(PRETRAIN_WEIGHTS, map_location=trainer.device)
+        ckpt = torch.load(PRETRAIN_WEIGHTS, map_location=trainer.device, weights_only=False)
         if "model" in ckpt:
             src_state = ckpt["model"].float().state_dict()
         else:
