@@ -73,7 +73,7 @@ class Logger(object):
 # WAG 预训练权重路径（用于初始化，cv5 不在其中，将保持零初始化）
 # WAG 版本 = CA + 150 epochs 额外训练，aux_geo=0 即等效 CA
 # 现在有 Refine Head，aux_geo 梯度通过 cv5 连续参数流回，不再受 DFL 死区限制
-PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-wag/weights/best.pt"
+PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"

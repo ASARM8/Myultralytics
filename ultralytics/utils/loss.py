@@ -1043,25 +1043,28 @@ class v8OBBLoss(v8DetectionLoss):
             ) from e
 
         # Pboxes
-        pred_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xywhr, (b, h*w, 5)
+        coarse_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xywhr, (b, h*w, 5)
+        pred_bboxes = coarse_bboxes
 
         # Refine Head：若 preds 包含 "refine" 键，应用 Δw/Δh/Δθ 修正（绕过 DFL 离散化瓶颈）
         pred_refine = preds.get("refine")
+        refined_bboxes = coarse_bboxes
         if pred_refine is not None:
             rf = pred_refine.permute(0, 2, 1)  # (B, H*W, ne_refine)
             refine_clamp = 1.0  # [e⁻¹, e¹] ≈ [0.37, 2.72]
             refine_tau = 5 * math.pi / 180  # 5° 角度修正上限
             dw = rf[..., 0:1].clamp(-refine_clamp, refine_clamp)
             dh = rf[..., 1:2].clamp(-refine_clamp, refine_clamp)
-            pred_bboxes = torch.cat([
-                pred_bboxes[..., 0:2],                          # x, y 不变
-                pred_bboxes[..., 2:3] * torch.exp(dw),          # w × exp(Δw)
-                pred_bboxes[..., 3:4] * torch.exp(dh),          # h × exp(Δh)
-                pred_bboxes[..., 4:5] + refine_tau * torch.tanh(rf[..., 2:3]) if rf.shape[-1] >= 3
-                else pred_bboxes[..., 4:5],                     # θ + τ·tanh(Δθ)
+            refined_bboxes = torch.cat([
+                coarse_bboxes[..., 0:2],
+                coarse_bboxes[..., 2:3] * torch.exp(dw),
+                coarse_bboxes[..., 3:4] * torch.exp(dh),
+                coarse_bboxes[..., 4:5] + refine_tau * torch.tanh(rf[..., 2:3]) if rf.shape[-1] >= 3
+                else coarse_bboxes[..., 4:5],
             ], dim=-1)
+            refined_bboxes = refined_bboxes.to(dtype=coarse_bboxes.dtype, device=coarse_bboxes.device)
 
-        bboxes_for_assigner = pred_bboxes.clone().detach()
+        bboxes_for_assigner = coarse_bboxes.clone().detach()
         # Only the first four elements need to be scaled
         bboxes_for_assigner[..., :4] *= stride_tensor
         # Coverage-Aware: 传递 stride_tensor 给 assigner 用于覆盖感知掩码计算
@@ -1084,6 +1087,22 @@ class v8OBBLoss(v8DetectionLoss):
         # Bbox loss
         if fg_mask.sum():
             weight = target_scores.sum(-1)[fg_mask]
+            pred_bboxes = coarse_bboxes
+            if pred_refine is not None:
+                target_fg = target_bboxes[fg_mask]
+                short_gt = target_fg[:, 2:4].amin(dim=-1)
+                long_gt = target_fg[:, 2:4].amax(dim=-1)
+                ar = long_gt / short_gt.clamp_min(1e-6)
+                refine_mask = (ar > float(self.hyp.aux_geo_ar)) | (short_gt < 16.0)
+                if refine_mask.any():
+                    pred_bboxes = coarse_bboxes.clone()
+                    pred_bboxes_fg = torch.where(
+                        refine_mask.unsqueeze(-1),
+                        refined_bboxes[fg_mask],
+                        coarse_bboxes[fg_mask],
+                    )
+                    pred_bboxes_fg = pred_bboxes_fg.to(dtype=pred_bboxes.dtype, device=pred_bboxes.device)
+                    pred_bboxes[fg_mask] = pred_bboxes_fg
             # Width-Aware 辅助几何损失（在 stride 归一化前计算，此时 target_bboxes 为 pixel 坐标）
             loss[4] = self.calculate_aux_geo_loss(
                 pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, stride_tensor
@@ -1105,9 +1124,8 @@ class v8OBBLoss(v8DetectionLoss):
             )  # angle loss
         else:
             loss[0] += (pred_angle * 0).sum()
-            # Refine Head：确保 cv5 参数在计算图中（DDP 兼容）
-            if pred_refine is not None:
-                loss[0] += (pred_refine * 0).sum()
+        if pred_refine is not None:
+            loss[0] += (pred_refine * 0).sum()
 
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.cls  # cls gain
