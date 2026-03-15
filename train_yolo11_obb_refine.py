@@ -133,10 +133,10 @@ CONFIG = {
 
     # ---------- 损失权重 ----------
     # aux_geo: 辅助几何损失增益（梯度现在通过 cv5 连续参数有效流回）
-    "aux_geo": 0.5,
+    "aux_geo": 0.2,
     "aux_geo_lp": 0.0,    # L_perp（法向偏移）：本次不做 Δn，关闭
     "aux_geo_lw": 2.0,
-    "aux_geo_lt": 0.5,
+    "aux_geo_lt": 0.0,
     "aux_geo_ar": 30.0,             
     "aux_geo_ws": 12.0,
 
