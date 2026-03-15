@@ -523,7 +523,17 @@ class OBBRefine(OBB):
         refine_clamp (float): Δw/Δh clamp 范围（默认 1.0 → [e⁻¹, e¹]）。
     """
 
-    def __init__(self, nc: int = 80, ne: int = 1, ne_refine: int = 3, reg_max=16, end2end=False, ch: tuple = ()):
+    def __init__(
+        self,
+        nc: int = 80,
+        ne: int = 1,
+        ne_refine: int = 3,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+        refine_select_ar: float = 30.0,
+        refine_select_ws: float = 16.0,
+    ):
         """初始化 OBBRefine，在 OBB 基础上增加精修分支。
 
         Args:
@@ -538,6 +548,9 @@ class OBBRefine(OBB):
         self.ne_refine = ne_refine
         self.refine_tau = 5 * math.pi / 180  # 5° 角度修正上限
         self.refine_clamp = 1.0  # Δw/Δh clamp 范围
+        self.refine_select_ar = refine_select_ar
+        self.refine_select_ws = refine_select_ws
+        self._refine_gate = None
 
         # 轻量精修分支：结构与 cv4 (angle head) 相同
         c5 = max(ch[0] // 4, ne_refine)
@@ -579,7 +592,16 @@ class OBBRefine(OBB):
             preds["refine"] = refine
         return preds
 
-    def _apply_wh_refine(self, dbox: torch.Tensor, refine: torch.Tensor) -> torch.Tensor:
+    def _build_refine_gate(self, dbox: torch.Tensor) -> torch.Tensor:
+        """根据 coarse 框几何形状构建选择性 refine 掩码。"""
+        short_side = torch.minimum(dbox[:, 2:3, :], dbox[:, 3:4, :])
+        long_side = torch.maximum(dbox[:, 2:3, :], dbox[:, 3:4, :])
+        ar = long_side / short_side.clamp_min(1e-6)
+        ar_thr = getattr(self, "refine_select_ar", 30.0)
+        ws_thr = getattr(self, "refine_select_ws", 16.0)
+        return (ar > ar_thr) | (short_side < ws_thr)
+
+    def _apply_wh_refine(self, dbox: torch.Tensor, refine: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         """对解码后的 xywh 框（pixel 单位）应用 Δw/Δh 修正。
 
         Args:
@@ -591,6 +613,10 @@ class OBBRefine(OBB):
         """
         dw = refine[:, 0:1, :].clamp(-self.refine_clamp, self.refine_clamp)
         dh = refine[:, 1:2, :].clamp(-self.refine_clamp, self.refine_clamp)
+        if gate is not None:
+            gate = gate.to(dtype=dw.dtype, device=dw.device)
+            dw = dw * gate
+            dh = dh * gate
         return torch.cat([
             dbox[:, 0:2, :],                          # x, y 不变
             dbox[:, 2:3, :] * torch.exp(dw),           # w × exp(Δw)
@@ -602,7 +628,10 @@ class OBBRefine(OBB):
         dbox = super()._get_decode_boxes(x)  # (B, 4, H*W) xywh pixel 单位
         refine = x.get("refine")
         if refine is not None:
-            dbox = self._apply_wh_refine(dbox, refine)
+            self._refine_gate = self._build_refine_gate(dbox)
+            dbox = self._apply_wh_refine(dbox, refine, self._refine_gate)
+        else:
+            self._refine_gate = None
         return dbox
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -615,6 +644,8 @@ class OBBRefine(OBB):
         refine = x.get("refine")
         if refine is not None and self.ne_refine >= 3:
             dt = refine[:, 2:3, :]
+            if self._refine_gate is not None:
+                dt = dt * self._refine_gate.to(dtype=dt.dtype, device=dt.device)
             angle_out = x["angle"] + self.refine_tau * torch.tanh(dt)
         else:
             angle_out = x["angle"]

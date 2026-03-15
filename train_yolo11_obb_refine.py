@@ -137,7 +137,7 @@ CONFIG = {
     "aux_geo_lp": 0.0,    # L_perp（法向偏移）：本次不做 Δn，关闭
     "aux_geo_lw": 2.0,
     "aux_geo_lt": 0.5,
-    "aux_geo_ar": 30.0,
+    "aux_geo_ar": 30.0,             
     "aux_geo_ws": 12.0,
 
     # ---------- 其他 ----------
