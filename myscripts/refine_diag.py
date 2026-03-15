@@ -10,6 +10,7 @@ Refine Head v1 诊断脚本
 """
 
 import math
+import os
 import torch
 import numpy as np
 from collections import defaultdict
@@ -27,6 +28,97 @@ MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine/weights/best.pt"
 DATA_PATH = "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml"
 NUM_BATCHES = 100  # 诊断用的 batch 数
 DEVICE = 0
+REPORT_PATH = "/root/autodl-tmp/work-dirs/refine_diag/refine_diag_results.md"
+SMALL_SHORT_SIDE_PX = 16.0
+MEDIUM_SHORT_SIDE_PX = 32.0
+
+
+def extend_stats(stats, key, tensor):
+    if tensor is None:
+        return
+    tensor = tensor.detach().reshape(-1)
+    if tensor.numel() == 0:
+        return
+    stats[key].extend(tensor.cpu().tolist())
+
+
+def apply_refine_to_bboxes(coarse_bboxes, pred_refine, clamp_val, tau):
+    if pred_refine is None:
+        return coarse_bboxes
+    rf = pred_refine.permute(0, 2, 1)
+    dw = rf[..., 0:1].clamp(-clamp_val, clamp_val)
+    dh = rf[..., 1:2].clamp(-clamp_val, clamp_val)
+    angle = coarse_bboxes[..., 4:5] + tau * torch.tanh(rf[..., 2:3]) if rf.shape[-1] >= 3 else coarse_bboxes[..., 4:5]
+    return torch.cat(
+        [
+            coarse_bboxes[..., 0:2],
+            coarse_bboxes[..., 2:3] * torch.exp(dw),
+            coarse_bboxes[..., 3:4] * torch.exp(dh),
+            angle,
+        ],
+        dim=-1,
+    )
+
+
+def build_assignment_diagnostics(criterion, detect_head, preds, batch):
+    if not isinstance(preds, dict):
+        return None
+    pred_distri = preds["boxes"]
+    pred_scores = preds["scores"]
+    pred_angle = preds["angle"]
+    pred_refine = preds.get("refine")
+    feats = preds["feats"]
+
+    anchor_points, stride_tensor = make_anchors(feats, detect_head.stride, 0.5)
+    pd = pred_distri.permute(0, 2, 1).contiguous()
+    pa = pred_angle.permute(0, 2, 1).contiguous()
+
+    coarse_bboxes = criterion.bbox_decode(anchor_points, pd, pa)
+    refined_bboxes = apply_refine_to_bboxes(
+        coarse_bboxes,
+        pred_refine,
+        clamp_val=float(getattr(detect_head, "refine_clamp", 1.0)),
+        tau=float(getattr(detect_head, "refine_tau", 5 * math.pi / 180)),
+    )
+
+    coarse_bboxes_px = coarse_bboxes.clone()
+    refined_bboxes_px = refined_bboxes.clone()
+    coarse_bboxes_px[..., :4] *= stride_tensor
+    refined_bboxes_px[..., :4] *= stride_tensor
+
+    batch_size = pred_angle.shape[0]
+    dtype = pred_scores.dtype
+    imgsz = torch.tensor(feats[0].shape[2:], device=criterion.device, dtype=dtype) * criterion.stride[0]
+    batch_idx = batch["batch_idx"].view(-1, 1)
+    targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
+    rw, rh = targets[:, 4] * float(imgsz[1]), targets[:, 5] * float(imgsz[0])
+    targets = targets[(rw >= 2) & (rh >= 2)]
+    targets = criterion.preprocess(targets.to(criterion.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+    gt_labels, gt_bboxes = targets.split((1, 5), 2)
+    mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
+
+    criterion.assigner._stride_tensor = stride_tensor
+    ps = pred_scores.detach().permute(0, 2, 1).contiguous().sigmoid()
+    _, target_bboxes, target_scores, fg_mask, target_gt_idx = criterion.assigner(
+        ps,
+        refined_bboxes_px.type(gt_bboxes.dtype),
+        anchor_points * stride_tensor,
+        gt_labels,
+        gt_bboxes,
+        mask_gt,
+    )
+
+    return {
+        "coarse_bboxes": coarse_bboxes,
+        "refined_bboxes": refined_bboxes,
+        "coarse_bboxes_px": coarse_bboxes_px,
+        "refined_bboxes_px": refined_bboxes_px,
+        "pred_refine": pred_refine,
+        "target_bboxes": target_bboxes,
+        "target_scores": target_scores,
+        "target_gt_idx": target_gt_idx,
+        "fg_mask": fg_mask,
+    }
 
 
 def collect_diagnostics():
@@ -193,42 +285,63 @@ def collect_diagnostics():
             else:
                 train_preds2 = preds2
 
-            if isinstance(train_preds2, dict):
-                pred_distri = train_preds2["boxes"]  # (B, 4*reg_max, H*W)
-                pred_angle = train_preds2["angle"]  # (B, 1, H*W)
-                pred_refine = train_preds2.get("refine")
-                feats = train_preds2["feats"]
+            diag = build_assignment_diagnostics(criterion, detect_head, train_preds2, batch)
+            if diag is not None:
+                coarse_bboxes = diag["coarse_bboxes"]
+                refined_bboxes = diag["refined_bboxes"]
+                pred_refine = diag["pred_refine"]
+                fg_mask = diag["fg_mask"]
+                target_bboxes = diag["target_bboxes"]
 
-                stride = detect_head.stride
-                anchor_points, stride_tensor = make_anchors(feats, stride, 0.5)
-
-                # 解码粗框（无 refine）
-                pd = pred_distri.permute(0, 2, 1).contiguous()
-                pa = pred_angle.permute(0, 2, 1).contiguous()
-                coarse_bboxes = criterion.bbox_decode(anchor_points, pd, pa)
-
-                # 解码精修框
                 if pred_refine is not None:
-                    rf = pred_refine.permute(0, 2, 1)
-                    tau = 5 * math.pi / 180
-                    clamp_val = 1.0
-                    dw_val = rf[..., 0:1].clamp(-clamp_val, clamp_val)
-                    dh_val = rf[..., 1:2].clamp(-clamp_val, clamp_val)
-                    refined_bboxes = torch.cat([
-                        coarse_bboxes[..., 0:2],
-                        coarse_bboxes[..., 2:3] * torch.exp(dw_val),
-                        coarse_bboxes[..., 3:4] * torch.exp(dh_val),
-                        coarse_bboxes[..., 4:5] + tau * torch.tanh(rf[..., 2:3])
-                        if rf.shape[-1] >= 3 else coarse_bboxes[..., 4:5],
-                    ], dim=-1)
-
-                    # 对比 coarse vs refined 的差异
                     w_diff = (refined_bboxes[..., 2] - coarse_bboxes[..., 2]).abs()
                     h_diff = (refined_bboxes[..., 3] - coarse_bboxes[..., 3]).abs()
                     a_diff = (refined_bboxes[..., 4] - coarse_bboxes[..., 4]).abs()
                     stats["refine_w_diff_mean"].append(w_diff.mean().item())
                     stats["refine_h_diff_mean"].append(h_diff.mean().item())
                     stats["refine_a_diff_mean"].append(a_diff.mean().item())
+
+                if fg_mask.any():
+                    coarse_pos = diag["coarse_bboxes_px"][fg_mask]
+                    refined_pos = diag["refined_bboxes_px"][fg_mask]
+                    matched_gt_pos = target_bboxes[fg_mask]
+
+                    coarse_iou = probiou(coarse_pos, matched_gt_pos).reshape(-1)
+                    refined_iou = probiou(refined_pos, matched_gt_pos).reshape(-1)
+                    delta_iou = refined_iou - coarse_iou
+
+                    extend_stats(stats, "pos_coarse_iou", coarse_iou)
+                    extend_stats(stats, "pos_refined_iou", refined_iou)
+                    extend_stats(stats, "pos_delta_iou", delta_iou)
+                    extend_stats(stats, "pos_abs_delta_iou", delta_iou.abs())
+
+                    short_side = matched_gt_pos[:, 2:4].amin(dim=-1)
+                    long_side = matched_gt_pos[:, 2:4].amax(dim=-1)
+                    aspect_ratio = long_side / short_side.clamp_min(1e-6)
+
+                    extend_stats(stats, "pos_short_side_px", short_side)
+                    extend_stats(stats, "pos_aspect_ratio", aspect_ratio)
+
+                    thin_mask = (aspect_ratio > float(criterion.hyp.aux_geo_ar)) | (
+                        short_side < float(criterion.hyp.aux_geo_ws)
+                    )
+                    if thin_mask.any():
+                        extend_stats(stats, "thin_pos_coarse_iou", coarse_iou[thin_mask])
+                        extend_stats(stats, "thin_pos_refined_iou", refined_iou[thin_mask])
+                        extend_stats(stats, "thin_pos_delta_iou", delta_iou[thin_mask])
+                        extend_stats(stats, "thin_pos_abs_delta_iou", delta_iou[thin_mask].abs())
+
+                    bucket_masks = {
+                        "small": short_side < SMALL_SHORT_SIDE_PX,
+                        "medium": (short_side >= SMALL_SHORT_SIDE_PX) & (short_side < MEDIUM_SHORT_SIDE_PX),
+                        "large": short_side >= MEDIUM_SHORT_SIDE_PX,
+                    }
+                    for bucket_name, bucket_mask in bucket_masks.items():
+                        if bucket_mask.any():
+                            extend_stats(stats, f"{bucket_name}_pos_coarse_iou", coarse_iou[bucket_mask])
+                            extend_stats(stats, f"{bucket_name}_pos_refined_iou", refined_iou[bucket_mask])
+                            extend_stats(stats, f"{bucket_name}_pos_delta_iou", delta_iou[bucket_mask])
+                            extend_stats(stats, f"{bucket_name}_pos_abs_delta_iou", delta_iou[bucket_mask].abs())
 
         if (batch_idx + 1) % 20 == 0:
             print(f"  已处理 {batch_idx + 1}/{NUM_BATCHES} batches")
@@ -239,6 +352,31 @@ def collect_diagnostics():
     def log_and_print(text):
         print(text)
         report_lines.append(text)
+
+    def get_array(key):
+        return np.array(stats.get(key, []), dtype=float)
+
+    def log_iou_block(title, coarse_key, refined_key, delta_key, abs_delta_key):
+        coarse = get_array(coarse_key)
+        refined = get_array(refined_key)
+        delta = get_array(delta_key)
+        abs_delta = get_array(abs_delta_key)
+        log_and_print("\n" + "=" * 60)
+        log_and_print(title)
+        log_and_print("=" * 60)
+        if delta.size == 0:
+            log_and_print("  无样本")
+            return
+        log_and_print(f"  样本数: {delta.size}")
+        log_and_print(f"  coarse IoU:  mean={coarse.mean():.6f}, median={np.median(coarse):.6f}")
+        log_and_print(f"  refined IoU: mean={refined.mean():.6f}, median={np.median(refined):.6f}")
+        log_and_print(
+            f"  ΔIoU:        mean={delta.mean():.6f}, median={np.median(delta):.6f}, "
+            f"p25={np.percentile(delta, 25):.6f}, p75={np.percentile(delta, 75):.6f}"
+        )
+        log_and_print(f"  |ΔIoU| mean: {abs_delta.mean():.6f}")
+        log_and_print(f"  ΔIoU > 0 比例: {(delta > 0).mean() * 100:.2f}%")
+        log_and_print(f"  ΔIoU < 0 比例: {(delta < 0).mean() * 100:.2f}%")
 
     log_and_print("\n" + "=" * 60)
     log_and_print("假设 1：cv5 输出（Δw/Δh/Δθ）是否接近零？")
@@ -287,17 +425,64 @@ def collect_diagnostics():
             vals = np.array(stats[key])
             log_and_print(f"  {label}: mean={vals.mean():.6f}")
 
+    log_iou_block(
+        "新增诊断 4：正样本上的 coarse IoU vs refined IoU",
+        "pos_coarse_iou",
+        "pos_refined_iou",
+        "pos_delta_iou",
+        "pos_abs_delta_iou",
+    )
+
+    log_iou_block(
+        "新增诊断 5：细长目标子集（thin positives）IoU",
+        "thin_pos_coarse_iou",
+        "thin_pos_refined_iou",
+        "thin_pos_delta_iou",
+        "thin_pos_abs_delta_iou",
+    )
+
+    log_and_print("\n" + "=" * 60)
+    log_and_print("新增诊断 6：按短边尺度分桶的 IoU 变化")
+    log_and_print("=" * 60)
+    for bucket_name, label in [
+        ("small", f"small (short < {SMALL_SHORT_SIDE_PX:.0f}px)"),
+        ("medium", f"medium ({SMALL_SHORT_SIDE_PX:.0f}px <= short < {MEDIUM_SHORT_SIDE_PX:.0f}px)"),
+        ("large", f"large (short >= {MEDIUM_SHORT_SIDE_PX:.0f}px)"),
+    ]:
+        delta = get_array(f"{bucket_name}_pos_delta_iou")
+        if delta.size == 0:
+            log_and_print(f"  {label}: 无样本")
+            continue
+        coarse = get_array(f"{bucket_name}_pos_coarse_iou")
+        refined = get_array(f"{bucket_name}_pos_refined_iou")
+        log_and_print(
+            f"  {label}: n={delta.size}, coarse={coarse.mean():.6f}, "
+            f"refined={refined.mean():.6f}, ΔIoU={delta.mean():.6f}, "
+            f"ΔIoU>0={(delta > 0).mean() * 100:.2f}%"
+        )
+
     log_and_print("\n" + "=" * 60)
     log_and_print("总结")
     log_and_print("=" * 60)
     log_and_print("如果假设 1+2 均确认：冻结除 cv5 外所有参数 + 提高 lr 是正确的修复方向")
     log_and_print("如果假设 1 否定：cv5 有输出但未改善指标，需要检查 loss 计算路径")
+    pos_delta = get_array("pos_delta_iou")
+    thin_delta = get_array("thin_pos_delta_iou")
+    if pos_delta.size:
+        log_and_print(
+            f"正样本 ΔIoU 均值={pos_delta.mean():.6f}，"
+            f"改进比例={(pos_delta > 0).mean() * 100:.2f}%"
+        )
+    if thin_delta.size:
+        log_and_print(
+            f"细长目标 ΔIoU 均值={thin_delta.mean():.6f}，"
+            f"改进比例={(thin_delta > 0).mean() * 100:.2f}%"
+        )
     
     # 写入 md 文件
-    md_path = "/root/autodl-tmp/work-dirs/refine_diag/refine_diag_results.md"
+    md_path = REPORT_PATH
     try:
-        import os
-        os.makedirs(os.path.dirname(md_path), exist_ok=False)
+        os.makedirs(os.path.dirname(md_path), exist_ok=True)
         with open(md_path, "w", encoding="utf-8") as f:
             f.write("# Refine Head 诊断报告\n\n```text\n")
             f.write("\n".join(report_lines))
