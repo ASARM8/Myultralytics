@@ -76,8 +76,9 @@ PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
+RUN_NAME = "yolo11_obb-ca-refine-decouple"
 
-VAL_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple/weights/last.pt"
+VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 
 # ========================== 训练配置 ==========================
 CONFIG = {
@@ -98,7 +99,7 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",
-    "name": "yolo11_obb-ca-refine-decouple",
+    "name": RUN_NAME,
     "exist_ok": False,
 
     # ---------- 模型保存配置 ----------
@@ -164,13 +165,29 @@ def parse_args():
 def set_refine_inference_mode(yolo_model, disable_refine_inference: bool):
     from ultralytics.nn.modules.head import OBBRefine
 
+    model_root = yolo_model.model if hasattr(yolo_model, "model") else yolo_model
     found = 0
-    for m in yolo_model.model.modules():
+    for m in model_root.modules():
         if isinstance(m, OBBRefine):
             m.disable_refine_inference = bool(disable_refine_inference)
             found += 1
     if found == 0:
         raise RuntimeError("未找到 OBBRefine 模块，无法切换 coarse-only 验证模式。")
+
+
+def sync_obbrefine_runtime_attrs(target_model, refine_select_ar: float, refine_select_ws: float, disable_refine_inference: bool):
+    from ultralytics.nn.modules.head import OBBRefine
+
+    model_root = target_model.model if hasattr(target_model, "model") else target_model
+    found = 0
+    for m in model_root.modules():
+        if isinstance(m, OBBRefine):
+            m.refine_select_ar = float(refine_select_ar)
+            m.refine_select_ws = float(refine_select_ws)
+            m.disable_refine_inference = bool(disable_refine_inference)
+            found += 1
+    if found == 0:
+        raise RuntimeError("未找到 OBBRefine 模块，无法同步运行时属性。")
 
 
 def run_val_ab(args):
@@ -268,15 +285,23 @@ def main():
             trainer.ema.updates = 0
             print("[*] EMA 已同步")
 
-        # 同步门控阈值：将训练脚本中的 aux_geo_ar / aux_geo_ws 写入 OBBRefine 实例属性
-        # 这样保存的 .pt 会携带正确的阈值，推理时自动一致
-        from ultralytics.nn.modules.head import OBBRefine
-        for m in trainer.model.modules():
-            if isinstance(m, OBBRefine):
-                m.refine_select_ar = float(trainer.args.aux_geo_ar)
-                m.refine_select_ws = float(trainer.args.aux_geo_ws)
-                print(f"[*] 门控阈值已同步到 OBBRefine: AR>{m.refine_select_ar}, short<{m.refine_select_ws}px")
-                break
+        sync_obbrefine_runtime_attrs(
+            trainer.model,
+            trainer.args.aux_geo_ar,
+            trainer.args.aux_geo_ws,
+            True,
+        )
+        if hasattr(trainer, 'ema') and trainer.ema is not None:
+            sync_obbrefine_runtime_attrs(
+                trainer.ema.ema,
+                trainer.args.aux_geo_ar,
+                trainer.args.aux_geo_ws,
+                True,
+            )
+        print(
+            f"[*] OBBRefine 运行时属性已同步: AR>{float(trainer.args.aux_geo_ar)}, "
+            f"short<{float(trainer.args.aux_geo_ws)}px, 默认验证/推理=coarse-only"
+        )
 
     model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
@@ -301,6 +326,8 @@ def main():
     print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
     print(f"  aux_geo 增益: {CONFIG['aux_geo']}")
     print(f"  Refine Head: Δw + Δh (ne_refine=2, 完全解耦)")
+    print("  验证/推理默认口径: coarse-only（默认禁用 refine inference）")
+    print("  A/B 对照入口: python train_yolo11_obb_refine.py --mode val_ab --weights <ckpt>")
     print("=" * 60)
 
     # 5. 开始训练
@@ -311,9 +338,9 @@ def main():
     print("  训练完成！")
     print(f"  结果保存在: {CONFIG['project']}/{CONFIG['name']}")
     print("  保存内容说明:")
-    print("    - weights/best.pt     : 最佳模型权重")
+    print("    - weights/best.pt     : 按 coarse-only 验证指标选出的最佳模型")
     print("    - weights/last.pt     : 最后一轮权重")
-    print("    - results.csv         : 每轮训练指标")
+    print("    - results.csv         : 每轮训练指标（默认 coarse-only 验证口径）")
     print("    - results.png         : 训练曲线图")
     print("    - args.yaml           : 完整训练参数记录")
     print("=" * 60)

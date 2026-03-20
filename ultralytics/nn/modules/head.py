@@ -549,7 +549,7 @@ class OBBRefine(OBB):
         self.refine_select_ar = refine_select_ar
         self.refine_select_ws = refine_select_ws
         self._refine_gate = None
-        self.disable_refine_inference = False
+        self.disable_refine_inference = True
 
         # 轻量精修分支：结构与 cv4 (angle head) 相同
         c5 = max(ch[0] // 4, ne_refine)
@@ -585,6 +585,8 @@ class OBBRefine(OBB):
         preds = super().forward_head(x, box_head, cls_head, angle_head)
         if refine_head is not None:
             bs = x[0].shape[0]
+            # 关键：用 x[i].detach() 阻断 refine loss → backbone 的梯度泄漏
+            # cv5 只读 backbone 特征、不写梯度，确保 refine 学习不污染已收敛的主干
             # 关键：用 x[i].detach() 阻断 refine loss → backbone 的梯度泄漏
             # cv5 只读 backbone 特征、不写梯度，确保 refine 学习不污染已收敛的主干
             refine = torch.cat(
@@ -628,7 +630,7 @@ class OBBRefine(OBB):
         """解码边框并应用 Δw/Δh 精修。"""
         dbox = super()._get_decode_boxes(x)  # (B, 4, H*W) xywh pixel 单位
         refine = x.get("refine")
-        if refine is not None and not self.disable_refine_inference:
+        if refine is not None and not getattr(self, "disable_refine_inference", True):
             self._refine_gate = self._build_refine_gate(dbox)
             dbox = self._apply_wh_refine(dbox, refine, self._refine_gate)
         else:

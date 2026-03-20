@@ -24,7 +24,7 @@ from ultralytics.utils.metrics import probiou
 
 # ========================== 配置 ==========================
 # 当前主线训练的 checkpoint 路径（含 OBBRefine 头）
-MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple/weights/best.pt"
+MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple-coarseval/weights/best.pt"
 DATA_PATH = "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml"
 NUM_BATCHES = 100  # 诊断用的 batch 数
 DEVICE = 0
