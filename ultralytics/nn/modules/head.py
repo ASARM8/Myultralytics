@@ -511,15 +511,14 @@ class OBB(Detect):
 
 
 class OBBRefine(OBB):
-    """OBB 检测头 + 轻量宽度/角度精修分支。
+    """OBB 检测头 + 轻量宽高精修分支。
 
-    在原有 OBB 头（DFL box + cls + angle）基础上，新增 cv5 分支预测 [Δw, Δh, Δθ]，
-    绕过 DFL 离散化瓶颈，直接用连续回归修正短边宽度和角度。
+    在原有 OBB 头（DFL box + cls + angle）基础上，新增 cv5 分支预测 [Δw, Δh]，
+    绕过 DFL 离散化瓶颈，直接用连续回归修正短边宽高。
 
     Attributes:
-        ne_refine (int): 精修通道数（默认 3 = [Δw, Δh, Δθ]）。
+        ne_refine (int): 精修通道数（默认 2 = [Δw, Δh]）。
         cv5 (nn.ModuleList): 精修分支卷积层。
-        refine_tau (float): 角度修正上限（弧度，默认 5° ≈ 0.087）。
         refine_clamp (float): Δw/Δh clamp 范围（默认 1.0 → [e⁻¹, e¹]）。
     """
 
@@ -527,7 +526,7 @@ class OBBRefine(OBB):
         self,
         nc: int = 80,
         ne: int = 1,
-        ne_refine: int = 3,
+        ne_refine: int = 2,
         reg_max=16,
         end2end=False,
         ch: tuple = (),
@@ -539,14 +538,13 @@ class OBBRefine(OBB):
         Args:
             nc (int): 类别数。
             ne (int): 角度预测通道数。
-            ne_refine (int): 精修通道数（[Δw, Δh, Δθ]）。
+            ne_refine (int): 精修通道数（[Δw, Δh]）。
             reg_max (int): DFL 通道数。
             end2end (bool): 是否使用端到端检测。
             ch (tuple): 各 FPN 层的通道数。
         """
         super().__init__(nc, ne, reg_max, end2end, ch)
         self.ne_refine = ne_refine
-        self.refine_tau = 5 * math.pi / 180  # 5° 角度修正上限
         self.refine_clamp = 1.0  # Δw/Δh clamp 范围
         self.refine_select_ar = refine_select_ar
         self.refine_select_ws = refine_select_ws
@@ -557,7 +555,7 @@ class OBBRefine(OBB):
         self.cv5 = nn.ModuleList(
             nn.Sequential(Conv(x, c5, 3), Conv(c5, c5, 3), nn.Conv2d(c5, ne_refine, 1)) for x in ch
         )
-        # 零初始化最后一层 → 训练开始时 refine = 0 → identity（exp(0)=1, tanh(0)=0）
+        # 零初始化最后一层 → 训练开始时 refine = 0 → identity（exp(0)=1）
         for seq in self.cv5:
             nn.init.zeros_(seq[-1].weight)
             nn.init.zeros_(seq[-1].bias)
@@ -635,22 +633,10 @@ class OBBRefine(OBB):
         return dbox
 
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
-        """推理路径：解码框 + 分类 + 精修角度。"""
+        """推理路径：解码框 + 分类，角度保持 coarse 输出。"""
         self.angle = x["angle"]  # decode_bboxes 需要
-        # 调用 Detect._inference（跳过 OBB._inference，避免重复拼接 angle）
         preds = Detect._inference(self, x)  # (B, 4+nc, H*W)，dbox 已含 Δw/Δh 修正
-
-        # 角度修正
-        refine = x.get("refine")
-        if refine is not None and self.ne_refine >= 3:
-            dt = refine[:, 2:3, :]
-            if self._refine_gate is not None:
-                dt = dt * self._refine_gate.to(dtype=dt.dtype, device=dt.device)
-            angle_out = x["angle"] + self.refine_tau * torch.tanh(dt)
-        else:
-            angle_out = x["angle"]
-
-        return torch.cat([preds, angle_out], dim=1)
+        return torch.cat([preds, x["angle"]], dim=1)
 
     def fuse(self) -> None:
         """移除 one2many 头以优化推理。"""

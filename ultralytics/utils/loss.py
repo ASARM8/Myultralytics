@@ -1010,6 +1010,42 @@ class v8OBBLoss(v8DetectionLoss):
                     out[j, :n] = torch.cat([targets[matches, 1:2], bboxes], dim=-1)
         return out
 
+    def build_refine_mask(self, target_bboxes: torch.Tensor, fg_mask: torch.Tensor) -> torch.Tensor:
+        """根据 matched GT 构建 refine 门控掩码。"""
+        target_fg = target_bboxes[fg_mask]
+        if target_fg.numel() == 0:
+            return torch.zeros(0, dtype=torch.bool, device=target_bboxes.device)
+
+        short_gt = target_fg[:, 2:4].amin(dim=-1)
+        long_gt = target_fg[:, 2:4].amax(dim=-1)
+        ar = long_gt / short_gt.clamp_min(1e-6)
+        ar_thresh = float(self.hyp.aux_geo_ar)
+        ws_thresh = float(self.hyp.aux_geo_ws)
+        return (ar > ar_thresh) | (short_gt < ws_thresh)
+
+    def apply_refine_to_bboxes(
+        self, coarse_bboxes: torch.Tensor, pred_refine: torch.Tensor | None, detach_base: bool = False
+    ) -> torch.Tensor:
+        """对 coarse 框应用 Δw/Δh 精修。"""
+        base_bboxes = coarse_bboxes.detach() if detach_base else coarse_bboxes
+        if pred_refine is None:
+            return base_bboxes
+
+        rf = pred_refine.permute(0, 2, 1)
+        refine_clamp = 1.0
+        dw = rf[..., 0:1].clamp(-refine_clamp, refine_clamp)
+        dh = rf[..., 1:2].clamp(-refine_clamp, refine_clamp) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
+        refined_bboxes = torch.cat(
+            [
+                base_bboxes[..., 0:2],
+                base_bboxes[..., 2:3] * torch.exp(dw),
+                base_bboxes[..., 3:4] * torch.exp(dh),
+                base_bboxes[..., 4:5],
+            ],
+            dim=-1,
+        )
+        return refined_bboxes.to(dtype=coarse_bboxes.dtype, device=coarse_bboxes.device)
+
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
         loss = torch.zeros(5, device=self.device)  # box, cls, dfl, angle, aux_geo
@@ -1044,25 +1080,9 @@ class v8OBBLoss(v8DetectionLoss):
 
         # Pboxes
         coarse_bboxes = self.bbox_decode(anchor_points, pred_distri, pred_angle)  # xywhr, (b, h*w, 5)
-        pred_bboxes = coarse_bboxes
 
-        # Refine Head：若 preds 包含 "refine" 键，应用 Δw/Δh/Δθ 修正（绕过 DFL 离散化瓶颈）
+        # Refine Head：若 preds 包含 "refine" 键，仅额外构造宽高 residual 监督
         pred_refine = preds.get("refine")
-        refined_bboxes = coarse_bboxes
-        if pred_refine is not None:
-            rf = pred_refine.permute(0, 2, 1)  # (B, H*W, ne_refine)
-            refine_clamp = 1.0  # [e⁻¹, e¹] ≈ [0.37, 2.72]
-            refine_tau = 5 * math.pi / 180  # 5° 角度修正上限
-            dw = rf[..., 0:1].clamp(-refine_clamp, refine_clamp)
-            dh = rf[..., 1:2].clamp(-refine_clamp, refine_clamp)
-            refined_bboxes = torch.cat([
-                coarse_bboxes[..., 0:2],
-                coarse_bboxes[..., 2:3] * torch.exp(dw),
-                coarse_bboxes[..., 3:4] * torch.exp(dh),
-                coarse_bboxes[..., 4:5] + refine_tau * torch.tanh(rf[..., 2:3]) if rf.shape[-1] >= 3
-                else coarse_bboxes[..., 4:5],
-            ], dim=-1)
-            refined_bboxes = refined_bboxes.to(dtype=coarse_bboxes.dtype, device=coarse_bboxes.device)
 
         bboxes_for_assigner = coarse_bboxes.clone().detach()
         # Only the first four elements need to be scaled
@@ -1087,32 +1107,22 @@ class v8OBBLoss(v8DetectionLoss):
         # Bbox loss
         if fg_mask.sum():
             weight = target_scores.sum(-1)[fg_mask]
-            pred_bboxes = coarse_bboxes
             if pred_refine is not None:
-                target_fg = target_bboxes[fg_mask]
-                short_gt = target_fg[:, 2:4].amin(dim=-1)
-                long_gt = target_fg[:, 2:4].amax(dim=-1)
-                ar = long_gt / short_gt.clamp_min(1e-6)
-                refine_mask = (ar > float(self.hyp.aux_geo_ar)) | (short_gt < 16.0)
-                if refine_mask.any():
-                    pred_bboxes = coarse_bboxes.clone()
-                    pred_bboxes_fg = torch.where(
-                        refine_mask.unsqueeze(-1),
-                        refined_bboxes[fg_mask],
-                        coarse_bboxes[fg_mask],
-                    )
-                    pred_bboxes_fg = pred_bboxes_fg.to(dtype=pred_bboxes.dtype, device=pred_bboxes.device)
-                    pred_bboxes[fg_mask] = pred_bboxes_fg
-            # Width-Aware 辅助几何损失（在 stride 归一化前计算，此时 target_bboxes 为 pixel 坐标）
-            loss[4] = self.calculate_aux_geo_loss(
-                pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, stride_tensor
-            )
-            target_bboxes[..., :4] /= stride_tensor
+                refine_mask = self.build_refine_mask(target_bboxes, fg_mask)
+                loss[4] = self.calculate_refine_residual_loss(
+                    coarse_bboxes, pred_refine, target_bboxes, fg_mask, weight, target_scores_sum, stride_tensor, refine_mask
+                )
+            else:
+                loss[4] = self.calculate_aux_geo_loss(
+                    coarse_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, stride_tensor
+                )
+            target_bboxes_norm = target_bboxes.clone()
+            target_bboxes_norm[..., :4] /= stride_tensor
             loss[0], loss[2] = self.bbox_loss(
                 pred_distri,
-                pred_bboxes,
+                coarse_bboxes,
                 anchor_points,
-                target_bboxes,
+                target_bboxes_norm,
                 target_scores,
                 target_scores_sum,
                 fg_mask,
@@ -1120,7 +1130,7 @@ class v8OBBLoss(v8DetectionLoss):
                 stride_tensor,
             )
             loss[3] = self.calculate_angle_loss(
-                pred_bboxes, target_bboxes, fg_mask, weight, target_scores_sum
+                coarse_bboxes, target_bboxes_norm, fg_mask, weight, target_scores_sum
             )  # angle loss
         else:
             loss[0] += (pred_angle * 0).sum()
@@ -1153,9 +1163,45 @@ class v8OBBLoss(v8DetectionLoss):
             pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
         return torch.cat((dist2rbox(pred_dist, pred_angle, anchor_points), pred_angle), dim=-1)
 
+    def calculate_refine_residual_loss(
+        self,
+        coarse_bboxes: torch.Tensor,
+        pred_refine: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        fg_mask: torch.Tensor,
+        weight: torch.Tensor,
+        target_scores_sum: torch.Tensor,
+        stride_tensor: torch.Tensor,
+        refine_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Refine residual loss：仅在 gated positives 上监督 Δw/Δh，并阻断对 coarse 主干的反向拖动。"""
+        if refine_mask.numel() == 0 or not refine_mask.any():
+            return torch.tensor(0.0, device=coarse_bboxes.device)
+
+        eps = 1e-6
+        refined_bboxes = self.apply_refine_to_bboxes(coarse_bboxes, pred_refine, detach_base=True)
+        refined_px = refined_bboxes.clone()
+        refined_px[..., :4] *= stride_tensor
+        refined_px = refined_px.to(dtype=target_bboxes.dtype, device=target_bboxes.device)
+
+        refined_fg = refined_px[fg_mask][refine_mask]
+        target_fg = target_bboxes[fg_mask][refine_mask]
+        weight_fg = weight[refine_mask]
+        weight_fg_col = weight_fg.unsqueeze(-1)
+
+        iou = probiou(refined_fg, target_fg)
+        loss_iou = ((1.0 - iou) * weight_fg_col).sum() / target_scores_sum
+
+        short_gt = target_fg[:, 2:4].amin(dim=-1)
+        short_pred = refined_fg[:, 2:4].amin(dim=-1)
+        loss_w = torch.abs(torch.log((short_pred + eps) / (short_gt + eps)))
+        loss_w = (loss_w * weight_fg).sum() / target_scores_sum
+
+        return loss_iou + float(self.hyp.aux_geo_lw) * loss_w
+
     def calculate_aux_geo_loss(self, pred_bboxes, target_bboxes, fg_mask,
                                 weight, target_scores_sum, stride_tensor):
-        """Width-Aware 辅助几何损失：仅对细长目标 (AR>30 或短边<12px) 施加额外监督。
+        """Width-Aware 辅助几何损失：仅对细长目标 (AR>30 或短边<16px) 施加额外监督。
 
         包含三个分量：
         1. 法向偏移损失 L_perp：惩罚垂直于长轴方向的中心偏移，按短边归一化
@@ -1194,7 +1240,7 @@ class v8OBBLoss(v8DetectionLoss):
 
         # 门控：仅对 AR>阈值 或 短边<阈值 的目标启用（阈值从 hyp 读取）
         ar_thresh = self.hyp.aux_geo_ar   # 默认 30.0
-        ws_thresh = self.hyp.aux_geo_ws   # 默认 12.0
+        ws_thresh = self.hyp.aux_geo_ws   # 默认 16.0
         ar = long_gt / (short_gt + eps)
         gate = ((ar > ar_thresh) | (short_gt < ws_thresh)).float()
 

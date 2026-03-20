@@ -1,6 +1,6 @@
 """
 YOLOv11-OBB + Refine Head 训练脚本
-基于 CA (Coverage-Aware) 模型，新增轻量宽度/角度精修分支（Δw, Δh, Δθ）。
+基于 CA (Coverage-Aware) 模型，新增轻量宽高精修分支（Δw, Δh）。
 使用方法:
     直接运行: python train_yolo11_obb_refine.py
     修改下方 CONFIG 字典中的参数即可自定义训练配置
@@ -8,7 +8,7 @@ YOLOv11-OBB + Refine Head 训练脚本
 关键设计：
     - 从 yolo11-obb-ca-refine.yaml 构建模型（含 OBBRefine 头 + cv5 精修分支）
     - 通过回调加载 CA best.pt 预训练权重（cv5 零初始化保持 identity）
-    - aux_geo 设为 0.5（辅助监督，梯度现在能有效流回 cv5）
+    - aux_geo 设为 0.2（作为 refine residual 宽高监督增益）
 """
 
 import os
@@ -70,9 +70,7 @@ class Logger(object):
             self.log_file.flush()
 
 # ========================== 路径配置 ==========================
-# WAG 预训练权重路径（用于初始化，cv5 不在其中，将保持零初始化）
-# WAG 版本 = CA + 150 epochs 额外训练，aux_geo=0 即等效 CA
-# 现在有 Refine Head，aux_geo 梯度通过 cv5 连续参数流回，不再受 DFL 死区限制
+# CA 预训练权重路径（用于初始化，cv5 不在其中，将保持零初始化）
 PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
@@ -97,7 +95,7 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",
-    "name": "yolo11_obb-ca-refine",
+    "name": "yolo11_obb-ca-refine-decouple",
     "exist_ok": False,
 
     # ---------- 模型保存配置 ----------
@@ -138,7 +136,7 @@ CONFIG = {
     "aux_geo_lw": 2.0,
     "aux_geo_lt": 0.0,
     "aux_geo_ar": 30.0,             
-    "aux_geo_ws": 12.0,
+    "aux_geo_ws": 16.0,
 
     # ---------- 其他 ----------
     "amp": True,
@@ -158,9 +156,9 @@ def main():
     # 1. 从 YAML 构建模型（含 OBBRefine 头）
     model = YOLO(CONFIG["model"])
 
-    # 2. 注册回调：训练开始前加载 WAG 预训练权重
+    # 2. 注册回调：训练开始前加载 CA 预训练权重
     def on_pretrain_routine_end(trainer):
-        """在模型构建完成后、训练循环开始前，注入 WAG 预训练权重。"""
+        """在模型构建完成后、训练循环开始前，注入 CA 预训练权重。"""
         print(f"\n[*] 加载预训练权重: {PRETRAIN_WEIGHTS}")
 
         ckpt = torch.load(PRETRAIN_WEIGHTS, map_location=trainer.device, weights_only=False)
@@ -170,7 +168,7 @@ def main():
             src_state = ckpt
 
         # intersect_dicts 只加载 key 和 shape 都匹配的参数
-        # cv5 的参数不在 WAG checkpoint 中，保持零初始化
+        # cv5 的参数不在 CA checkpoint 中，保持零初始化
         model_state = trainer.model.state_dict()
         loaded = intersect_dicts(src_state, model_state)
         trainer.model.load_state_dict(loaded, strict=False)
@@ -185,6 +183,16 @@ def main():
             trainer.ema.ema.load_state_dict(trainer.model.state_dict())
             trainer.ema.updates = 0
             print("[*] EMA 已同步")
+
+        # 同步门控阈值：将训练脚本中的 aux_geo_ar / aux_geo_ws 写入 OBBRefine 实例属性
+        # 这样保存的 .pt 会携带正确的阈值，推理时自动一致
+        from ultralytics.nn.modules.head import OBBRefine
+        for m in trainer.model.modules():
+            if isinstance(m, OBBRefine):
+                m.refine_select_ar = float(trainer.args.aux_geo_ar)
+                m.refine_select_ws = float(trainer.args.aux_geo_ws)
+                print(f"[*] 门控阈值已同步到 OBBRefine: AR>{m.refine_select_ar}, short<{m.refine_select_ws}px")
+                break
 
     model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
@@ -208,7 +216,7 @@ def main():
     print(f"  图片尺寸: {CONFIG['imgsz']}")
     print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
     print(f"  aux_geo 增益: {CONFIG['aux_geo']}")
-    print(f"  Refine Head: Δw + Δh + Δθ (ne_refine=3)")
+    print(f"  Refine Head: Δw + Δh (ne_refine=2, 完全解耦)")
     print("=" * 60)
 
     # 5. 开始训练

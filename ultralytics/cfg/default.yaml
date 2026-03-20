@@ -111,7 +111,7 @@ aux_geo_lp: 1.0 # (float) aux_geo 法向偏移分量权重 λ_perp
 aux_geo_lw: 2.0 # (float) aux_geo 宽度分量权重 λ_w
 aux_geo_lt: 0.5 # (float) aux_geo 角度分量权重 λ_theta
 aux_geo_ar: 30.0 # (float) aux_geo 门控：长宽比阈值
-aux_geo_ws: 12.0 # (float) aux_geo 门控：短边像素阈值
+aux_geo_ws: 16.0 # (float) aux_geo 门控：短边像素阈值
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction

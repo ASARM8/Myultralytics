@@ -1,7 +1,7 @@
 """
-Refine Head v1 诊断脚本
+Refine Head 完全解耦版诊断脚本
 验证三个假设：
-1. cv5 输出 Δw/Δh/Δθ 是否接近零（Refine Head 未学到有效修正）
+1. cv5 输出 Δw/Δh 是否接近零（Refine Head 未学到有效修正）
 2. cv5 梯度量级是否远小于 cv2（梯度被 DFL 头吸收）
 3. DFL 粗框在薄目标上是否有残差（cv5 是否有修正空间）
 
@@ -23,8 +23,8 @@ from ultralytics.utils.metrics import probiou
 
 
 # ========================== 配置 ==========================
-# v1 训练的 checkpoint 路径（含 OBBRefine 头）
-MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine/weights/best.pt"
+# 当前主线训练的 checkpoint 路径（含 OBBRefine 头）
+MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple/weights/best.pt"
 DATA_PATH = "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml"
 NUM_BATCHES = 100  # 诊断用的 batch 数
 DEVICE = 0
@@ -42,19 +42,18 @@ def extend_stats(stats, key, tensor):
     stats[key].extend(tensor.cpu().tolist())
 
 
-def apply_refine_to_bboxes(coarse_bboxes, pred_refine, clamp_val, tau):
+def apply_refine_to_bboxes(coarse_bboxes, pred_refine, clamp_val):
     if pred_refine is None:
         return coarse_bboxes
     rf = pred_refine.permute(0, 2, 1)
     dw = rf[..., 0:1].clamp(-clamp_val, clamp_val)
-    dh = rf[..., 1:2].clamp(-clamp_val, clamp_val)
-    angle = coarse_bboxes[..., 4:5] + tau * torch.tanh(rf[..., 2:3]) if rf.shape[-1] >= 3 else coarse_bboxes[..., 4:5]
+    dh = rf[..., 1:2].clamp(-clamp_val, clamp_val) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
     return torch.cat(
         [
             coarse_bboxes[..., 0:2],
             coarse_bboxes[..., 2:3] * torch.exp(dw),
             coarse_bboxes[..., 3:4] * torch.exp(dh),
-            angle,
+            coarse_bboxes[..., 4:5],
         ],
         dim=-1,
     )
@@ -78,7 +77,6 @@ def build_assignment_diagnostics(criterion, detect_head, preds, batch):
         coarse_bboxes,
         pred_refine,
         clamp_val=float(getattr(detect_head, "refine_clamp", 1.0)),
-        tau=float(getattr(detect_head, "refine_tau", 5 * math.pi / 180)),
     )
 
     coarse_bboxes_px = coarse_bboxes.clone()
@@ -101,23 +99,41 @@ def build_assignment_diagnostics(criterion, detect_head, preds, batch):
     ps = pred_scores.detach().permute(0, 2, 1).contiguous().sigmoid()
     _, target_bboxes, target_scores, fg_mask, target_gt_idx = criterion.assigner(
         ps,
-        refined_bboxes_px.type(gt_bboxes.dtype),
+        coarse_bboxes_px.type(gt_bboxes.dtype),
         anchor_points * stride_tensor,
         gt_labels,
         gt_bboxes,
         mask_gt,
     )
 
+    selected_refined_bboxes_px = coarse_bboxes_px.clone()
+    refine_mask = torch.zeros(0, dtype=torch.bool, device=criterion.device)
+    if fg_mask.any() and pred_refine is not None:
+        if hasattr(criterion, "build_refine_mask"):
+            refine_mask = criterion.build_refine_mask(target_bboxes, fg_mask)
+        else:
+            target_fg = target_bboxes[fg_mask]
+            short_gt = target_fg[:, 2:4].amin(dim=-1)
+            long_gt = target_fg[:, 2:4].amax(dim=-1)
+            ar = long_gt / short_gt.clamp_min(1e-6)
+            refine_mask = (ar > float(criterion.hyp.aux_geo_ar)) | (short_gt < float(criterion.hyp.aux_geo_ws))
+        if refine_mask.any():
+            selected_fg = selected_refined_bboxes_px[fg_mask]
+            selected_fg[refine_mask] = refined_bboxes_px[fg_mask][refine_mask]
+            selected_refined_bboxes_px[fg_mask] = selected_fg
+
     return {
         "coarse_bboxes": coarse_bboxes,
         "refined_bboxes": refined_bboxes,
         "coarse_bboxes_px": coarse_bboxes_px,
         "refined_bboxes_px": refined_bboxes_px,
+        "selected_refined_bboxes_px": selected_refined_bboxes_px,
         "pred_refine": pred_refine,
         "target_bboxes": target_bboxes,
         "target_scores": target_scores,
         "target_gt_idx": target_gt_idx,
         "fg_mask": fg_mask,
+        "refine_mask": refine_mask,
     }
 
 
@@ -223,10 +239,9 @@ def collect_diagnostics():
 
         # 从 train_preds 中提取 refine
         if isinstance(train_preds, dict) and "refine" in train_preds:
-            refine = train_preds["refine"]  # (B, 3, H*W)
+            refine = train_preds["refine"]  # (B, 2, H*W)
             dw = refine[:, 0, :]
             dh = refine[:, 1, :]
-            dt = refine[:, 2, :] if refine.shape[1] >= 3 else None
 
             stats["dw_mean"].append(dw.mean().item())
             stats["dw_std"].append(dw.std().item())
@@ -234,10 +249,6 @@ def collect_diagnostics():
             stats["dh_mean"].append(dh.mean().item())
             stats["dh_std"].append(dh.std().item())
             stats["dh_absmax"].append(dh.abs().max().item())
-            if dt is not None:
-                stats["dt_mean"].append(dt.mean().item())
-                stats["dt_std"].append(dt.std().item())
-                stats["dt_absmax"].append(dt.abs().max().item())
         else:
             print(f"  batch {batch_idx}: 未找到 refine 输出！preds 类型={type(train_preds)}")
             if isinstance(train_preds, dict):
@@ -296,14 +307,12 @@ def collect_diagnostics():
                 if pred_refine is not None:
                     w_diff = (refined_bboxes[..., 2] - coarse_bboxes[..., 2]).abs()
                     h_diff = (refined_bboxes[..., 3] - coarse_bboxes[..., 3]).abs()
-                    a_diff = (refined_bboxes[..., 4] - coarse_bboxes[..., 4]).abs()
                     stats["refine_w_diff_mean"].append(w_diff.mean().item())
                     stats["refine_h_diff_mean"].append(h_diff.mean().item())
-                    stats["refine_a_diff_mean"].append(a_diff.mean().item())
 
                 if fg_mask.any():
                     coarse_pos = diag["coarse_bboxes_px"][fg_mask]
-                    refined_pos = diag["refined_bboxes_px"][fg_mask]
+                    refined_pos = diag["selected_refined_bboxes_px"][fg_mask]
                     matched_gt_pos = target_bboxes[fg_mask]
 
                     coarse_iou = probiou(coarse_pos, matched_gt_pos).reshape(-1)
@@ -379,14 +388,14 @@ def collect_diagnostics():
         log_and_print(f"  ΔIoU < 0 比例: {(delta < 0).mean() * 100:.2f}%")
 
     log_and_print("\n" + "=" * 60)
-    log_and_print("假设 1：cv5 输出（Δw/Δh/Δθ）是否接近零？")
+    log_and_print("假设 1：cv5 输出（Δw/Δh）是否接近零？")
     log_and_print("=" * 60)
-    for key in ["dw", "dh", "dt"]:
+    for key in ["dw", "dh"]:
         if f"{key}_mean" in stats:
             means = np.array(stats[f"{key}_mean"])
             stds = np.array(stats[f"{key}_std"])
             maxs = np.array(stats[f"{key}_absmax"])
-            label = {"dw": "Δw", "dh": "Δh", "dt": "Δθ"}[key]
+            label = {"dw": "Δw", "dh": "Δh"}[key]
             log_and_print(f"  {label}: mean={means.mean():.6f}±{means.std():.6f}, "
                   f"std={stds.mean():.6f}, abs_max={maxs.mean():.6f} (max={maxs.max():.6f})")
 
@@ -419,14 +428,13 @@ def collect_diagnostics():
     log_and_print("假设 3：Refine 对预测框的实际修正量")
     log_and_print("=" * 60)
     for key, label in [("refine_w_diff_mean", "w 修正量(grid)"),
-                       ("refine_h_diff_mean", "h 修正量(grid)"),
-                       ("refine_a_diff_mean", "θ 修正量(rad)")]:
+                       ("refine_h_diff_mean", "h 修正量(grid)")]:
         if key in stats:
             vals = np.array(stats[key])
             log_and_print(f"  {label}: mean={vals.mean():.6f}")
 
     log_iou_block(
-        "新增诊断 4：正样本上的 coarse IoU vs refined IoU",
+        "新增诊断 4：正样本上的 coarse IoU vs gated refined IoU",
         "pos_coarse_iou",
         "pos_refined_iou",
         "pos_delta_iou",
@@ -464,8 +472,8 @@ def collect_diagnostics():
     log_and_print("\n" + "=" * 60)
     log_and_print("总结")
     log_and_print("=" * 60)
-    log_and_print("如果假设 1+2 均确认：冻结除 cv5 外所有参数 + 提高 lr 是正确的修复方向")
-    log_and_print("如果假设 1 否定：cv5 有输出但未改善指标，需要检查 loss 计算路径")
+    log_and_print("当前版本应结合完全解耦训练逻辑解读：coarse 负责主任务，refine 只负责 gated residual 宽高修正")
+    log_and_print("重点关注 thin/small 是否保留正收益，以及 medium 负迁移是否明显收敛")
     pos_delta = get_array("pos_delta_iou")
     thin_delta = get_array("thin_pos_delta_iou")
     if pos_delta.size:
