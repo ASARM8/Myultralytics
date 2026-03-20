@@ -11,6 +11,7 @@ YOLOv11-OBB + Refine Head 训练脚本
     - aux_geo 设为 0.2（作为 refine residual 宽高监督增益）
 """
 
+import argparse
 import os
 import sys
 import datetime
@@ -75,6 +76,8 @@ PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
+
+VAL_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple/weights/last.pt"
 
 # ========================== 训练配置 ==========================
 CONFIG = {
@@ -145,6 +148,87 @@ CONFIG = {
     "seed": 0,
     "verbose": True,
 }
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["train", "val_ab"], default="train")
+    parser.add_argument("--weights", default=VAL_WEIGHTS)
+    parser.add_argument("--data", default=CONFIG["data"])
+    parser.add_argument("--imgsz", type=int, default=CONFIG["imgsz"])
+    parser.add_argument("--batch", type=int, default=CONFIG["batch"])
+    parser.add_argument("--device", default=str(CONFIG["device"]))
+    return parser.parse_args()
+
+
+def set_refine_inference_mode(yolo_model, disable_refine_inference: bool):
+    from ultralytics.nn.modules.head import OBBRefine
+
+    found = 0
+    for m in yolo_model.model.modules():
+        if isinstance(m, OBBRefine):
+            m.disable_refine_inference = bool(disable_refine_inference)
+            found += 1
+    if found == 0:
+        raise RuntimeError("未找到 OBBRefine 模块，无法切换 coarse-only 验证模式。")
+
+
+def run_val_ab(args):
+    sys.stdout = Logger(sys.stdout)
+    sys.stderr = Logger(sys.stderr)
+
+    model = YOLO(args.weights)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    common_kwargs = {
+        "data": args.data,
+        "imgsz": args.imgsz,
+        "batch": args.batch,
+        "device": args.device,
+        "project": CONFIG["project"],
+        "exist_ok": True,
+        "plots": True,
+    }
+    metric_keys = [
+        "metrics/precision(B)",
+        "metrics/recall(B)",
+        "metrics/mAP50(B)",
+        "metrics/mAP50-95(B)",
+    ]
+    metric_labels = {
+        "metrics/precision(B)": "precision",
+        "metrics/recall(B)": "recall",
+        "metrics/mAP50(B)": "mAP50",
+        "metrics/mAP50-95(B)": "mAP50-95",
+    }
+
+    print("=" * 60)
+    print(f"  A/B 验证权重: {args.weights}")
+    print(f"  数据集: {args.data}")
+    print(f"  图片尺寸: {args.imgsz}")
+    print(f"  批次大小: {args.batch}")
+    print("=" * 60)
+
+    set_refine_inference_mode(model, False)
+    normal_metrics = model.val(name=f"{CONFIG['name']}-val-normal-{stamp}", **common_kwargs)
+    normal_dict = normal_metrics.results_dict
+
+    set_refine_inference_mode(model, True)
+    coarse_metrics = model.val(name=f"{CONFIG['name']}-val-coarse-only-{stamp}", **common_kwargs)
+    coarse_dict = coarse_metrics.results_dict
+
+    print("\n" + "=" * 60)
+    print("  A/B 验证结果对比")
+    print("=" * 60)
+    for key in metric_keys:
+        normal_value = float(normal_dict[key])
+        coarse_value = float(coarse_dict[key])
+        delta = coarse_value - normal_value
+        print(
+            f"  {metric_labels[key]}: normal={normal_value:.5f}, coarse-only={coarse_value:.5f}, Δ={delta:+.5f}"
+        )
+    print("=" * 60)
+
+    return {"normal": normal_dict, "coarse_only": coarse_dict}
 
 
 def main():
@@ -238,4 +322,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    cli_args = parse_args()
+    if cli_args.mode == "val_ab":
+        run_val_ab(cli_args)
+    else:
+        main()
