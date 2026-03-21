@@ -12,6 +12,7 @@ YOLOv11-OBB + Refine Head 训练脚本
 """
 
 import argparse
+import csv
 import os
 import sys
 import datetime
@@ -20,7 +21,7 @@ os.environ["OMP_NUM_THREADS"] = "8"
 
 import torch
 from ultralytics import YOLO
-from ultralytics.utils.torch_utils import intersect_dicts
+from ultralytics.utils.torch_utils import intersect_dicts, unwrap_model
 
 # ========================== 终端日志保存配置 ==========================
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
@@ -76,7 +77,7 @@ PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
-RUN_NAME = "yolo11_obb-ca-refine-decouple"
+RUN_NAME = "yolo11_obb-ca-refine-b1"
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 
@@ -135,12 +136,15 @@ CONFIG = {
 
     # ---------- 损失权重 ----------
     # aux_geo: 辅助几何损失增益（梯度现在通过 cv5 连续参数有效流回）
-    "aux_geo": 0.2,
+    "aux_geo": 0.05,
     "aux_geo_lp": 0.0,    # L_perp（法向偏移）：本次不做 Δn，关闭
     "aux_geo_lw": 2.0,
     "aux_geo_lt": 0.0,
     "aux_geo_ar": 30.0,             
     "aux_geo_ws": 16.0,
+    "refine_feature_detach": False,
+    "refine_soft_boost": False,
+    "refine_boost_max": 2.0,
 
     # ---------- 其他 ----------
     "amp": True,
@@ -175,7 +179,13 @@ def set_refine_inference_mode(yolo_model, disable_refine_inference: bool):
         raise RuntimeError("未找到 OBBRefine 模块，无法切换 coarse-only 验证模式。")
 
 
-def sync_obbrefine_runtime_attrs(target_model, refine_select_ar: float, refine_select_ws: float, disable_refine_inference: bool):
+def sync_obbrefine_runtime_attrs(
+    target_model,
+    refine_select_ar: float,
+    refine_select_ws: float,
+    disable_refine_inference: bool,
+    refine_feature_detach: bool,
+):
     from ultralytics.nn.modules.head import OBBRefine
 
     model_root = target_model.model if hasattr(target_model, "model") else target_model
@@ -185,6 +195,7 @@ def sync_obbrefine_runtime_attrs(target_model, refine_select_ar: float, refine_s
             m.refine_select_ar = float(refine_select_ar)
             m.refine_select_ws = float(refine_select_ws)
             m.disable_refine_inference = bool(disable_refine_inference)
+            m.refine_feature_detach = bool(refine_feature_detach)
             found += 1
     if found == 0:
         raise RuntimeError("未找到 OBBRefine 模块，无法同步运行时属性。")
@@ -290,6 +301,7 @@ def main():
             trainer.args.aux_geo_ar,
             trainer.args.aux_geo_ws,
             True,
+            trainer.args.refine_feature_detach,
         )
         if hasattr(trainer, 'ema') and trainer.ema is not None:
             sync_obbrefine_runtime_attrs(
@@ -297,10 +309,13 @@ def main():
                 trainer.args.aux_geo_ar,
                 trainer.args.aux_geo_ws,
                 True,
+                trainer.args.refine_feature_detach,
             )
         print(
             f"[*] OBBRefine 运行时属性已同步: AR>{float(trainer.args.aux_geo_ar)}, "
-            f"short<{float(trainer.args.aux_geo_ws)}px, 默认验证/推理=coarse-only"
+            f"short<{float(trainer.args.aux_geo_ws)}px, "
+            f"refine_feature_detach={bool(trainer.args.refine_feature_detach)}, "
+            f"refine_soft_boost={bool(trainer.args.refine_soft_boost)}, 默认验证/推理=coarse-only"
         )
 
     model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
@@ -312,10 +327,48 @@ def main():
         print(f"\n[*] 日志文件: {final_log_file}\n")
         sys.stdout.set_log_file(final_log_file)
         sys.stderr.set_log_file(final_log_file)
+        trainer.refine_diag_file = os.path.join(trainer.save_dir, "refine_diag.csv")
+        with open(trainer.refine_diag_file, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["epoch", "refine_mask_ratio", "avg_abs_dw", "refine_loss"])
 
     model.add_callback("on_train_start", on_train_start)
 
+    def on_train_epoch_end(trainer):
+        criterion = getattr(unwrap_model(trainer.model), "criterion", None)
+        if criterion is None or not hasattr(criterion, "refine_diagnostics"):
+            return
+        diag = criterion.refine_diagnostics
+        print(
+            f"[*] refine_diag epoch {trainer.epoch + 1}: "
+            f"mask_ratio={float(diag['refine_mask_ratio']):.6f}, "
+            f"avg_abs_dw={float(diag['avg_abs_dw']):.6f}, "
+            f"refine_loss={float(diag['refine_loss']):.6f}"
+        )
+        diag_file = getattr(trainer, "refine_diag_file", None)
+        if diag_file:
+            with open(diag_file, "a", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    trainer.epoch + 1,
+                    float(diag["refine_mask_ratio"]),
+                    float(diag["avg_abs_dw"]),
+                    float(diag["refine_loss"]),
+                ])
+
+    model.add_callback("on_train_epoch_end", on_train_epoch_end)
+
     # 4. 打印配置
+    if CONFIG["refine_soft_boost"] and CONFIG["refine_feature_detach"]:
+        raise ValueError("refine_soft_boost=True 时必须同时设置 refine_feature_detach=False。")
+
+    if CONFIG["refine_soft_boost"]:
+        refine_mode_label = "B2（训练弱耦合 + AR soft boost）"
+    elif CONFIG["refine_feature_detach"]:
+        refine_mode_label = "fully-decoupled"
+    else:
+        refine_mode_label = "B1（训练弱耦合）"
+
     print("=" * 60)
     print(f"  模型 YAML: {MODEL_YAML}")
     print(f"  预训练权重: {PRETRAIN_WEIGHTS}")
@@ -325,7 +378,10 @@ def main():
     print(f"  图片尺寸: {CONFIG['imgsz']}")
     print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
     print(f"  aux_geo 增益: {CONFIG['aux_geo']}")
-    print(f"  Refine Head: Δw + Δh (ne_refine=2, 完全解耦)")
+    print(f"  Refine Head: Δw + Δh (ne_refine=2, {refine_mode_label})")
+    print(f"  refine_feature_detach: {CONFIG['refine_feature_detach']}")
+    print(f"  refine_soft_boost: {CONFIG['refine_soft_boost']}")
+    print(f"  refine_boost_max: {CONFIG['refine_boost_max']}")
     print("  验证/推理默认口径: coarse-only（默认禁用 refine inference）")
     print("  A/B 对照入口: python train_yolo11_obb_refine.py --mode val_ab --weights <ckpt>")
     print("=" * 60)
@@ -341,6 +397,7 @@ def main():
     print("    - weights/best.pt     : 按 coarse-only 验证指标选出的最佳模型")
     print("    - weights/last.pt     : 最后一轮权重")
     print("    - results.csv         : 每轮训练指标（默认 coarse-only 验证口径）")
+    print("    - refine_diag.csv     : 每轮 refine 诊断统计")
     print("    - results.png         : 训练曲线图")
     print("    - args.yaml           : 完整训练参数记录")
     print("=" * 60)

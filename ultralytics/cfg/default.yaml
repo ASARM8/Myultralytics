@@ -112,6 +112,9 @@ aux_geo_lw: 2.0 # (float) aux_geo 宽度分量权重 λ_w
 aux_geo_lt: 0.5 # (float) aux_geo 角度分量权重 λ_theta
 aux_geo_ar: 30.0 # (float) aux_geo 门控：长宽比阈值
 aux_geo_ws: 16.0 # (float) aux_geo 门控：短边像素阈值
+refine_feature_detach: True # (bool) 是否对 refine 分支输入特征断梯度
+refine_soft_boost: False # (bool) 是否启用基于长宽比的 refine soft boost
+refine_boost_max: 2.0 # (float) refine soft boost 的最大放大倍数
 nbs: 64 # (int) nominal batch size used for loss normalization
 hsv_h: 0.015 # (float) HSV hue augmentation fraction
 hsv_s: 0.7 # (float) HSV saturation augmentation fraction
