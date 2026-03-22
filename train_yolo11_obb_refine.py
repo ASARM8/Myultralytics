@@ -77,7 +77,7 @@ PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
-RUN_NAME = "yolo11_obb-ca-refine-b1"
+RUN_NAME = "yolo11_obb-ca-refine-b2"
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 
@@ -143,7 +143,7 @@ CONFIG = {
     "aux_geo_ar": 30.0,             
     "aux_geo_ws": 16.0,
     "refine_feature_detach": False,
-    "refine_soft_boost": False,
+    "refine_soft_boost": True,
     "refine_boost_max": 2.0,
 
     # ---------- 其他 ----------

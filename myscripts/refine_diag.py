@@ -24,11 +24,11 @@ from ultralytics.utils.metrics import probiou
 
 # ========================== 配置 ==========================
 # 当前主线训练的 checkpoint 路径（含 OBBRefine 头）
-MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple-coarseval/weights/best.pt"
+MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-b2/weights/best.pt"
 DATA_PATH = "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml"
 NUM_BATCHES = 100  # 诊断用的 batch 数
 DEVICE = 0
-REPORT_PATH = "/root/autodl-tmp/work-dirs/refine_diag/refine_diag_results.md"
+REPORT_PATH = "/root/autodl-tmp/work-dirs/refine_diag_b2/refine_diag_results.md"
 SMALL_SHORT_SIDE_PX = 16.0
 MEDIUM_SHORT_SIDE_PX = 32.0
 
@@ -196,10 +196,9 @@ def collect_diagnostics():
 
     # 收集统计
     stats = defaultdict(list)
-    criterion = model.model.criterion
-    if criterion is None:
-        criterion = model.model.init_criterion()
-        model.model.criterion = criterion
+    # 强制重新初始化 criterion 以确保其内部的 Tensor (如 self.proj) 分配在当前指定的 Device 上
+    criterion = model.model.init_criterion()
+    model.model.criterion = criterion
 
     # 启动前自检：确认 loss 所需超参已就位，避免中途因 dict/缺字段报错
     required_hyp_keys = ["box", "cls", "dfl", "angle", "aux_geo", "aux_geo_ar", "aux_geo_ws"]
