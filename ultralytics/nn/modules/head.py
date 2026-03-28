@@ -596,11 +596,8 @@ class OBBRefine(OBB):
     def _build_refine_gate(self, dbox: torch.Tensor) -> torch.Tensor:
         """根据 coarse 框几何形状构建选择性 refine 掩码。"""
         short_side = torch.minimum(dbox[:, 2:3, :], dbox[:, 3:4, :])
-        long_side = torch.maximum(dbox[:, 2:3, :], dbox[:, 3:4, :])
-        ar = long_side / short_side.clamp_min(1e-6)
-        ar_thr = getattr(self, "refine_select_ar", 30.0)
         ws_thr = getattr(self, "refine_select_ws", 16.0)
-        return (ar > ar_thr) | (short_side < ws_thr)
+        return short_side < ws_thr
 
     def _apply_wh_refine(self, dbox: torch.Tensor, refine: torch.Tensor, gate: torch.Tensor | None = None) -> torch.Tensor:
         """对解码后的 xywh 框（pixel 单位）应用 Δw/Δh 修正。
