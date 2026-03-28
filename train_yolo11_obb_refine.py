@@ -77,7 +77,7 @@ PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
-RUN_NAME = "yolo11_obb-ca-refine-b2"
+RUN_NAME = "yolo11_obb-ca-refine-shortside"
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 
@@ -330,7 +330,7 @@ def main():
         trainer.refine_diag_file = os.path.join(trainer.save_dir, "refine_diag.csv")
         with open(trainer.refine_diag_file, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["epoch", "refine_mask_ratio", "avg_abs_dw", "refine_loss"])
+            writer.writerow(["epoch", "refine_mask_ratio", "avg_abs_dshort", "refine_loss"])
 
     model.add_callback("on_train_start", on_train_start)
 
@@ -342,7 +342,7 @@ def main():
         print(
             f"[*] refine_diag epoch {trainer.epoch + 1}: "
             f"mask_ratio={float(diag['refine_mask_ratio']):.6f}, "
-            f"avg_abs_dw={float(diag['avg_abs_dw']):.6f}, "
+            f"avg_abs_dshort={float(diag['avg_abs_dshort']):.6f}, "
             f"refine_loss={float(diag['refine_loss']):.6f}"
         )
         diag_file = getattr(trainer, "refine_diag_file", None)
@@ -352,7 +352,7 @@ def main():
                 writer.writerow([
                     trainer.epoch + 1,
                     float(diag["refine_mask_ratio"]),
-                    float(diag["avg_abs_dw"]),
+                    float(diag["avg_abs_dshort"]),
                     float(diag["refine_loss"]),
                 ])
 

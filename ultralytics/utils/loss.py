@@ -992,16 +992,17 @@ class v8OBBLoss(v8DetectionLoss):
             reg_max=self.reg_max if self.reg_max > 16 else None,  # Coverage-Aware: 仅 reg_max>16 时启用
         )
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
-        self.refine_diagnostics = {"refine_mask_ratio": 0.0, "avg_abs_dw": 0.0, "refine_loss": 0.0}
+        self.refine_diagnostics = {"refine_mask_ratio": 0.0, "avg_abs_dshort": 0.0, "refine_loss": 0.0}
         self._reset_refine_diag_running()
 
     def _reset_refine_diag_running(self) -> None:
         """Reset running refine diagnostics."""
-        self._refine_diag_sums = {"refine_mask_ratio": 0.0, "avg_abs_dw": 0.0, "refine_loss": 0.0}
+        self._refine_diag_sums = {"refine_mask_ratio": 0.0, "avg_abs_dshort": 0.0, "refine_loss": 0.0}
         self._refine_diag_steps = 0
 
     def _accumulate_refine_diagnostics(
         self,
+        coarse_bboxes: torch.Tensor,
         pred_refine: torch.Tensor,
         fg_mask: torch.Tensor,
         refine_mask: torch.Tensor,
@@ -1009,12 +1010,16 @@ class v8OBBLoss(v8DetectionLoss):
     ) -> None:
         """Accumulate batch-level refine diagnostics."""
         mask_ratio = float(refine_mask.float().mean().item()) if refine_mask.numel() else 0.0
-        avg_abs_dw = 0.0
+        avg_abs_dshort = 0.0
         if fg_mask.any() and refine_mask.numel() and refine_mask.any():
+            coarse_fg = coarse_bboxes[fg_mask]
             refine_fg = pred_refine.permute(0, 2, 1)[fg_mask]
-            avg_abs_dw = float(refine_fg[refine_mask, 0].abs().mean().item())
+            short_is_w = coarse_fg[:, 2] <= coarse_fg[:, 3]
+            dh = refine_fg[:, 1] if refine_fg.shape[1] >= 2 else torch.zeros_like(refine_fg[:, 0])
+            dshort = torch.where(short_is_w, refine_fg[:, 0], dh)
+            avg_abs_dshort = float(dshort[refine_mask].abs().mean().item())
         self._refine_diag_sums["refine_mask_ratio"] += mask_ratio
-        self._refine_diag_sums["avg_abs_dw"] += avg_abs_dw
+        self._refine_diag_sums["avg_abs_dshort"] += avg_abs_dshort
         self._refine_diag_sums["refine_loss"] += float(refine_loss.detach().item())
         self._refine_diag_steps += 1
 
@@ -1026,7 +1031,7 @@ class v8OBBLoss(v8DetectionLoss):
                 k: v / denom for k, v in self._refine_diag_sums.items()
             }
         else:
-            self.refine_diagnostics = {"refine_mask_ratio": 0.0, "avg_abs_dw": 0.0, "refine_loss": 0.0}
+            self.refine_diagnostics = {"refine_mask_ratio": 0.0, "avg_abs_dshort": 0.0, "refine_loss": 0.0}
         self._reset_refine_diag_running()
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
@@ -1053,11 +1058,8 @@ class v8OBBLoss(v8DetectionLoss):
             return torch.zeros(0, dtype=torch.bool, device=target_bboxes.device)
 
         short_gt = target_fg[:, 2:4].amin(dim=-1)
-        long_gt = target_fg[:, 2:4].amax(dim=-1)
-        ar = long_gt / short_gt.clamp_min(1e-6)
-        ar_thresh = float(self.hyp.aux_geo_ar)
         ws_thresh = float(self.hyp.aux_geo_ws)
-        return (ar > ar_thresh) | (short_gt < ws_thresh)
+        return short_gt < ws_thresh
 
     def build_refine_boost(self, target_bboxes: torch.Tensor, fg_mask: torch.Tensor) -> torch.Tensor:
         """构建基于长宽比的 refine soft boost。"""
@@ -1084,6 +1086,10 @@ class v8OBBLoss(v8DetectionLoss):
         refine_clamp = 1.0
         dw = rf[..., 0:1].clamp(-refine_clamp, refine_clamp)
         dh = rf[..., 1:2].clamp(-refine_clamp, refine_clamp) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
+        short_is_w = base_bboxes[..., 2:3] <= base_bboxes[..., 3:4]
+        zero = torch.zeros_like(dw)
+        dw = torch.where(short_is_w, dw, zero)
+        dh = torch.where(short_is_w, zero, dh)
         refined_bboxes = torch.cat(
             [
                 base_bboxes[..., 0:2],
@@ -1177,7 +1183,7 @@ class v8OBBLoss(v8DetectionLoss):
                 )
                 refine_loss_value = loss[4]
                 self._accumulate_refine_diagnostics(
-                    pred_refine, fg_mask, refine_mask, refine_loss_value * float(self.hyp.aux_geo)
+                    coarse_bboxes, pred_refine, fg_mask, refine_mask, refine_loss_value * float(self.hyp.aux_geo)
                 )
             else:
                 loss[4] = self.calculate_aux_geo_loss(

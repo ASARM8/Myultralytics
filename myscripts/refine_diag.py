@@ -48,6 +48,10 @@ def apply_refine_to_bboxes(coarse_bboxes, pred_refine, clamp_val):
     rf = pred_refine.permute(0, 2, 1)
     dw = rf[..., 0:1].clamp(-clamp_val, clamp_val)
     dh = rf[..., 1:2].clamp(-clamp_val, clamp_val) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
+    short_is_w = coarse_bboxes[..., 2:3] <= coarse_bboxes[..., 3:4]
+    zero = torch.zeros_like(dw)
+    dw = torch.where(short_is_w, dw, zero)
+    dh = torch.where(short_is_w, zero, dh)
     return torch.cat(
         [
             coarse_bboxes[..., 0:2],
@@ -114,9 +118,7 @@ def build_assignment_diagnostics(criterion, detect_head, preds, batch):
         else:
             target_fg = target_bboxes[fg_mask]
             short_gt = target_fg[:, 2:4].amin(dim=-1)
-            long_gt = target_fg[:, 2:4].amax(dim=-1)
-            ar = long_gt / short_gt.clamp_min(1e-6)
-            refine_mask = (ar > float(criterion.hyp.aux_geo_ar)) | (short_gt < float(criterion.hyp.aux_geo_ws))
+            refine_mask = short_gt < float(criterion.hyp.aux_geo_ws)
         if refine_mask.any():
             selected_fg = selected_refined_bboxes_px[fg_mask]
             selected_fg[refine_mask] = refined_bboxes_px[fg_mask][refine_mask]

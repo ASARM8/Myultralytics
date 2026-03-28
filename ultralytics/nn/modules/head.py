@@ -611,6 +611,10 @@ class OBBRefine(OBB):
         """
         dw = refine[:, 0:1, :].clamp(-self.refine_clamp, self.refine_clamp)
         dh = refine[:, 1:2, :].clamp(-self.refine_clamp, self.refine_clamp)
+        short_is_w = dbox[:, 2:3, :] <= dbox[:, 3:4, :]
+        zero = torch.zeros_like(dw)
+        dw = torch.where(short_is_w, dw, zero)
+        dh = torch.where(short_is_w, zero, dh)
         if gate is not None:
             gate = gate.to(dtype=dw.dtype, device=dw.device)
             dw = dw * gate
