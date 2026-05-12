@@ -6,9 +6,13 @@ YOLOv11-OBB 自定义数据集训练脚本
 """
 
 import os
+import shutil
+import traceback
+from pathlib import Path
 os.environ["OMP_NUM_THREADS"] = "8"  # 修复 libgomp 警告
 
 from ultralytics import YOLO
+from ultralytics.utils.logger import ConsoleLogger
 
 # ========================== 训练配置 ==========================
 CONFIG = {
@@ -74,37 +78,93 @@ CONFIG = {
 }
 
 
+def move_log_to_save_dir(log_file, save_dir):
+    log_file = Path(log_file)
+    if not save_dir:
+        return log_file
+
+    save_dir = Path(save_dir)
+    if not save_dir.exists():
+        return log_file
+
+    if log_file.exists() and log_file.parent.resolve() == save_dir.resolve():
+        return log_file
+
+    target_file = save_dir / "train_console.log"
+    if log_file.resolve() == target_file.resolve():
+        return target_file
+
+    if not log_file.exists():
+        return target_file if target_file.exists() else log_file
+
+    if target_file.exists():
+        stem, suffix = target_file.stem, target_file.suffix
+        index = 2
+        while (save_dir / f"{stem}_{index}{suffix}").exists():
+            index += 1
+        target_file = save_dir / f"{stem}_{index}{suffix}"
+
+    shutil.move(str(log_file), str(target_file))
+    return target_file
+
+
 def main():
     """主训练函数"""
+    log_file = Path(CONFIG["project"]) / f"{CONFIG['name']}_train_console.tmp.log"
+    console_logger = ConsoleLogger(log_file, batch_size=1)
+    console_logger.start_capture()
+    model = None
+    final_log_file = log_file
+
+    def attach_log_to_save_dir(trainer):
+        nonlocal final_log_file
+        console_logger._flush_buffer()
+        final_log_file = move_log_to_save_dir(final_log_file, trainer.save_dir)
+        console_logger.destination = final_log_file
+
     # 1. 创建模型（从 yaml 配置文件构建，随机初始化权重）
-    model = YOLO(CONFIG["model"])
+    try:
+        model = YOLO(CONFIG["model"])
+        model.add_callback("on_pretrain_routine_start", attach_log_to_save_dir)
 
-    # 2. 开始训练
-    print("=" * 60)
-    print(f"  模型: {CONFIG['model']}")
-    print(f"  数据集: {CONFIG['data']}")
-    print(f"  训练轮数: {CONFIG['epochs']}")
-    print(f"  批次大小: {CONFIG['batch']}")
-    print(f"  图片尺寸: {CONFIG['imgsz']}")
-    print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
-    print("=" * 60)
+        # 2. 开始训练
+        print("=" * 60)
+        print(f"  模型: {CONFIG['model']}")
+        print(f"  数据集: {CONFIG['data']}")
+        print(f"  训练轮数: {CONFIG['epochs']}")
+        print(f"  批次大小: {CONFIG['batch']}")
+        print(f"  图片尺寸: {CONFIG['imgsz']}")
+        print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
+        print(f"  临时日志文件: {log_file}")
+        print("=" * 60)
 
-    results = model.train(**CONFIG)
+        results = model.train(**CONFIG)
+        save_dir = getattr(model.trainer, "save_dir", Path(CONFIG["project"]) / CONFIG["name"])
 
-    # 3. 训练完成后输出结果路径
-    print("\n" + "=" * 60)
-    print("  训练完成！")
-    print(f"  结果保存在: {CONFIG['project']}/{CONFIG['name']}")
-    print("  保存内容说明:")
-    print("    - weights/best.pt     : 最佳模型权重")
-    print("    - weights/last.pt     : 最后一轮权重")
-    print("    - results.csv         : 每轮训练指标（loss, mAP等）")
-    print("    - results.png         : 训练曲线图")
-    print("    - confusion_matrix.png: 混淆矩阵")
-    print("    - args.yaml           : 完整训练参数记录")
-    print("=" * 60)
+        # 3. 训练完成后输出结果路径
+        print("\n" + "=" * 60)
+        print("  训练完成！")
+        print(f"  结果保存在: {save_dir}")
+        print(f"  日志文件: {final_log_file}")
+        print("  保存内容说明:")
+        print("    - weights/best.pt     : 最佳模型权重")
+        print("    - weights/last.pt     : 最后一轮权重")
+        print("    - results.csv         : 每轮训练指标（loss, mAP等）")
+        print("    - results.png         : 训练曲线图")
+        print("    - confusion_matrix.png: 混淆矩阵")
+        print("    - args.yaml           : 完整训练参数记录")
+        print("=" * 60)
 
-    return results
+        return results
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        console_logger.stop_capture()
+        trainer = getattr(model, "trainer", None) if model is not None else None
+        save_dir = getattr(trainer, "save_dir", None)
+        final_log_file = move_log_to_save_dir(final_log_file, save_dir)
+        print(f"  日志文件: {final_log_file}")
 
 
 if __name__ == "__main__":
