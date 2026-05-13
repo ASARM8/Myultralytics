@@ -35,12 +35,12 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
-    "name": "yolo11_obb_640_baseline",        # 实验名称（子目录）
+    "name": "yolo11_obb_640_baseline_stable",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
     # ---------- 模型保存配置 ----------
     "save": True,               # 保存训练检查点（best.pt 和 last.pt）
-    "save_period": 50,          # 每隔 N 个 epoch 额外保存一次权重（-1 表示不额外保存）
+    "save_period": 10,          # 每隔 N 个 epoch 额外保存一次权重（-1 表示不额外保存）
 
     # ---------- 验证与可视化 ----------
     "val": True,                # 训练过程中进行验证
@@ -49,30 +49,30 @@ CONFIG = {
     # ---------- 训练策略 ----------
     "pretrained": False,        # 不使用预训练权重（从零训练）
     "optimizer": "AdamW",       # AdamW 优化器（从零训练时收敛更稳定）
-    "lr0": 0.001,               # 初始学习率（AdamW 推荐 1e-3）
+    "lr0": 0.0003,              # 初始学习率（AdamW 推荐 1e-3）
     "lrf": 0.01,                # 最终学习率 = lr0 * lrf
     "momentum": 0.937,          # Adam beta1
     "weight_decay": 0.0005,     # 权重衰减（L2 正则化）
     "warmup_epochs": 10.0,       # 预热轮数（从零训练建议更长的预热）
     "cos_lr": True,             # 余弦退火学习率调度（平滑降低学习率，提升收敛质量）
     "patience": 0,            # 早停：连续 N 个 epoch 验证指标不提升则停止
-    "close_mosaic": 15,         # 最后 15 个 epoch 关闭 mosaic（让模型更好适应真实图片）
+    "close_mosaic": 100,        # 最后 100 个 epoch 关闭 mosaic（让模型更好适应真实图片）
 
     # ---------- 数据增强配置 ----------
     "hsv_h": 0.015,             # HSV 色调增强
     "hsv_s": 0.7,               # HSV 饱和度增强
     "hsv_v": 0.4,               # HSV 亮度增强
     "degrees": 0.0,             # 旋转角度范围（±度）
-    "translate": 0.1,           # 平移比例
-    "scale": 0.5,               # 缩放比例
+    "translate": 0.05,          # 平移比例
+    "scale": 0.3,               # 缩放比例
     "fliplr": 0.5,              # 水平翻转概率
     "flipud": 0.0,              # 垂直翻转概率
-    "mosaic": 1.0,              # Mosaic 增强概率
+    "mosaic": 0.5,              # Mosaic 增强概率
     "mixup": 0.0,               # MixUp 增强概率
 
     # ---------- 其他 ----------
-    "amp": True,                # 自动混合精度训练（FP16 加速，5090 原生支持）
-    "cache": True,              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
+    "amp": False,               # 自动混合精度训练（FP16 加速，5090 原生支持）
+    "cache": "disk",            # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
     "resume": False,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
     "verbose": True,            # 输出详细日志
