@@ -24,18 +24,18 @@ CONFIG = {
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
-    "data": "/root/autodl-tmp/datasets/TTPLA-640/dataset.yaml",
+    "data": "/root/autodl-tmp/datasets/TTPLA-640-POS/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,              # 训练总轮数
-    "batch": 32,                # 批次大小（RTX 5090 32GB 显存，yolo11l + 1024 尝试 32，OOM 则降回 16）
+    "batch": 16,                # 批次大小（RTX 5090 32GB 显存，yolo11l + 1024 尝试 32，OOM 则降回 16）
     "imgsz": 640,              # 输入图片尺寸
     "device": 0,                # GPU 设备编号
     "workers": 16,               # 数据加载线程数（5090 性能强，可用更多线程）
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
-    "name": "yolo11_obb_640_baseline_stable",        # 实验名称（子目录）
+    "name": "yolo11_obb_640_baseline_pos",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
     # ---------- 模型保存配置 ----------
