@@ -1058,21 +1058,11 @@ class v8OBBLoss(v8DetectionLoss):
             return torch.zeros(0, dtype=torch.bool, device=target_bboxes.device)
 
         short_gt = target_fg[:, 2:4].amin(dim=-1)
-        ws_thresh = float(self.hyp.aux_geo_ws)
-        return short_gt < ws_thresh
-
-    def build_refine_boost(self, target_bboxes: torch.Tensor, fg_mask: torch.Tensor) -> torch.Tensor:
-        """构建基于长宽比的 refine soft boost。"""
-        target_fg = target_bboxes[fg_mask]
-        if target_fg.numel() == 0:
-            return torch.zeros(0, dtype=torch.float32, device=target_bboxes.device)
-
-        short_gt = target_fg[:, 2:4].amin(dim=-1)
         long_gt = target_fg[:, 2:4].amax(dim=-1)
         ar = long_gt / short_gt.clamp_min(1e-6)
-        ar_thresh = max(float(self.hyp.aux_geo_ar), 1e-6)
-        max_boost = max(float(getattr(self.hyp, "refine_boost_max", 1.0)), 1.0)
-        return (ar / ar_thresh).clamp_(1.0, max_boost)
+        ar_thresh = float(self.hyp.aux_geo_ar)
+        ws_thresh = float(self.hyp.aux_geo_ws)
+        return (ar > ar_thresh) | (short_gt < ws_thresh)
 
     def apply_refine_to_bboxes(
         self, coarse_bboxes: torch.Tensor, pred_refine: torch.Tensor | None, detach_base: bool = False
@@ -1086,10 +1076,6 @@ class v8OBBLoss(v8DetectionLoss):
         refine_clamp = 1.0
         dw = rf[..., 0:1].clamp(-refine_clamp, refine_clamp)
         dh = rf[..., 1:2].clamp(-refine_clamp, refine_clamp) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
-        short_is_w = base_bboxes[..., 2:3] <= base_bboxes[..., 3:4]
-        zero = torch.zeros_like(dw)
-        dw = torch.where(short_is_w, dw, zero)
-        dh = torch.where(short_is_w, zero, dh)
         refined_bboxes = torch.cat(
             [
                 base_bboxes[..., 0:2],
@@ -1139,7 +1125,6 @@ class v8OBBLoss(v8DetectionLoss):
         # Refine Head：若 preds 包含 "refine" 键，仅额外构造宽高 residual 监督
         pred_refine = preds.get("refine")
         refine_mask = torch.zeros(0, dtype=torch.bool, device=self.device)
-        refine_boost = None
         refine_loss_value = torch.tensor(0.0, device=self.device)
 
         bboxes_for_assigner = coarse_bboxes.clone().detach()
@@ -1167,9 +1152,6 @@ class v8OBBLoss(v8DetectionLoss):
             weight = target_scores.sum(-1)[fg_mask]
             if pred_refine is not None:
                 refine_mask = self.build_refine_mask(target_bboxes, fg_mask)
-                refine_boost = None
-                if getattr(self.hyp, "refine_soft_boost", False):
-                    refine_boost = self.build_refine_boost(target_bboxes, fg_mask)
                 loss[4] = self.calculate_refine_residual_loss(
                     coarse_bboxes,
                     pred_refine,
@@ -1179,7 +1161,6 @@ class v8OBBLoss(v8DetectionLoss):
                     target_scores_sum,
                     stride_tensor,
                     refine_mask,
-                    refine_boost,
                 )
                 refine_loss_value = loss[4]
                 self._accumulate_refine_diagnostics(
@@ -1246,7 +1227,6 @@ class v8OBBLoss(v8DetectionLoss):
         target_scores_sum: torch.Tensor,
         stride_tensor: torch.Tensor,
         refine_mask: torch.Tensor,
-        refine_boost: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Refine residual loss：仅在 gated positives 上监督 Δw/Δh，并阻断对 coarse 主干的反向拖动。"""
         if refine_mask.numel() == 0 or not refine_mask.any():
@@ -1261,8 +1241,6 @@ class v8OBBLoss(v8DetectionLoss):
         refined_fg = refined_px[fg_mask][refine_mask]
         target_fg = target_bboxes[fg_mask][refine_mask]
         weight_fg = weight[refine_mask]
-        if refine_boost is not None and refine_boost.numel():
-            weight_fg = weight_fg * refine_boost[refine_mask].to(device=weight_fg.device, dtype=weight_fg.dtype)
         weight_fg_col = weight_fg.unsqueeze(-1)
 
         iou = probiou(refined_fg, target_fg)

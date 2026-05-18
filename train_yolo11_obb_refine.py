@@ -7,93 +7,46 @@ YOLOv11-OBB + Refine Head 训练脚本
 
 关键设计：
     - 从 yolo11-obb-ca-refine.yaml 构建模型（含 OBBRefine 头 + cv5 精修分支）
-    - 通过回调加载 CA best.pt 预训练权重（cv5 零初始化保持 identity）
+    - 不加载任何 .pt 预训练权重，所有参数从 YAML 随机初始化开始训练
     - aux_geo 设为 0.2（作为 refine residual 宽高监督增益）
 """
 
 import argparse
 import csv
 import os
-import sys
+import shutil
+import traceback
 import datetime
-import re
+from pathlib import Path
 os.environ["OMP_NUM_THREADS"] = "8"
 
-import torch
 from ultralytics import YOLO
-from ultralytics.utils.torch_utils import intersect_dicts, unwrap_model
-
-# ========================== 终端日志保存配置 ==========================
-ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-TQDM_BAR = re.compile(
-    r'(\d+/\d+\s+[\d.]+G\s+[\d.]+)'
-    r'|(━━━━━|━━━╸|━━╸|━╸|━)'
-    r'|(\d+%\s*\|?[█▉▊▋▌▍▎▏]+)'
-    r'|(Class\s+Images\s+Instances.*?:\s*\d+%)'
-)
-
-class Logger(object):
-    """带缓冲与过滤的日志类"""
-    def __init__(self, stream):
-        self.terminal = stream
-        self.log_file = None
-        self.buffer = []
-
-    def set_log_file(self, filepath):
-        self.log_file = open(filepath, 'a', encoding='utf-8')
-        if self.buffer:
-            self.log_file.write("".join(self.buffer))
-            self.log_file.flush()
-            self.buffer = []
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.terminal.flush()
-        clean_msg = ANSI_ESCAPE.sub('', message)
-        if TQDM_BAR.search(clean_msg):
-            return
-        if '\r' in clean_msg:
-            parts = [p for p in clean_msg.split('\r') if p]
-            if parts:
-                clean_msg = parts[-1]
-            else:
-                return
-        if not clean_msg.strip('\n'):
-            return
-        if self.log_file is not None:
-            self.log_file.write(clean_msg)
-            self.log_file.flush()
-        else:
-            self.buffer.append(clean_msg)
-
-    def flush(self):
-        self.terminal.flush()
-        if self.log_file is not None:
-            self.log_file.flush()
+from ultralytics.utils.logger import ConsoleLogger
+from ultralytics.utils.torch_utils import unwrap_model
 
 # ========================== 路径配置 ==========================
-# CA 预训练权重路径（用于初始化，cv5 不在其中，将保持零初始化）
-PRETRAIN_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt"
+# 不使用预训练权重，保留该变量仅用于打印和 A/B 默认路径逻辑
+PRETRAIN_WEIGHTS = None
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
-RUN_NAME = "yolo11_obb-ca-refine-shortside"
+RUN_NAME = "yolo11_obb_640_pos_refine_scratch"
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 
 # ========================== 训练配置 ==========================
 CONFIG = {
     # ---------- 模型配置 ----------
-    # 从 YAML 构建新架构（不从 .pt 加载，权重通过回调注入）
+    # 从 YAML 构建新架构（不从 .pt 加载，完全随机初始化）
     "model": MODEL_YAML,
 
     # ---------- 数据集配置 ----------
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/root/autodl-tmp/datasets/TTPLA-640-POS/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
-    "epochs": 150,
+    "epochs": 300,
     "batch": 16,
-    "imgsz": 1024,
+    "imgsz": 640,
     "device": 0,
     "workers": 16,  # 临时设为 0 排查多进程崩溃根因；确认无误后改回 8
     "patience": 0,
@@ -105,7 +58,7 @@ CONFIG = {
 
     # ---------- 模型保存配置 ----------
     "save": True,
-    "save_period": 50,
+    "save_period": 10,
 
     # ---------- 验证与可视化 ----------
     "val": True,
@@ -114,45 +67,73 @@ CONFIG = {
     # ---------- 训练策略 ----------
     "pretrained": False,
     "optimizer": "AdamW",
-    "lr0": 0.0001,
+    "lr0": 0.0003,
     "lrf": 0.01,
     "momentum": 0.937,
     "weight_decay": 0.0005,
-    "warmup_epochs": 5.0,
+    "warmup_epochs": 10.0,
     "cos_lr": True,
-    "close_mosaic": 10,
+    "close_mosaic": 100,
 
     # ---------- 数据增强配置 ----------
     "hsv_h": 0.015,
     "hsv_s": 0.7,
     "hsv_v": 0.4,
     "degrees": 0.0,
-    "translate": 0.1,
-    "scale": 0.5,
+    "translate": 0.05,
+    "scale": 0.3,
     "fliplr": 0.5,
     "flipud": 0.0,
-    "mosaic": 1.0,
+    "mosaic": 0.5,
     "mixup": 0.0,
 
     # ---------- 损失权重 ----------
     # aux_geo: 辅助几何损失增益（梯度现在通过 cv5 连续参数有效流回）
-    "aux_geo": 0.05,
+    "aux_geo": 0.2,
     "aux_geo_lp": 0.0,    # L_perp（法向偏移）：本次不做 Δn，关闭
     "aux_geo_lw": 2.0,
     "aux_geo_lt": 0.0,
     "aux_geo_ar": 30.0,             
     "aux_geo_ws": 16.0,
-    "refine_feature_detach": False,
-    "refine_soft_boost": True,
-    "refine_boost_max": 2.0,
+    "refine_feature_detach": True,
 
     # ---------- 其他 ----------
-    "amp": True,
+    "amp": False,
     "cache": 'disk',
     "resume": False,
     "seed": 0,
     "verbose": True,
 }
+
+
+def move_log_to_save_dir(log_file, save_dir):
+    log_file = Path(log_file)
+    if not save_dir:
+        return log_file
+
+    save_dir = Path(save_dir)
+    if not save_dir.exists():
+        return log_file
+
+    if log_file.exists() and log_file.parent.resolve() == save_dir.resolve():
+        return log_file
+
+    target_file = save_dir / "train_console.log"
+    if log_file.resolve() == target_file.resolve():
+        return target_file
+
+    if not log_file.exists():
+        return target_file if target_file.exists() else log_file
+
+    if target_file.exists():
+        stem, suffix = target_file.stem, target_file.suffix
+        index = 2
+        while (save_dir / f"{stem}_{index}{suffix}").exists():
+            index += 1
+        target_file = save_dir / f"{stem}_{index}{suffix}"
+
+    shutil.move(str(log_file), str(target_file))
+    return target_file
 
 
 def parse_args():
@@ -202,9 +183,10 @@ def sync_obbrefine_runtime_attrs(
 
 
 def run_val_ab(args):
-    sys.stdout = Logger(sys.stdout)
-    sys.stderr = Logger(sys.stderr)
-
+    log_file = Path(CONFIG["project"]) / f"{CONFIG['name']}_val_ab_console.tmp.log"
+    console_logger = ConsoleLogger(log_file, batch_size=1)
+    console_logger.start_capture()
+    final_log_file = log_file
     model = YOLO(args.weights)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     common_kwargs = {
@@ -236,173 +218,170 @@ def run_val_ab(args):
     print(f"  批次大小: {args.batch}")
     print("=" * 60)
 
-    set_refine_inference_mode(model, False)
-    normal_metrics = model.val(name=f"{CONFIG['name']}-val-normal-{stamp}", **common_kwargs)
-    normal_dict = normal_metrics.results_dict
+    try:
+        set_refine_inference_mode(model, False)
+        normal_metrics = model.val(name=f"{CONFIG['name']}-val-normal-{stamp}", **common_kwargs)
+        normal_dict = normal_metrics.results_dict
+        final_log_file = move_log_to_save_dir(final_log_file, normal_metrics.save_dir)
+        console_logger.destination = final_log_file
 
-    set_refine_inference_mode(model, True)
-    coarse_metrics = model.val(name=f"{CONFIG['name']}-val-coarse-only-{stamp}", **common_kwargs)
-    coarse_dict = coarse_metrics.results_dict
+        set_refine_inference_mode(model, True)
+        coarse_metrics = model.val(name=f"{CONFIG['name']}-val-coarse-only-{stamp}", **common_kwargs)
+        coarse_dict = coarse_metrics.results_dict
 
-    print("\n" + "=" * 60)
-    print("  A/B 验证结果对比")
-    print("=" * 60)
-    for key in metric_keys:
-        normal_value = float(normal_dict[key])
-        coarse_value = float(coarse_dict[key])
-        delta = coarse_value - normal_value
-        print(
-            f"  {metric_labels[key]}: normal={normal_value:.5f}, coarse-only={coarse_value:.5f}, Δ={delta:+.5f}"
-        )
-    print("=" * 60)
+        print("\n" + "=" * 60)
+        print("  A/B 验证结果对比")
+        print("=" * 60)
+        for key in metric_keys:
+            normal_value = float(normal_dict[key])
+            coarse_value = float(coarse_dict[key])
+            delta = coarse_value - normal_value
+            print(
+                f"  {metric_labels[key]}: normal={normal_value:.5f}, coarse-only={coarse_value:.5f}, Δ={delta:+.5f}"
+            )
+        print(f"  日志文件: {final_log_file}")
+        print("=" * 60)
 
-    return {"normal": normal_dict, "coarse_only": coarse_dict}
+        return {"normal": normal_dict, "coarse_only": coarse_dict}
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        console_logger.stop_capture()
 
 
 def main():
     """主训练函数"""
-    sys.stdout = Logger(sys.stdout)
-    sys.stderr = Logger(sys.stderr)
-    print("\n[*] 终端日志拦截器已启动\n")
+    log_file = Path(CONFIG["project"]) / f"{CONFIG['name']}_train_console.tmp.log"
+    console_logger = ConsoleLogger(log_file, batch_size=1)
+    console_logger.start_capture()
+    model = None
+    final_log_file = log_file
 
-    # 1. 从 YAML 构建模型（含 OBBRefine 头）
-    model = YOLO(CONFIG["model"])
+    def attach_log_to_save_dir(trainer):
+        nonlocal final_log_file
+        console_logger._flush_buffer()
+        final_log_file = move_log_to_save_dir(final_log_file, trainer.save_dir)
+        console_logger.destination = final_log_file
 
-    # 2. 注册回调：训练开始前加载 CA 预训练权重
-    def on_pretrain_routine_end(trainer):
-        """在模型构建完成后、训练循环开始前，注入 CA 预训练权重。"""
-        print(f"\n[*] 加载预训练权重: {PRETRAIN_WEIGHTS}")
+    try:
+        print("\n[*] 终端日志拦截器已启动\n")
 
-        ckpt = torch.load(PRETRAIN_WEIGHTS, map_location=trainer.device, weights_only=False)
-        if "model" in ckpt:
-            src_state = ckpt["model"].float().state_dict()
-        else:
-            src_state = ckpt
+        # 1. 从 YAML 构建模型（含 OBBRefine 头）
+        model = YOLO(CONFIG["model"])
+        model.add_callback("on_pretrain_routine_start", attach_log_to_save_dir)
 
-        # intersect_dicts 只加载 key 和 shape 都匹配的参数
-        # cv5 的参数不在 CA checkpoint 中，保持零初始化
-        model_state = trainer.model.state_dict()
-        loaded = intersect_dicts(src_state, model_state)
-        trainer.model.load_state_dict(loaded, strict=False)
-
-        n_loaded = len(loaded)
-        n_total = len(model_state)
-        n_new = n_total - n_loaded
-        print(f"[*] 已加载 {n_loaded}/{n_total} 参数，{n_new} 个新参数（cv5 精修分支）保持零初始化")
-
-        # 同步 EMA
-        if hasattr(trainer, 'ema') and trainer.ema is not None:
-            trainer.ema.ema.load_state_dict(trainer.model.state_dict())
-            trainer.ema.updates = 0
-            print("[*] EMA 已同步")
-
-        sync_obbrefine_runtime_attrs(
-            trainer.model,
-            trainer.args.aux_geo_ar,
-            trainer.args.aux_geo_ws,
-            True,
-            trainer.args.refine_feature_detach,
-        )
-        if hasattr(trainer, 'ema') and trainer.ema is not None:
+        # 2. 注册回调：训练开始前同步 OBBRefine 运行时属性
+        def on_pretrain_routine_end(trainer):
+            """在模型构建完成后、训练循环开始前，同步 OBBRefine 运行时属性。"""
             sync_obbrefine_runtime_attrs(
-                trainer.ema.ema,
+                trainer.model,
                 trainer.args.aux_geo_ar,
                 trainer.args.aux_geo_ws,
                 True,
                 trainer.args.refine_feature_detach,
             )
-        print(
-            f"[*] OBBRefine 运行时属性已同步: AR>{float(trainer.args.aux_geo_ar)}, "
-            f"short<{float(trainer.args.aux_geo_ws)}px, "
-            f"refine_feature_detach={bool(trainer.args.refine_feature_detach)}, "
-            f"refine_soft_boost={bool(trainer.args.refine_soft_boost)}, 默认验证/推理=coarse-only"
-        )
+            if hasattr(trainer, 'ema') and trainer.ema is not None:
+                sync_obbrefine_runtime_attrs(
+                    trainer.ema.ema,
+                    trainer.args.aux_geo_ar,
+                    trainer.args.aux_geo_ws,
+                    True,
+                    trainer.args.refine_feature_detach,
+                )
+            print(
+                f"[*] OBBRefine 运行时属性已同步: AR>{float(trainer.args.aux_geo_ar)}, "
+                f"short<{float(trainer.args.aux_geo_ws)}px, "
+                f"refine_feature_detach={bool(trainer.args.refine_feature_detach)}, "
+                f"默认验证/推理=coarse-only，训练从 YAML 随机初始化开始"
+            )
 
-    model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
+        model.add_callback("on_pretrain_routine_end", on_pretrain_routine_end)
 
-    # 3. 注册回调：日志文件落地
-    def on_train_start(trainer):
-        time_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        final_log_file = os.path.join(trainer.save_dir, f"train_terminal_{time_str}.log")
-        print(f"\n[*] 日志文件: {final_log_file}\n")
-        sys.stdout.set_log_file(final_log_file)
-        sys.stderr.set_log_file(final_log_file)
-        trainer.refine_diag_file = os.path.join(trainer.save_dir, "refine_diag.csv")
-        with open(trainer.refine_diag_file, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(["epoch", "refine_mask_ratio", "avg_abs_dshort", "refine_loss"])
-
-    model.add_callback("on_train_start", on_train_start)
-
-    def on_train_epoch_end(trainer):
-        criterion = getattr(unwrap_model(trainer.model), "criterion", None)
-        if criterion is None or not hasattr(criterion, "refine_diagnostics"):
-            return
-        diag = criterion.refine_diagnostics
-        print(
-            f"[*] refine_diag epoch {trainer.epoch + 1}: "
-            f"mask_ratio={float(diag['refine_mask_ratio']):.6f}, "
-            f"avg_abs_dshort={float(diag['avg_abs_dshort']):.6f}, "
-            f"refine_loss={float(diag['refine_loss']):.6f}"
-        )
-        diag_file = getattr(trainer, "refine_diag_file", None)
-        if diag_file:
-            with open(diag_file, "a", newline="", encoding="utf-8") as f:
+        # 3. 注册回调：日志文件落地
+        def on_train_start(trainer):
+            attach_log_to_save_dir(trainer)
+            print(f"\n[*] 日志文件: {final_log_file}\n")
+            trainer.refine_diag_file = os.path.join(trainer.save_dir, "refine_diag.csv")
+            with open(trainer.refine_diag_file, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    trainer.epoch + 1,
-                    float(diag["refine_mask_ratio"]),
-                    float(diag["avg_abs_dshort"]),
-                    float(diag["refine_loss"]),
-                ])
+                writer.writerow(["epoch", "refine_mask_ratio", "avg_abs_dshort", "refine_loss"])
 
-    model.add_callback("on_train_epoch_end", on_train_epoch_end)
+        model.add_callback("on_train_start", on_train_start)
 
-    # 4. 打印配置
-    if CONFIG["refine_soft_boost"] and CONFIG["refine_feature_detach"]:
-        raise ValueError("refine_soft_boost=True 时必须同时设置 refine_feature_detach=False。")
+        def on_train_epoch_end(trainer):
+            criterion = getattr(unwrap_model(trainer.model), "criterion", None)
+            if criterion is None or not hasattr(criterion, "refine_diagnostics"):
+                return
+            diag = criterion.refine_diagnostics
+            print(
+                f"[*] refine_diag epoch {trainer.epoch + 1}: "
+                f"mask_ratio={float(diag['refine_mask_ratio']):.6f}, "
+                f"avg_abs_dshort={float(diag['avg_abs_dshort']):.6f}, "
+                f"refine_loss={float(diag['refine_loss']):.6f}"
+            )
+            diag_file = getattr(trainer, "refine_diag_file", None)
+            if diag_file:
+                with open(diag_file, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([
+                        trainer.epoch + 1,
+                        float(diag["refine_mask_ratio"]),
+                        float(diag["avg_abs_dshort"]),
+                        float(diag["refine_loss"]),
+                    ])
 
-    if CONFIG["refine_soft_boost"]:
-        refine_mode_label = "B2（训练弱耦合 + AR soft boost）"
-    elif CONFIG["refine_feature_detach"]:
+        model.add_callback("on_train_epoch_end", on_train_epoch_end)
+
+        # 4. 打印配置
+        if not CONFIG["refine_feature_detach"]:
+            raise ValueError("最终保留路线要求 refine_feature_detach=True。")
         refine_mode_label = "fully-decoupled"
-    else:
-        refine_mode_label = "B1（训练弱耦合）"
 
-    print("=" * 60)
-    print(f"  模型 YAML: {MODEL_YAML}")
-    print(f"  预训练权重: {PRETRAIN_WEIGHTS}")
-    print(f"  数据集: {CONFIG['data']}")
-    print(f"  训练轮数: {CONFIG['epochs']}")
-    print(f"  批次大小: {CONFIG['batch']}")
-    print(f"  图片尺寸: {CONFIG['imgsz']}")
-    print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
-    print(f"  aux_geo 增益: {CONFIG['aux_geo']}")
-    print(f"  Refine Head: Δw + Δh (ne_refine=2, {refine_mode_label})")
-    print(f"  refine_feature_detach: {CONFIG['refine_feature_detach']}")
-    print(f"  refine_soft_boost: {CONFIG['refine_soft_boost']}")
-    print(f"  refine_boost_max: {CONFIG['refine_boost_max']}")
-    print("  验证/推理默认口径: coarse-only（默认禁用 refine inference）")
-    print("  A/B 对照入口: python train_yolo11_obb_refine.py --mode val_ab --weights <ckpt>")
-    print("=" * 60)
+        print("=" * 60)
+        print(f"  模型 YAML: {MODEL_YAML}")
+        print("  预训练权重: 不使用（从 YAML 随机初始化）")
+        print(f"  数据集: {CONFIG['data']}")
+        print(f"  训练轮数: {CONFIG['epochs']}")
+        print(f"  批次大小: {CONFIG['batch']}")
+        print(f"  图片尺寸: {CONFIG['imgsz']}")
+        print(f"  输出目录: {CONFIG['project']}/{CONFIG['name']}")
+        print(f"  临时日志文件: {log_file}")
+        print(f"  aux_geo 增益: {CONFIG['aux_geo']}")
+        print(f"  Refine Head: Δw + Δh (ne_refine=2, {refine_mode_label})")
+        print(f"  refine_feature_detach: {CONFIG['refine_feature_detach']}")
+        print("  验证/推理默认口径: coarse-only（默认禁用 refine inference）")
+        print("  A/B 对照入口: python train_yolo11_obb_refine.py --mode val_ab --weights <ckpt>")
+        print("=" * 60)
 
-    # 5. 开始训练
-    results = model.train(**CONFIG)
+        # 5. 开始训练
+        results = model.train(**CONFIG)
+        save_dir = getattr(model.trainer, "save_dir", Path(CONFIG["project"]) / CONFIG["name"])
 
-    # 6. 训练完成
-    print("\n" + "=" * 60)
-    print("  训练完成！")
-    print(f"  结果保存在: {CONFIG['project']}/{CONFIG['name']}")
-    print("  保存内容说明:")
-    print("    - weights/best.pt     : 按 coarse-only 验证指标选出的最佳模型")
-    print("    - weights/last.pt     : 最后一轮权重")
-    print("    - results.csv         : 每轮训练指标（默认 coarse-only 验证口径）")
-    print("    - refine_diag.csv     : 每轮 refine 诊断统计")
-    print("    - results.png         : 训练曲线图")
-    print("    - args.yaml           : 完整训练参数记录")
-    print("=" * 60)
+        # 6. 训练完成
+        print("\n" + "=" * 60)
+        print("  训练完成！")
+        print(f"  结果保存在: {save_dir}")
+        print(f"  日志文件: {final_log_file}")
+        print("  保存内容说明:")
+        print("    - weights/best.pt     : 按 coarse-only 验证指标选出的最佳模型")
+        print("    - weights/last.pt     : 最后一轮权重")
+        print("    - results.csv         : 每轮训练指标（默认 coarse-only 验证口径）")
+        print("    - refine_diag.csv     : 每轮 refine 诊断统计")
+        print("    - results.png         : 训练曲线图")
+        print("    - args.yaml           : 完整训练参数记录")
+        print("=" * 60)
 
-    return results
+        return results
+    except Exception:
+        traceback.print_exc()
+        raise
+    finally:
+        console_logger.stop_capture()
+        trainer = getattr(model, "trainer", None) if model is not None else None
+        save_dir = getattr(trainer, "save_dir", None)
+        final_log_file = move_log_to_save_dir(final_log_file, save_dir)
+        print(f"  日志文件: {final_log_file}")
 
 
 if __name__ == "__main__":

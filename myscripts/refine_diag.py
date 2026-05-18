@@ -24,11 +24,11 @@ from ultralytics.utils.metrics import probiou
 
 # ========================== 配置 ==========================
 # 当前主线训练的 checkpoint 路径（含 OBBRefine 头）
-MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-b2/weights/best.pt"
+MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple-coarseval/weights/best.pt"
 DATA_PATH = "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml"
 NUM_BATCHES = 100  # 诊断用的 batch 数
 DEVICE = 0
-REPORT_PATH = "/root/autodl-tmp/work-dirs/refine_diag_b2/refine_diag_results.md"
+REPORT_PATH = "/root/autodl-tmp/work-dirs/refine_diag/refine_diag_results.md"
 SMALL_SHORT_SIDE_PX = 16.0
 MEDIUM_SHORT_SIDE_PX = 32.0
 
@@ -48,10 +48,6 @@ def apply_refine_to_bboxes(coarse_bboxes, pred_refine, clamp_val):
     rf = pred_refine.permute(0, 2, 1)
     dw = rf[..., 0:1].clamp(-clamp_val, clamp_val)
     dh = rf[..., 1:2].clamp(-clamp_val, clamp_val) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
-    short_is_w = coarse_bboxes[..., 2:3] <= coarse_bboxes[..., 3:4]
-    zero = torch.zeros_like(dw)
-    dw = torch.where(short_is_w, dw, zero)
-    dh = torch.where(short_is_w, zero, dh)
     return torch.cat(
         [
             coarse_bboxes[..., 0:2],

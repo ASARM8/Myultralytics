@@ -159,7 +159,6 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
-        "refine_boost_max",
     }
 )
 CFG_FRACTION_KEYS = frozenset(
@@ -241,7 +240,6 @@ CFG_BOOL_KEYS = frozenset(
         "profile",
         "end2end",
         "refine_feature_detach",
-        "refine_soft_boost",
     }
 )
 
