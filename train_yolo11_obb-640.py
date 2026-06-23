@@ -24,7 +24,7 @@ CONFIG = {
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
-    "data": "/root/autodl-tmp/datasets/TTPLA-640-POS/dataset.yaml",
+    "data": "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,              # 训练总轮数
@@ -35,7 +35,7 @@ CONFIG = {
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
-    "name": "yolo11_obb_640_baseline_pos",        # 实验名称（子目录）
+    "name": "yolo11_obb_640_811_baseline",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
     # ---------- 模型保存配置 ----------
