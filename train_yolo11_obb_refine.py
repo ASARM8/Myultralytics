@@ -30,7 +30,7 @@ PRETRAIN_WEIGHTS = None
 
 # OBBRefine YAML 配置路径（含 cv5 精修分支定义）
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
-RUN_NAME = "yolo11_obb_640_pos_refine_scratch"
+RUN_NAME = "yolo11_obb_640_811_ca_refine_scratch"
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 
@@ -41,7 +41,7 @@ CONFIG = {
     "model": MODEL_YAML,
 
     # ---------- 数据集配置 ----------
-    "data": "/root/autodl-tmp/datasets/TTPLA-640-POS/dataset.yaml",
+    "data": "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,
