@@ -1,5 +1,5 @@
 """
-YOLOv11-OBB 自定义数据集训练脚本
+YOLOv11-OBB CA-only 对照训练脚本
 使用方法:
     直接运行: python train_yolo11_obb.py
     修改下方 CONFIG 字典中的参数即可自定义训练配置
@@ -91,31 +91,29 @@ class Logger(object):
 # ========================== 训练配置 ==========================
 CONFIG = {
     # ---------- 模型配置 ----------
-    # 使用 .yaml 文件从零开始训练（不使用预训练权重）
-    # 可选规模: yolo11n-obb.yaml / yolo11s-obb.yaml / yolo11m-obb.yaml / yolo11l-obb.yaml / yolo11x-obb.yaml
-    # "model": "yolo11l-obb-ca.yaml",
-    # "model": "/root/autodl-tmp/work-dirs/yolo11_obb2/weights/last.pt",
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/last.pt",
+    # CA-only 对照：Coverage-Aware Assignment + reg_max=32，不启用 Refine Head。
+    "model": "ultralytics/cfg/models/11/yolo11l-obb-ca.yaml",
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
-    "epochs": 50,              # 训练总轮数
-    "batch": 16,                # 批次大小（RTX 5090 32GB 显存，yolo11l + 1024 尝试 32，OOM 则降回 16）
-    "imgsz": 1024,              # 输入图片尺寸
+    "epochs": 300,              # 训练总轮数
+    "batch": 16,                # 批次大小
+    "imgsz": 640,              # 输入图片尺寸
     "device": 0,                # GPU 设备编号
     "workers": 16,               # 数据加载线程数（5090 性能强，可用更多线程）
+    "patience": 0,
 
     # ---------- 输出目录配置 ----------
     "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
-    "name": "yolo11_obb-ca-continue",        # 实验名称（子目录）
+    "name": "yolo11_obb_640_811_ca",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
     # ---------- 模型保存配置 ----------
     "save": True,               # 保存训练检查点（best.pt 和 last.pt）
-    "save_period": 50,          # 每隔 N 个 epoch 额外保存一次权重（-1 表示不额外保存）
+    "save_period": 10,          # 每隔 N 个 epoch 额外保存一次权重（-1 表示不额外保存）
 
     # ---------- 验证与可视化 ----------
     "val": True,                # 训练过程中进行验证
@@ -124,29 +122,33 @@ CONFIG = {
     # ---------- 训练策略 ----------
     "pretrained": False,        # 不使用预训练权重（从零训练）
     "optimizer": "AdamW",       # AdamW 优化器（从零训练时收敛更稳定）
-    "lr0": 0.0001,               # 初始学习率（AdamW 推荐 1e-3）
+    "lr0": 0.0003,               # 初始学习率（AdamW 推荐 1e-3）
     "lrf": 0.01,                # 最终学习率 = lr0 * lrf
     "momentum": 0.937,          # Adam beta1
     "weight_decay": 0.0005,     # 权重衰减（L2 正则化）
     "warmup_epochs": 10.0,       # 预热轮数（从零训练建议更长的预热）
     "cos_lr": True,             # 余弦退火学习率调度（平滑降低学习率，提升收敛质量）
     # "patience":15,            # 早停：连续 N 个 epoch 验证指标不提升则停止
-    "close_mosaic": 10,         # 最后 15 个 epoch 关闭 mosaic（让模型更好适应真实图片）
+    "close_mosaic": 100,        # 最后 100 个 epoch 关闭 mosaic（对齐 refine-head 训练）
 
     # ---------- 数据增强配置 ----------
     "hsv_h": 0.015,             # HSV 色调增强
     "hsv_s": 0.7,               # HSV 饱和度增强
     "hsv_v": 0.4,               # HSV 亮度增强
     "degrees": 0.0,             # 旋转角度范围（±度）
-    "translate": 0.1,           # 平移比例
-    "scale": 0.5,               # 缩放比例
+    "translate": 0.05,          # 平移比例
+    "scale": 0.3,               # 缩放比例
     "fliplr": 0.5,              # 水平翻转概率
     "flipud": 0.0,              # 垂直翻转概率
-    "mosaic": 1.0,              # Mosaic 增强概率
+    "mosaic": 0.5,              # Mosaic 增强概率
     "mixup": 0.0,               # MixUp 增强概率
 
+    # ---------- 辅助损失 ----------
+    # CA-only 不训练精校分支，也不启用额外主分支几何辅助损失；显式覆盖 default.yaml 中的 aux_geo=1.5。
+    "aux_geo": 0.0,
+
     # ---------- 其他 ----------
-    "amp": True,               # 排雷期关闭混合精度，使用 Float32 排除数值不稳定（验证通过后可改回 True）
+    "amp": False,              # 对齐 refine-head 训练，关闭混合精度
     "cache": 'disk',              # 缓存数据集到 RAM（加速训练，内存不够可改为 'disk' 或 False）
     "resume": False,            # 是否从上次中断处恢复训练
     "seed": 0,                  # 随机种子（保证可复现性）
