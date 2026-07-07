@@ -20,6 +20,7 @@ import datetime
 from pathlib import Path
 os.environ["OMP_NUM_THREADS"] = "8"
 
+import torch
 from ultralytics import YOLO
 from ultralytics.utils.logger import ConsoleLogger
 from ultralytics.utils.torch_utils import unwrap_model
@@ -33,6 +34,11 @@ MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
 RUN_NAME = "yolo11_obb_640_811_ca_refine_scratch"
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
+RESUME_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/epoch290.pt"
+RESUME_TOTAL_EPOCHS = 400
+RESUME_LR0 = 5e-6
+RESUME_LRF = 1.0
+RESUME_WARMUP_EPOCHS = 0.0
 
 # ========================== 训练配置 ==========================
 CONFIG = {
@@ -138,13 +144,67 @@ def move_log_to_save_dir(log_file, save_dir):
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["train", "val_ab"], default="train")
+    parser.add_argument("--mode", choices=["train", "resume", "val_ab"], default="train")
     parser.add_argument("--weights", default=VAL_WEIGHTS)
+    parser.add_argument("--resume-weights", default=RESUME_WEIGHTS)
+    parser.add_argument("--total-epochs", type=int, default=RESUME_TOTAL_EPOCHS)
+    parser.add_argument("--resume-lr0", type=float, default=RESUME_LR0)
+    parser.add_argument("--resume-lrf", type=float, default=RESUME_LRF)
+    parser.add_argument("--resume-warmup-epochs", type=float, default=RESUME_WARMUP_EPOCHS)
+    parser.add_argument("--resume-cos-lr", action="store_true")
     parser.add_argument("--data", default=CONFIG["data"])
     parser.add_argument("--imgsz", type=int, default=CONFIG["imgsz"])
     parser.add_argument("--batch", type=int, default=CONFIG["batch"])
     parser.add_argument("--device", default=str(CONFIG["device"]))
     return parser.parse_args()
+
+
+def load_torch_checkpoint(path: Path):
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def prepare_stable_resume_checkpoint(args) -> Path:
+    source = Path(args.resume_weights)
+    if not source.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {source}")
+
+    checkpoint = load_torch_checkpoint(source)
+    checkpoint_epoch = int(checkpoint.get("epoch", -1))
+    start_epoch = checkpoint_epoch + 1
+    if args.total_epochs <= start_epoch:
+        raise ValueError(
+            f"total_epochs must be greater than checkpoint start epoch {start_epoch}; got {args.total_epochs}."
+        )
+
+    train_args = checkpoint.setdefault("train_args", {})
+    original_epochs = train_args.get("epochs")
+    original_lr0 = train_args.get("lr0")
+    original_lrf = train_args.get("lrf")
+    original_cos_lr = train_args.get("cos_lr")
+
+    train_args["epochs"] = int(args.total_epochs)
+    train_args["lr0"] = float(args.resume_lr0)
+    train_args["lrf"] = float(args.resume_lrf)
+    train_args["cos_lr"] = bool(args.resume_cos_lr)
+    train_args["warmup_epochs"] = float(args.resume_warmup_epochs)
+    train_args["close_mosaic"] = int(args.total_epochs)
+
+    target = source.with_name(f"{source.stem}_stable_resume_to_{args.total_epochs}{source.suffix}")
+    torch.save(checkpoint, target)
+
+    print(
+        f"[*] Created stable resume checkpoint: {target}\n"
+        f"    source_epoch={checkpoint_epoch}, original_epochs={original_epochs}, total_epochs={args.total_epochs}\n"
+        f"    lr0: {original_lr0} -> {args.resume_lr0}, lrf: {original_lrf} -> {args.resume_lrf}, "
+        f"cos_lr: {original_cos_lr} -> {bool(args.resume_cos_lr)}\n"
+        f"    warmup_epochs={args.resume_warmup_epochs}, close_mosaic={args.total_epochs}"
+    )
+    if checkpoint.get("optimizer") is None:
+        print("[!] Warning: checkpoint has no optimizer state; this will behave like fine-tuning, not strict resume.")
+    return target
 
 
 def set_refine_inference_mode(yolo_model, disable_refine_inference: bool):
@@ -250,7 +310,7 @@ def run_val_ab(args):
         console_logger.stop_capture()
 
 
-def main():
+def main(model_path: str | Path | None = None, train_overrides: dict | None = None):
     """主训练函数"""
     log_file = Path(CONFIG["project"]) / f"{CONFIG['name']}_train_console.tmp.log"
     console_logger = ConsoleLogger(log_file, batch_size=1)
@@ -268,7 +328,7 @@ def main():
         print("\n[*] 终端日志拦截器已启动\n")
 
         # 1. 从 YAML 构建模型（含 OBBRefine 头）
-        model = YOLO(CONFIG["model"])
+        model = YOLO(str(model_path) if model_path else CONFIG["model"])
         model.add_callback("on_pretrain_routine_start", attach_log_to_save_dir)
 
         # 2. 注册回调：训练开始前同步 OBBRefine 运行时属性
@@ -355,7 +415,10 @@ def main():
         print("=" * 60)
 
         # 5. 开始训练
-        results = model.train(**CONFIG)
+        train_config = CONFIG.copy()
+        if train_overrides:
+            train_config.update(train_overrides)
+        results = model.train(**train_config)
         save_dir = getattr(model.trainer, "save_dir", Path(CONFIG["project"]) / CONFIG["name"])
 
         # 6. 训练完成
@@ -388,5 +451,19 @@ if __name__ == "__main__":
     cli_args = parse_args()
     if cli_args.mode == "val_ab":
         run_val_ab(cli_args)
+    elif cli_args.mode == "resume":
+        stable_resume_weights = prepare_stable_resume_checkpoint(cli_args)
+        main(
+            model_path=stable_resume_weights,
+            train_overrides={
+                "resume": True,
+                "close_mosaic": int(cli_args.total_epochs),
+                "save_period": CONFIG["save_period"],
+                "workers": CONFIG["workers"],
+                "batch": cli_args.batch,
+                "device": cli_args.device,
+                "imgsz": cli_args.imgsz,
+            },
+        )
     else:
         main()
