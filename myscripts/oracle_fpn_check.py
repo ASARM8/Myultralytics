@@ -13,6 +13,8 @@ OBB 模型几何排查脚本
 import os
 import sys
 import glob
+import csv
+import json
 import yaml
 import numpy as np
 import torch
@@ -58,6 +60,7 @@ CONFIG = {
 
 # 排查用 IoU 阈值
 CHECK_THRESHOLDS = [0.50, 0.75, 0.90]
+MAP_THRESHOLDS = [round(0.50 + 0.05 * i, 2) for i in range(10)]
 
 
 # ========================== 数据收集 ==========================
@@ -186,17 +189,24 @@ def oracle_replace_all(pred, gt):
     return gt.copy()
 
 
-def compute_oracle_ap(all_data, modify_fn, iou_threshold):
-    """用 Oracle 修改后的预测计算 AP。
+def oracle_identity(pred, gt):
+    """Return predictions unchanged for a protocol-matched baseline."""
+    del gt
+    return pred
+
+
+def compute_oracle_aps(all_data, modify_fn, iou_thresholds):
+    """用 Oracle 修改后的预测一次性计算多个 IoU 阈值的 AP。
 
     对每张图片：
       1. 复制预测框
       2. 对 IoU50 匹配成功的预测框，用 modify_fn 修改
       3. 重新计算 IoU 矩阵
-      4. 在 iou_threshold 下重新匹配
-      5. 汇总 TP/FP 并计算 AP
+      4. 在全部 iou_thresholds 下重新匹配
+      5. 汇总各阈值 TP/FP 并计算 AP
     """
-    all_tp = []
+    thresholds = list(iou_thresholds)
+    all_tp = [[] for _ in thresholds]
     all_conf = []
     total_gt = 0
 
@@ -230,18 +240,27 @@ def compute_oracle_ap(all_data, modify_fn, iou_threshold):
         else:
             new_iou = np.zeros((n_gt, n_pred), dtype=np.float32)
 
-        # 在目标阈值下重新匹配
-        tp, _ = match_at_thresholds(new_iou, gt_cls, pred_cls, [iou_threshold])
-        all_tp.append(tp[:, 0])
+        # 同一 IoU 矩阵一次完成全部阈值匹配，避免为 mAP50-95 重复计算几何 IoU。
+        tp, _ = match_at_thresholds(new_iou, gt_cls, pred_cls, thresholds)
+        for index in range(len(thresholds)):
+            all_tp[index].append(tp[:, index])
         all_conf.append(pred_conf)
 
-    if not all_tp:
-        return 0.0
+    if not all_conf:
+        return {threshold: 0.0 for threshold in thresholds}
 
-    all_tp = np.concatenate(all_tp)
     all_conf = np.concatenate(all_conf)
-    ap, _, _ = compute_ap_from_tp(all_tp, all_conf, total_gt)
-    return ap
+    results = {}
+    for threshold, values in zip(thresholds, all_tp):
+        tp_values = np.concatenate(values) if values else np.zeros((0,), dtype=np.float32)
+        ap, _, _ = compute_ap_from_tp(tp_values, all_conf, total_gt)
+        results[threshold] = ap
+    return results
+
+
+def compute_oracle_ap(all_data, modify_fn, iou_threshold):
+    """Backward-compatible single-threshold wrapper."""
+    return compute_oracle_aps(all_data, modify_fn, [iou_threshold])[iou_threshold]
 
 
 def check1_oracle_experiment(all_data):
@@ -250,26 +269,13 @@ def check1_oracle_experiment(all_data):
     print("  排查 1：几何替换 Oracle 实验")
     print("=" * 60)
 
-    # 基线 AP
+    # 基线 AP：与 Oracle 变体使用完全相同的逐阈值重匹配协议。
     print("\n  计算基线 AP ...")
-    baseline = {}
-    for th in [0.75, 0.90]:
-        all_tp = []
-        all_conf = []
-        total_gt = 0
-        th_idx = CHECK_THRESHOLDS.index(th)
-        for d in all_data:
-            all_tp.append(d["tp"][:, th_idx])
-            all_conf.append(d["pred_conf"])
-            total_gt += len(d["gt_cls"])
-        if all_tp:
-            tp_arr = np.concatenate(all_tp)
-            conf_arr = np.concatenate(all_conf)
-            ap, _, _ = compute_ap_from_tp(tp_arr, conf_arr, total_gt)
-        else:
-            ap = 0.0
-        baseline[th] = ap
-        print(f"    基线 AP{int(th*100)} = {ap:.4f}")
+    baseline_by_iou = compute_oracle_aps(all_data, oracle_identity, MAP_THRESHOLDS)
+    baseline = {**baseline_by_iou, "map50_95": float(np.mean(list(baseline_by_iou.values())))}
+    print(f"    基线 AP75 = {baseline[0.75]:.4f}")
+    print(f"    基线 AP90 = {baseline[0.90]:.4f}")
+    print(f"    基线 mAP50-95 = {baseline['map50_95']:.4f}")
 
     # Oracle 变体
     oracle_variants = [
@@ -284,13 +290,20 @@ def check1_oracle_experiment(all_data):
     results = {}
     for key, label, modify_fn in oracle_variants:
         print(f"\n  [{label}]")
-        row = {"label": label}
-        for th in [0.75, 0.90]:
-            ap = compute_oracle_ap(all_data, modify_fn, th)
-            gain = ap - baseline[th]
-            row[f"ap{int(th*100)}"] = ap
-            row[f"gain{int(th*100)}"] = gain
-            print(f"    AP{int(th*100)} = {ap:.4f}  (提升 {gain:+.4f})")
+        ap_by_iou = compute_oracle_aps(all_data, modify_fn, MAP_THRESHOLDS)
+        row = {
+            "label": label,
+            "ap_by_iou": {f"{th:.2f}": ap for th, ap in ap_by_iou.items()},
+            "ap75": ap_by_iou[0.75],
+            "gain75": ap_by_iou[0.75] - baseline[0.75],
+            "ap90": ap_by_iou[0.90],
+            "gain90": ap_by_iou[0.90] - baseline[0.90],
+            "map50_95": float(np.mean(list(ap_by_iou.values()))),
+        }
+        row["gain_map50_95"] = row["map50_95"] - baseline["map50_95"]
+        print(f"    AP75 = {row['ap75']:.4f}  (提升 {row['gain75']:+.4f})")
+        print(f"    AP90 = {row['ap90']:.4f}  (提升 {row['gain90']:+.4f})")
+        print(f"    mAP50-95 = {row['map50_95']:.4f}  (提升 {row['gain_map50_95']:+.4f})")
         results[key] = row
 
     return baseline, results
@@ -873,6 +886,46 @@ def generate_report(config, check1_result, check2_result, check3_result, model_i
     with open(report_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"\n报告已保存: {report_path}")
+
+    # 论文表8的机器可读数据；联合替换和理论上限仍保留在完整 JSON 中。
+    paper_variants = [
+        ("replace_center", "中心位置"),
+        ("replace_length", "长边"),
+        ("replace_width", "短边"),
+        ("replace_angle", "角度"),
+    ]
+    csv_path = os.path.join(output_dir, "table08_oracle.csv")
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=["oracle_replacement", "delta_ap75", "delta_ap90", "delta_map50_95"],
+        )
+        writer.writeheader()
+        for key, label in paper_variants:
+            result = oracle_results[key]
+            writer.writerow(
+                {
+                    "oracle_replacement": label,
+                    "delta_ap75": result["gain75"],
+                    "delta_ap90": result["gain90"],
+                    "delta_map50_95": result["gain_map50_95"],
+                }
+            )
+
+    json_path = os.path.join(output_dir, "oracle_fpn_results.json")
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "protocol": {"iou_thresholds": MAP_THRESHOLDS, "matching": "recomputed for every threshold"},
+                "baseline": {str(key): value for key, value in baseline.items()},
+                "oracle_results": oracle_results,
+            },
+            handle,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"论文表8 CSV 已保存: {csv_path}")
+    print(f"Oracle JSON 已保存: {json_path}")
     return report_path
 
 
