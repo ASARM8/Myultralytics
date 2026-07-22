@@ -152,6 +152,7 @@ def parse_args():
     parser.add_argument("--resume-lrf", type=float, default=RESUME_LRF)
     parser.add_argument("--resume-warmup-epochs", type=float, default=RESUME_WARMUP_EPOCHS)
     parser.add_argument("--resume-cos-lr", action="store_true")
+    parser.add_argument("--resume-name", default=None)
     parser.add_argument("--data", default=CONFIG["data"])
     parser.add_argument("--imgsz", type=int, default=CONFIG["imgsz"])
     parser.add_argument("--batch", type=int, default=CONFIG["batch"])
@@ -191,6 +192,10 @@ def prepare_stable_resume_checkpoint(args) -> Path:
     train_args["cos_lr"] = bool(args.resume_cos_lr)
     train_args["warmup_epochs"] = float(args.resume_warmup_epochs)
     train_args["close_mosaic"] = int(args.total_epochs)
+    train_args["project"] = CONFIG["project"]
+    train_args["name"] = args.resume_name or f"{RUN_NAME}_stable_resume_epoch{checkpoint_epoch}_to_{args.total_epochs}"
+    train_args["exist_ok"] = False
+    train_args.pop("save_dir", None)
 
     target = source.with_name(f"{source.stem}_stable_resume_to_{args.total_epochs}{source.suffix}")
     torch.save(checkpoint, target)
@@ -200,7 +205,8 @@ def prepare_stable_resume_checkpoint(args) -> Path:
         f"    source_epoch={checkpoint_epoch}, original_epochs={original_epochs}, total_epochs={args.total_epochs}\n"
         f"    lr0: {original_lr0} -> {args.resume_lr0}, lrf: {original_lrf} -> {args.resume_lrf}, "
         f"cos_lr: {original_cos_lr} -> {bool(args.resume_cos_lr)}\n"
-        f"    warmup_epochs={args.resume_warmup_epochs}, close_mosaic={args.total_epochs}"
+        f"    warmup_epochs={args.resume_warmup_epochs}, close_mosaic={args.total_epochs}\n"
+        f"    output_name={train_args['name']}"
     )
     if checkpoint.get("optimizer") is None:
         print("[!] Warning: checkpoint has no optimizer state; this will behave like fine-tuning, not strict resume.")
