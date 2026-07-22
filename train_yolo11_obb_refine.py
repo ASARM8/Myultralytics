@@ -301,9 +301,10 @@ def run_val_ab(args):
         for key in metric_keys:
             normal_value = float(normal_dict[key])
             coarse_value = float(coarse_dict[key])
-            delta = coarse_value - normal_value
+            delta = normal_value - coarse_value
             print(
-                f"  {metric_labels[key]}: normal={normal_value:.5f}, coarse-only={coarse_value:.5f}, Δ={delta:+.5f}"
+                f"  {metric_labels[key]}: normal={normal_value:.5f}, coarse-only={coarse_value:.5f}, "
+                f"Δ(normal-coarse)={delta:+.5f}"
             )
         print(f"  日志文件: {final_log_file}")
         print("=" * 60)
