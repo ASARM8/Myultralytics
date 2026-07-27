@@ -5,7 +5,14 @@ DFL 回归截断 & 正样本层级分配 验证统计脚本 (H1 + H2)
   H1: 每个正样本的所需回归距离 D_req 是否超出 DFL 理论上限 D_max = stride × (reg_max - 1)
   H2: 不同长边长度的 GT 框，其正样本被分配到了 FPN 的哪一层 (P3/P4/P5)
 
-使用方法: python myscripts/check_h1h2_stats.py
+正式统计推荐直接加载对应方法的完整 checkpoint，例如：
+  python myscripts/check_h1h2_stats.py \
+    --method ca-refine \
+    --model /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca_refine_scratch/weights/best.pt \
+    --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
+
+原始模型、CA和CA-Refine必须分别使用自己的checkpoint运行，不能把一种结构的
+YAML与另一种结构的权重做参数交集后作为正式统计结果。
 只需跑 1~3 个 Epoch 即可收集足够的统计学证据。
 
 原理:
@@ -15,45 +22,38 @@ DFL 回归截断 & 正样本层级分配 验证统计脚本 (H1 + H2)
   - 统计完成后正常执行原始 loss，不影响训练过程。
 """
 
-import os
-import sys
-import re
-import json
+import argparse
 import datetime
+import json
 import math
-import numpy as np
+import os
+import re
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+# 必须在导入 NumPy/PyTorch 之前设置，避免数值后端提前初始化线程池。
 os.environ["OMP_NUM_THREADS"] = "8"
 
+import numpy as np
 import torch
+
 from ultralytics import YOLO
-from ultralytics.utils.torch_utils import intersect_dicts
 from ultralytics.utils.tal import make_anchors
+from ultralytics.utils.torch_utils import unwrap_model
 
 
 # ========================== 配置 ==========================
 CONFIG = {
-    # ---------- 模型 ----------
-    # 可选 "yolo11l-obb.yaml"（原版）或 "yolo11l-obb-sp.yaml"（含 StripPooling）
-    "model": "yolo11l-obb-ca.yaml",
-    # 迁移权重（留空则从零开始；SP 模型需要层索引重映射，脚本自动处理）
-    "pretrained_weights": "/root/autodl-tmp/work-dirs/yolo11_obb-v2.1full/weights/best.pt",
-
-    # ---------- 数据 ----------
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
-
     # ---------- 训练参数（仅用于统计，跑 1~3 个 epoch 即可） ----------
     "epochs": 3,
     "batch": 8,
-    "imgsz": 1024,
+    "imgsz": 640,
     "device": 0,
     "workers": 16,
 
     # ---------- 输出 ----------
-    "project": "/root/autodl-tmp/work-dirs",
-    "name": "check_h1h2-3",
+    "project": "runs/h1h2",
     "exist_ok": False,
 
     # ---------- 节省资源：关闭不需要的功能 ----------
@@ -87,8 +87,12 @@ CONFIG = {
     "long_edge_labels": ["<100", "100-200", "200-300", "300-500", ">500"],
 }
 
-# StripPooling 层索引重映射插入位置（仅 SP 模型使用）
-SP_INSERT_IDX = 10
+METHOD_EXPECTATIONS = {
+    "baseline": {"head": "OBB", "reg_max": 16},
+    "ca": {"head": "OBB", "reg_max": 32},
+    "ca-refine": {"head": "OBBRefine", "reg_max": 32},
+    "custom": {"head": None, "reg_max": None},
+}
 
 
 # ========================== 统计收集器 ==========================
@@ -235,7 +239,10 @@ class H1H2Collector:
             mean_d = np.mean(dreqs) if dreqs else 0
             p95_d = np.percentile(dreqs, 95) if dreqs else 0
             max_d = max(dreqs) if dreqs else 0
-            print(f"{self.labels[i]:<12} {total:>10d} {overflow:>10d} {ratio:>9.1f}% {mean_d:>10.1f} {p95_d:>10.1f} {max_d:>10.1f}")
+            print(
+                f"{self.labels[i]:<12} {total:>10d} {overflow:>10d} {ratio:>9.1f}% "
+                f"{mean_d:>10.1f} {p95_d:>10.1f} {max_d:>10.1f}"
+            )
 
         # H2 控制台
         print("\n" + "=" * 80)
@@ -286,7 +293,10 @@ class H1H2Collector:
             mean_d = np.mean(dreqs) if dreqs else 0
             p95_d = np.percentile(dreqs, 95) if dreqs else 0
             max_d = max(dreqs) if dreqs else 0
-            md.append(f"| {self.labels[i]} | {total} | {overflow} | {ratio:.1f}% | {mean_d:.1f} | {p95_d:.1f} | {max_d:.1f} |")
+            md.append(
+                f"| {self.labels[i]} | {total} | {overflow} | {ratio:.1f}% | "
+                f"{mean_d:.1f} | {p95_d:.1f} | {max_d:.1f} |"
+            )
 
         md.append("\n## H2: 正样本层级分配统计\n")
         h_parts = ["| 长边分桶 |"] + [f" {sl} |" for sl in stride_labels] + [" 合计 |"]
@@ -433,6 +443,7 @@ class H1H2Collector:
 # 全局收集器实例（在 main 中初始化）
 _collector: H1H2Collector | None = None
 _original_obb_loss = None
+_strict_stats = True
 
 
 def _install_loss_hook():
@@ -446,6 +457,8 @@ def _install_loss_hook():
     from ultralytics.utils.loss import v8OBBLoss
 
     global _original_obb_loss
+    if _original_obb_loss is not None:
+        raise RuntimeError("v8OBBLoss统计hook已经安装，不能重复安装。")
     _original_obb_loss = v8OBBLoss.loss
 
     def _hooked_loss(self, preds, batch):
@@ -455,12 +468,24 @@ def _install_loss_hook():
             try:
                 _collect_stats(self, preds, batch)
             except Exception as e:
-                # 统计收集不应影响训练
+                if _strict_stats:
+                    raise RuntimeError(f"H1/H2统计收集失败: {e}") from e
                 print(f"[H1H2 统计] 收集异常（已跳过）: {e}")
 
         return _original_obb_loss(self, preds, batch)
 
     v8OBBLoss.loss = _hooked_loss
+
+
+def _restore_loss_hook():
+    """恢复原始OBB损失，避免同一解释器中的后续任务继续使用统计hook。"""
+    from ultralytics.utils.loss import v8OBBLoss
+
+    global _original_obb_loss
+    if _original_obb_loss is not None:
+        v8OBBLoss.loss = _original_obb_loss
+        _original_obb_loss = None
+        print("\n[*] 已恢复原始 v8OBBLoss.loss()")
 
 
 @torch.no_grad()
@@ -503,7 +528,9 @@ def _collect_stats(loss_self, preds, batch):
     bboxes_for_assigner = pred_bboxes.clone().detach()
     bboxes_for_assigner[..., :4] *= stride_tensor
 
-    # 调用 assigner —— 关键：获取 target_gt_idx
+    # 调用 assigner —— 关键：获取 target_gt_idx。
+    # hook发生在原始loss之前，因此必须先写入当前stride，确保首个batch也启用CA覆盖掩码。
+    loss_self.assigner._stride_tensor = stride_tensor
     _, target_bboxes, _, fg_mask, target_gt_idx = loss_self.assigner(
         pred_scores.detach().sigmoid(),
         bboxes_for_assigner.type(gt_bboxes.dtype),
@@ -526,46 +553,213 @@ def _collect_stats(loss_self, preds, batch):
     )
 
 
-# ========================== 权重加载辅助 ==========================
-def load_weights_with_remap(model, weights_path, insert_idx=None):
-    """
-    加载预训练权重，支持可选的层索引重映射（用于 SP 模型）。
+# ========================== 模型与命令行校验 ==========================
+def parse_args():
+    """解析正式H1/H2统计参数。"""
+    parser = argparse.ArgumentParser(
+        description="收集OBB模型的DFL溢出率与P3/P4/P5正样本分配统计。",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--method",
+        choices=tuple(METHOD_EXPECTATIONS),
+        required=True,
+        help="论文方法身份；baseline/ca/ca-refine会严格校验检测头和reg_max。",
+    )
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="正式统计应传对应方法的完整.pt checkpoint；YAML仅允许随机初始化诊断。",
+    )
+    parser.add_argument("--data", required=True, help="TTPLA-640-811数据集YAML。")
+    parser.add_argument("--epochs", type=int, default=CONFIG["epochs"])
+    parser.add_argument("--batch", type=int, default=CONFIG["batch"])
+    parser.add_argument("--imgsz", type=int, default=CONFIG["imgsz"])
+    parser.add_argument("--device", default=str(CONFIG["device"]))
+    parser.add_argument("--workers", type=int, default=CONFIG["workers"])
+    parser.add_argument("--project", default=CONFIG["project"])
+    parser.add_argument("--name", default=None, help="默认使用check_h1h2_<method>_640。")
+    parser.add_argument("--exist-ok", action="store_true", default=CONFIG["exist_ok"])
+    parser.add_argument(
+        "--allow-yaml-scratch",
+        action="store_true",
+        help="允许从YAML随机初始化；正式论文统计不应启用。",
+    )
+    parser.add_argument(
+        "--allow-stat-skip",
+        action="store_true",
+        help="统计异常时跳过当前batch；正式统计默认遇到异常立即失败。",
+    )
+    args = parser.parse_args()
 
-    Args:
-        model: YOLO 模型实例
-        weights_path: 权重文件路径
-        insert_idx: StripPooling 插入位置（None 表示不重映射）
-    """
-    if not weights_path or not os.path.exists(weights_path):
-        print("  未指定或找不到预训练权重，从随机初始化开始。")
-        return
+    if args.imgsz != 640:
+        parser.error("本论文H1/H2统计固定使用imgsz=640，拒绝非640输入。")
+    if args.epochs < 1:
+        parser.error("--epochs必须大于等于1。")
+    if args.batch < 1:
+        parser.error("--batch必须大于等于1。")
 
-    ckpt = torch.load(weights_path, map_location="cpu", weights_only=False)
-    old_model = (ckpt.get("ema") or ckpt["model"]).float()
-    old_sd = old_model.state_dict()
+    model_suffix = Path(args.model).suffix.lower()
+    if model_suffix == ".pt":
+        if not Path(args.model).is_file():
+            parser.error(f"checkpoint不存在: {args.model}")
+    elif model_suffix in {".yaml", ".yml"}:
+        if not args.allow_yaml_scratch:
+            parser.error(
+                "正式统计必须直接传.pt checkpoint。若仅做随机初始化诊断，请显式增加--allow-yaml-scratch。"
+            )
+    else:
+        parser.error("--model必须是.pt checkpoint或.yaml模型配置。")
 
-    if insert_idx is not None:
-        # 层索引重映射：旧模型 index >= insert_idx 的层在新模型中对应 index + 1
-        remapped_sd = {}
-        for k, v in old_sd.items():
-            parts = k.split(".")
-            if len(parts) >= 2 and parts[0] == "model" and parts[1].isdigit():
-                layer_idx = int(parts[1])
-                if layer_idx >= insert_idx:
-                    parts[1] = str(layer_idx + 1)
-            remapped_sd[".".join(parts)] = v
-        old_sd = remapped_sd
+    args.name = args.name or f"check_h1h2_{args.method.replace('-', '_')}_640"
+    return args
 
-    new_sd = model.model.state_dict()
-    matched_sd = intersect_dicts(old_sd, new_sd)
-    model.model.load_state_dict(matched_sd, strict=False)
-    print(f"  已加载预训练权重: {weights_path}")
-    print(f"  匹配: {len(matched_sd)}/{len(new_sd)} 项")
+
+def model_head_metadata(torch_model) -> dict:
+    """读取实际检测头元数据。"""
+    base_model = unwrap_model(torch_model)
+    if not hasattr(base_model, "model") or not base_model.model:
+        raise RuntimeError("无法从模型中定位检测头。")
+    head = base_model.model[-1]
+    reg_max = int(getattr(head, "reg_max", -1))
+    strides = getattr(head, "stride", None)
+    if hasattr(strides, "tolist"):
+        strides = strides.tolist()
+    elif strides is not None:
+        strides = list(strides)
+    model_yaml = getattr(base_model, "yaml", {})
+    return {
+        "head": type(head).__name__,
+        "reg_max": reg_max,
+        "nc": int(getattr(head, "nc", -1)),
+        "has_cv5": hasattr(head, "cv5") and getattr(head, "cv5") is not None,
+        "coverage_aware": reg_max > 16,
+        "strides": strides,
+        "yaml_file": model_yaml.get("yaml_file") if isinstance(model_yaml, dict) else None,
+    }
+
+
+def validate_model_identity(torch_model, method: str, *, expected_nc: int | None = None, stage: str) -> dict:
+    """校验checkpoint、方法标签和训练器实际模型是否一致。"""
+    metadata = model_head_metadata(torch_model)
+    expected = METHOD_EXPECTATIONS[method]
+    errors = []
+    if expected["head"] and metadata["head"] != expected["head"]:
+        errors.append(f"检测头应为{expected['head']}，实际为{metadata['head']}")
+    if expected["reg_max"] is not None and metadata["reg_max"] != expected["reg_max"]:
+        errors.append(f"reg_max应为{expected['reg_max']}，实际为{metadata['reg_max']}")
+    if method == "ca-refine" and not metadata["has_cv5"]:
+        errors.append("CA-Refine检测头缺少cv5精修分支")
+    if method in {"baseline", "ca"} and metadata["has_cv5"]:
+        errors.append(f"{method}不应包含cv5精修分支")
+    normalized_strides = [int(round(float(value))) for value in metadata["strides"] or []]
+    if method != "custom" and normalized_strides != [8, 16, 32]:
+        errors.append(f"FPN stride应为[8, 16, 32]，实际为{metadata['strides']}")
+    if expected_nc is not None and metadata["nc"] != int(expected_nc):
+        errors.append(f"类别数应与数据集一致({expected_nc})，实际为{metadata['nc']}")
+    if errors:
+        raise RuntimeError(f"{stage}模型身份校验失败: " + "；".join(errors))
+
+    print(
+        f"  [{stage}] head={metadata['head']}, reg_max={metadata['reg_max']}, "
+        f"nc={metadata['nc']}, cv5={metadata['has_cv5']}, "
+        f"CA={metadata['coverage_aware']}, strides={metadata['strides']}, "
+        f"yaml={metadata['yaml_file']}"
+    )
+    return metadata
+
+
+def model_state_schema(torch_model) -> dict:
+    """提取state-dict的键名、形状和dtype，不复制参数数据。"""
+    base_model = unwrap_model(torch_model)
+    return {
+        key: (tuple(value.shape), str(value.dtype))
+        for key, value in base_model.state_dict().items()
+    }
+
+
+def validate_state_schema(expected_schema: dict, torch_model, *, stage: str) -> int:
+    """确认训练器重建模型与checkpoint模型具有完全一致的参数结构。"""
+    actual_schema = model_state_schema(torch_model)
+    expected_keys = set(expected_schema)
+    actual_keys = set(actual_schema)
+    missing = sorted(expected_keys - actual_keys)
+    unexpected = sorted(actual_keys - expected_keys)
+    incompatible = sorted(
+        key
+        for key in expected_keys & actual_keys
+        if expected_schema[key] != actual_schema[key]
+    )
+    if missing or unexpected or incompatible:
+        details = []
+        if missing:
+            details.append(f"缺失键{len(missing)}个，例如{missing[:5]}")
+        if unexpected:
+            details.append(f"额外键{len(unexpected)}个，例如{unexpected[:5]}")
+        if incompatible:
+            examples = [
+                f"{key}: checkpoint={expected_schema[key]}, trainer={actual_schema[key]}"
+                for key in incompatible[:5]
+            ]
+            details.append(f"形状或dtype不一致{len(incompatible)}个，例如{examples}")
+        raise RuntimeError(f"{stage}参数结构校验失败: " + "；".join(details))
+
+    print(f"  [{stage}] state-dict结构完全一致: {len(actual_schema)}/{len(expected_schema)}项")
+    return len(actual_schema)
+
+
+def build_train_config(args) -> dict:
+    """生成传给Ultralytics trainer的参数，避免把模型来源再次作为model参数覆盖。"""
+    cli_keys = {"epochs", "batch", "imgsz", "device", "workers", "project", "exist_ok"}
+    statistical_keys = {"long_edge_bins", "long_edge_labels"}
+    train_config = {
+        key: value for key, value in CONFIG.items() if key not in cli_keys | statistical_keys
+    }
+    train_config.update(
+        {
+            "data": args.data,
+            "epochs": args.epochs,
+            "batch": args.batch,
+            "imgsz": args.imgsz,
+            "device": args.device,
+            "workers": args.workers,
+            "project": args.project,
+            "name": args.name,
+            "exist_ok": args.exist_ok,
+        }
+    )
+    return train_config
+
+
+def write_run_manifest(save_dir: str | Path, args, metadata: dict, dataset_nc: int) -> Path:
+    """保存可复现的模型身份与统计配置。"""
+    path = Path(save_dir) / "h1h2_run_config.json"
+    payload = {
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "method": args.method,
+        "model": str(Path(args.model).resolve()),
+        "data": str(Path(args.data).resolve()),
+        "imgsz": args.imgsz,
+        "epochs": args.epochs,
+        "batch": args.batch,
+        "device": args.device,
+        "workers": args.workers,
+        "dataset_nc": int(dataset_nc),
+        "model_metadata": metadata,
+        "long_edge_bins": CONFIG["long_edge_bins"],
+        "long_edge_labels": CONFIG["long_edge_labels"],
+        "strict_stats": not args.allow_stat_skip,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[*] 运行配置已保存至: {path}")
+    return path
 
 
 # ========================== 主函数 ==========================
 def main():
-    global _collector
+    global _collector, _strict_stats
+    args = parse_args()
+    _strict_stats = not args.allow_stat_skip
 
     print("=" * 80)
     print("  H1 & H2 验证统计脚本")
@@ -573,77 +767,77 @@ def main():
     print("  H2: 正样本层级分配分析 (长边分桶 vs FPN 层)")
     print("=" * 80)
 
-    # 1. 初始化收集器
     _collector = H1H2Collector(
         bins=CONFIG["long_edge_bins"],
         labels=CONFIG["long_edge_labels"],
     )
 
-    # 2. 安装 loss hook（必须在 model.train() 之前）
-    _install_loss_hook()
-    print("[*] 已安装 v8OBBLoss 统计 hook")
+    # checkpoint模式会恢复精确的检测头、类别数和所有分支；YAML只用于显式scratch诊断。
+    model = YOLO(args.model)
+    validate_model_identity(model.model, args.method, stage="载入模型")
+    checkpoint_schema = model_state_schema(model.model) if Path(args.model).suffix.lower() == ".pt" else None
+    train_config = build_train_config(args)
 
-    # 3. 创建模型
-    model_path = CONFIG["model"]
-    model = YOLO(model_path)
-
-    # 4. 加载权重
-    pretrained_weights = CONFIG.pop("pretrained_weights", None)
-    is_sp_model = "-sp" in str(model_path).lower()
-    load_weights_with_remap(
-        model,
-        pretrained_weights,
-        insert_idx=SP_INSERT_IDX if is_sp_model else None,
-    )
-
-    # 5. 提取训练参数（去除统计专用配置）
-    train_config = {k: v for k, v in CONFIG.items()
-                    if k not in ("long_edge_bins", "long_edge_labels")}
-
-    print(f"\n  模型: {model_path}")
-    print(f"  数据集: {CONFIG['data']}")
-    print(f"  统计轮数: {CONFIG['epochs']} epochs")
+    print(f"\n  方法: {args.method}")
+    print(f"  模型: {args.model}")
+    print(f"  数据集: {args.data}")
+    print(f"  输入尺寸: {args.imgsz}")
+    print(f"  统计轮数: {args.epochs} epochs")
     print(f"  长边分桶: {CONFIG['long_edge_labels']}")
     print("=" * 80)
 
-    # 6. 注册回调：在训练结束时输出报告
-    report_save_dir = [None]  # 用列表包装以便闭包修改
+    report_save_dir = [None]
+    active_metadata = {}
 
     def on_train_start(trainer):
         report_save_dir[0] = str(trainer.save_dir)
         print(f"[*] 统计报告将保存至: {report_save_dir[0]}")
+        dataset_nc = int(trainer.data["nc"])
+        metadata = validate_model_identity(
+            trainer.model,
+            args.method,
+            expected_nc=dataset_nc,
+            stage="训练器实际模型",
+        )
+        if checkpoint_schema is not None:
+            metadata["state_items"] = validate_state_schema(
+                checkpoint_schema,
+                trainer.model,
+                stage="checkpoint→训练器",
+            )
+        else:
+            metadata["state_items"] = len(model_state_schema(trainer.model))
+            print("  [checkpoint→训练器] YAML scratch模式，不执行checkpoint参数结构对比")
+        active_metadata.update(metadata)
+        write_run_manifest(report_save_dir[0], args, metadata, dataset_nc)
 
     model.add_callback("on_train_start", on_train_start)
 
-    # 7. 开始训练（统计收集在 loss hook 中自动进行）
-    model.train(**train_config)
+    _install_loss_hook()
+    print("[*] 已安装 v8OBBLoss 统计 hook")
 
-    # 8. 输出报告
-    print("\n" + "=" * 80)
-    print("  训练完成，正在生成 H1 & H2 统计报告...")
-    print("=" * 80)
-
-    # 获取 reg_max 和 strides
     try:
-        m = model.model.model[-1]  # Detect 模块
-        reg_max = m.reg_max
-        strides = m.stride.tolist()
-    except Exception:
-        reg_max = 16
-        strides = [8, 16, 32]
-        print(f"[警告] 无法从模型获取 reg_max/stride，使用默认值: reg_max={reg_max}, strides={strides}")
+        model.train(**train_config)
 
-    _collector.report(
-        reg_max=reg_max,
-        strides=strides,
-        save_dir=report_save_dir[0] or f"{CONFIG['project']}/{CONFIG['name']}",
-    )
+        if _collector.batch_count == 0:
+            raise RuntimeError("没有成功收集任何batch，拒绝生成空的H1/H2报告。")
+        if not active_metadata:
+            raise RuntimeError("训练开始回调未执行，无法确认实际模型身份。")
 
-    # 9. 恢复原始 loss 函数
-    from ultralytics.utils.loss import v8OBBLoss
-    if _original_obb_loss is not None:
-        v8OBBLoss.loss = _original_obb_loss
-        print("\n[*] 已恢复原始 v8OBBLoss.loss()")
+        print("\n" + "=" * 80)
+        print("  训练完成，正在生成 H1 & H2 统计报告...")
+        print("=" * 80)
+
+        strides = active_metadata["strides"]
+        if not strides or any(float(value) <= 0 for value in strides):
+            raise RuntimeError(f"无法获取有效stride: {strides}")
+        _collector.report(
+            reg_max=active_metadata["reg_max"],
+            strides=strides,
+            save_dir=report_save_dir[0],
+        )
+    finally:
+        _restore_loss_hook()
 
     print("\n统计完成！")
 
