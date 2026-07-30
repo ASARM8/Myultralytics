@@ -87,6 +87,9 @@ def _diagnostic_apply_wh_refine(
     gate_mode = getattr(self, "_diagnostic_refine_gate_mode", "current")
     if alpha == 0.0 or gate_mode == "none":
         return dbox.clone()
+    if getattr(self, "refine_version", 1) == 2:
+        delta = self.bound_refine(refine) * alpha
+        return self._apply_refine_delta(dbox, delta, gate)
     dw = refine[:, 0:1, :].clamp(-clamp_value, clamp_value) * alpha
     dh = refine[:, 1:2, :].clamp(-clamp_value, clamp_value) * alpha
     if gate is not None:
@@ -238,7 +241,10 @@ def metrics_row(
     values = results.results_dict
     metric = results.box
     all_ap = metric.all_ap
-    ap90 = float(all_ap[:, 8].mean()) if len(all_ap) else float("nan")
+    threshold_ap = {
+        f"ap{iou}": float(all_ap[:, index].mean()) if len(all_ap) else float("nan")
+        for index, iou in enumerate(range(50, 100, 5))
+    }
     return {
         "epoch": epoch,
         "method": variant.method,
@@ -259,7 +265,14 @@ def metrics_row(
         "map50": float(values["metrics/mAP50(B)"]),
         "map50_95": float(values["metrics/mAP50-95(B)"]),
         "ap75": float(metric.map75),
-        "ap90": ap90,
+        "ap90": threshold_ap["ap90"],
+        "ap55": threshold_ap["ap55"],
+        "ap60": threshold_ap["ap60"],
+        "ap65": threshold_ap["ap65"],
+        "ap70": threshold_ap["ap70"],
+        "ap80": threshold_ap["ap80"],
+        "ap85": threshold_ap["ap85"],
+        "ap95": threshold_ap["ap95"],
     }
 
 
@@ -405,7 +418,21 @@ def main():
                         continue
                     differences = {
                         metric: abs(row[metric] - coarse_row[metric])
-                        for metric in ("map50_95", "ap75", "ap90")
+                        for metric in (
+                            "precision",
+                            "recall",
+                            "map50",
+                            "map50_95",
+                            "ap55",
+                            "ap60",
+                            "ap65",
+                            "ap70",
+                            "ap75",
+                            "ap80",
+                            "ap85",
+                            "ap90",
+                            "ap95",
+                        )
                     }
                     maximum = max(differences.values())
                     status = "PASS" if maximum <= args.identity_tolerance else "FAIL"

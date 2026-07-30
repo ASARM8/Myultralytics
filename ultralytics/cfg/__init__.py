@@ -159,6 +159,10 @@ CFG_FLOAT_KEYS = frozenset(
         "time",
         "workspace",
         "batch",
+        "refine_delta_max",
+        "refine_target_limit",
+        "refine_smooth_l1_beta",
+        "refine_identity_gain",
     }
 )
 CFG_FRACTION_KEYS = frozenset(

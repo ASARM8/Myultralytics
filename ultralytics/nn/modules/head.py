@@ -20,7 +20,19 @@ from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = (
+    "OBB",
+    "OBBRefine",
+    "OBBRefineV2",
+    "Classify",
+    "Detect",
+    "Pose",
+    "RTDETRDecoder",
+    "Segment",
+    "YOLOEDetect",
+    "YOLOESegment",
+    "v10Detect",
+)
 
 
 class Detect(nn.Module):
@@ -645,6 +657,139 @@ class OBBRefine(OBB):
         """移除 one2many 头以优化推理。"""
         super().fuse()
         self.cv5 = None
+
+
+class OBBRefineV2(OBBRefine):
+    """OBB Refine V2 head with bounded, short/long-axis residuals.
+
+    The legacy :class:`OBBRefine` implementation is intentionally left unchanged for
+    checkpoint reproducibility. V2 keeps the same two-channel ``cv5`` topology, but
+    gives the channels explicit experiment-dependent semantics and replaces the hard
+    clamp with a smooth bounded transform.
+    """
+
+    experiment_profiles = {
+        "bounded_wh",
+        "direct_short_long",
+        "aligned_gate",
+        "aligned_identity",
+    }
+
+    def __init__(
+        self,
+        nc: int = 80,
+        ne: int = 1,
+        ne_refine: int = 2,
+        reg_max=16,
+        end2end=False,
+        ch: tuple = (),
+        refine_select_ar: float = 30.0,
+        refine_select_ws: float = 16.0,
+    ):
+        """Initialize Refine V2 while preserving the legacy constructor contract."""
+        if ne_refine != 2:
+            raise ValueError(f"OBBRefineV2 requires ne_refine=2, received {ne_refine}")
+        super().__init__(
+            nc=nc,
+            ne=ne,
+            ne_refine=ne_refine,
+            reg_max=reg_max,
+            end2end=end2end,
+            ch=ch,
+            refine_select_ar=refine_select_ar,
+            refine_select_ws=refine_select_ws,
+        )
+        self.refine_version = 2
+        self.refine_experiment = "aligned_identity"
+        self.refine_delta_max = 0.1
+        self.refine_target_limit = 0.095
+        self.refine_smooth_l1_beta = 0.02
+        self.refine_identity_gain = 0.05
+        self.register_buffer("_refine_v2_marker", torch.tensor(2, dtype=torch.int8), persistent=True)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        """Reject legacy cv5 tensors whose two channels have incompatible semantics."""
+        marker_key = f"{prefix}_refine_v2_marker"
+        has_refine_weights = any(
+            key.startswith(f"{prefix}cv5.") or key.startswith(f"{prefix}one2one_cv5.") for key in state_dict
+        )
+        if has_refine_weights and marker_key not in state_dict:
+            error_msgs.append(
+                f"{prefix[:-1]} received Refine weights without the V2 marker; "
+                "legacy OBBRefine cv5 tensors cannot be loaded into OBBRefineV2"
+            )
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def set_refine_experiment(self, experiment: str) -> None:
+        """Set one of the predefined single-factor Refine V2 experiment profiles."""
+        if experiment not in self.experiment_profiles:
+            raise ValueError(
+                f"Unknown Refine V2 experiment {experiment!r}; expected one of {sorted(self.experiment_profiles)}"
+            )
+        self.refine_experiment = experiment
+
+    def bound_refine(self, refine: torch.Tensor) -> torch.Tensor:
+        """Map raw residuals smoothly into ``[-refine_delta_max, refine_delta_max]``."""
+        delta_max = float(self.refine_delta_max)
+        if delta_max <= 0:
+            raise ValueError(f"refine_delta_max must be positive, received {delta_max}")
+        return delta_max * torch.tanh(refine / delta_max)
+
+    def _apply_refine_delta(
+        self,
+        dbox: torch.Tensor,
+        delta: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply already-bounded V2 deltas to decoded ``xywh`` boxes."""
+        experiment = getattr(self, "refine_experiment", "aligned_identity")
+        if experiment == "bounded_wh":
+            dw, dh = delta[:, 0:1, :], delta[:, 1:2, :]
+        else:
+            delta_short, delta_long = delta[:, 0:1, :], delta[:, 1:2, :]
+            short_is_w = dbox[:, 2:3, :] <= dbox[:, 3:4, :]
+            dw = torch.where(short_is_w, delta_short, delta_long)
+            dh = torch.where(short_is_w, delta_long, delta_short)
+
+        if gate is not None:
+            gate = gate.to(dtype=dw.dtype, device=dw.device)
+            dw = dw * gate
+            dh = dh * gate
+
+        return torch.cat(
+            [
+                dbox[:, 0:2, :],
+                dbox[:, 2:3, :] * torch.exp(dw),
+                dbox[:, 3:4, :] * torch.exp(dh),
+            ],
+            dim=1,
+        )
+
+    def _apply_wh_refine(
+        self,
+        dbox: torch.Tensor,
+        refine: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply the active V2 experiment's smooth bounded residual parameterization."""
+        return self._apply_refine_delta(dbox, self.bound_refine(refine), gate)
 
 
 class OBB26(OBB):

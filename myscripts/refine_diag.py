@@ -251,13 +251,41 @@ def apply_refine(
     gate: torch.Tensor,
     alpha: float,
     clamp_value: float,
+    refine_head: torch.nn.Module,
 ) -> torch.Tensor:
-    """Apply the production width/height residual formula to selected boxes."""
+    """Apply the active legacy/V2 production residual formula to selected boxes."""
     refined = coarse_bboxes.clone()
-    delta = residual[:, :2].clamp(-clamp_value, clamp_value)
-    delta = delta * float(alpha) * gate.to(delta.dtype).unsqueeze(-1)
-    refined[:, 2:4] *= torch.exp(delta)
+    delta = effective_residual(residual, refine_head, clamp_value)
+    delta_wh = residual_to_wh_delta(coarse_bboxes, delta, refine_head)
+    delta_wh = delta_wh * float(alpha) * gate.to(delta_wh.dtype).unsqueeze(-1)
+    refined[:, 2:4] *= torch.exp(delta_wh)
     return refined
+
+
+def effective_residual(
+    residual: torch.Tensor,
+    refine_head: torch.nn.Module,
+    clamp_value: float,
+) -> torch.Tensor:
+    """Return the residual actually applied before alpha and gate."""
+    if getattr(refine_head, "refine_version", 1) == 2:
+        return refine_head.bound_refine(residual)
+    return residual[..., :2].clamp(-clamp_value, clamp_value)
+
+
+def residual_to_wh_delta(
+    coarse_bboxes: torch.Tensor,
+    delta: torch.Tensor,
+    refine_head: torch.nn.Module,
+) -> torch.Tensor:
+    """Map active residual channels to width/height order."""
+    experiment = getattr(refine_head, "refine_experiment", "legacy")
+    if getattr(refine_head, "refine_version", 1) == 1 or experiment == "bounded_wh":
+        return delta[..., :2]
+    short_is_width = coarse_bboxes[..., 2] <= coarse_bboxes[..., 3]
+    delta_w = torch.where(short_is_width, delta[..., 0], delta[..., 1])
+    delta_h = torch.where(short_is_width, delta[..., 1], delta[..., 0])
+    return torch.stack((delta_w, delta_h), dim=-1)
 
 
 def extend_values(
@@ -323,7 +351,8 @@ def fpn_level_ids(feats: list[torch.Tensor], batch_size: int, device: torch.devi
 
 def summarize_distributions(
     store: dict[tuple[str, str], list[np.ndarray]],
-    clamp_value: float,
+    saturation_threshold: float,
+    residual_variables: set[str],
 ) -> pd.DataFrame:
     """Convert raw distribution chunks into quantile rows."""
     rows = []
@@ -344,7 +373,9 @@ def summarize_distributions(
                 "p99": float(np.percentile(values, 99)),
                 "max": float(values.max()),
                 "saturation_rate": (
-                    float((np.abs(values) >= clamp_value).mean()) if variable in {"dw", "dh", "dshort"} else np.nan
+                    float((np.abs(values) >= saturation_threshold).mean())
+                    if variable in residual_variables
+                    else np.nan
                 ),
             }
         )
@@ -515,6 +546,9 @@ def write_report(
     output_path: Path,
     args: argparse.Namespace,
     clamp_value: float,
+    saturation_threshold: float,
+    refine_version: str,
+    experiment: str,
     processed_batches: int,
     seen_images: int,
     gate_frame: pd.DataFrame,
@@ -535,7 +569,8 @@ def write_report(
         f"- imgsz：`{args.imgsz}`",
         f"- 已处理 batch / image：`{processed_batches}` / `{seen_images}`",
         f"- 门控阈值：`AR>{args.ar_threshold}` 或 `short<{args.short_threshold}px`",
-        f"- residual clamp：`{clamp_value}`",
+        f"- Refine版本 / 实验：`{refine_version}` / `{experiment}`",
+        f"- residual limit / 饱和判定：`{clamp_value}` / `|delta|>={saturation_threshold}`",
         f"- alpha：`{args.alphas}`",
         "",
         "本报告中的 IoU 是匹配正样本上的 ProbIoU 机制诊断，不等价于完整验证集 mAP；完整指标应由 "
@@ -645,7 +680,11 @@ def write_report(
             "4. GT oracle 明显优于 current gate：训练/推理门控错配是主因。",
             "5. GT oracle 也明显下降：即使门控正确，Refine 学到的残差方向仍然错误。",
             "6. `pred_only` 比例高：推理在大量训练期未监督位置启用了 Refine，应加入 identity 约束或统一门控。",
-            "7. `|delta|>=clamp` 的饱和比例高，或 `p95/p99` 接近/超过 1：当前 ±1 范围过大，应先缩小残差尺度。",
+            (
+                "7. `saturation_rate` 应低于 5%；V2 按 `|delta|>=0.95*delta_max` 判定平滑边界饱和。"
+                if refine_version == "v2"
+                else "7. legacy按 `|raw_delta|>=clamp` 判定硬截断饱和。"
+            ),
             "8. `global_clip_scale` 明显小于 `base_only_clip_scale`：cv5 通过全模型梯度裁剪间接影响 coarse 分支。",
         ]
     )
@@ -666,7 +705,7 @@ def main() -> None:
     parser.add_argument("--max-batches", type=int, default=50, help="0 表示遍历完整 split")
     parser.add_argument("--ar-threshold", type=float, default=30.0)
     parser.add_argument("--short-threshold", type=float, default=16.0)
-    parser.add_argument("--clamp", type=float, help="默认读取检测头 refine_clamp")
+    parser.add_argument("--clamp", type=float, help="覆盖 legacy clamp 或 V2 delta_max；默认读取检测头")
     parser.add_argument(
         "--alphas",
         type=parse_alphas,
@@ -731,7 +770,18 @@ def main() -> None:
         parameter.requires_grad_(True)
 
     refine_head = find_refine_head(core_model)
-    clamp_value = float(args.clamp if args.clamp is not None else getattr(refine_head, "refine_clamp", 1.0))
+    is_v2 = getattr(refine_head, "refine_version", 1) == 2
+    default_limit = getattr(refine_head, "refine_delta_max", None) if is_v2 else None
+    if default_limit is None:
+        default_limit = getattr(refine_head, "refine_clamp", 1.0)
+    clamp_value = float(args.clamp if args.clamp is not None else default_limit)
+    if is_v2 and args.clamp is not None:
+        refine_head.refine_delta_max = clamp_value
+    experiment = getattr(refine_head, "refine_experiment", "legacy")
+    channel_names = ("dw", "dh") if not is_v2 or experiment == "bounded_wh" else ("dshort", "dlong")
+    raw_channel_names = tuple(f"raw_{name}" for name in channel_names)
+    saturation_threshold = 0.95 * clamp_value if is_v2 else clamp_value
+    residual_variables = set(channel_names) | {"dshort"}
     criterion = core_model.init_criterion()
     data_dict = check_det_dataset(args.data)
     stride = max(int(core_model.stride.max().item()), 32)
@@ -751,7 +801,10 @@ def main() -> None:
     print("Refine Head 机制诊断")
     print(f"weights={args.weights}")
     print(f"data={args.data}, split={args.split}, imgsz={args.imgsz}")
-    print(f"AR>{args.ar_threshold}, short<{args.short_threshold}px, clamp={clamp_value}")
+    print(
+        f"AR>{args.ar_threshold}, short<{args.short_threshold}px, residual_limit={clamp_value}, "
+        f"version={'v2' if is_v2 else 'legacy'}, experiment={experiment}"
+    )
     print("=" * 80)
 
     for batch_index, raw_batch in enumerate(loader):
@@ -767,7 +820,13 @@ def main() -> None:
             assignment = build_assignments(criterion, raw, batch)
 
         coarse_px = assignment["coarse_px"]
-        residual = assignment["pred_refine"]
+        raw_residual = assignment["pred_refine"]
+        residual = refine_head.bound_refine(raw_residual) if is_v2 else raw_residual
+        delta_wh = residual_to_wh_delta(
+            coarse_px,
+            effective_residual(raw_residual, refine_head, clamp_value),
+            refine_head,
+        )
         pred_scores = assignment["pred_scores"].sigmoid().amax(dim=-1)
         fg_mask = assignment["fg_mask"]
         predicted_gates = build_predicted_gates(
@@ -777,12 +836,28 @@ def main() -> None:
         )
         level_ids, level_names = fpn_level_ids(raw["feats"], batch_size, device)
 
-        extend_values(distributions, "all_anchors", "dw", residual[..., 0])
-        extend_values(distributions, "all_anchors", "dh", residual[..., 1])
+        extend_values(distributions, "all_anchors", channel_names[0], residual[..., 0])
+        extend_values(distributions, "all_anchors", channel_names[1], residual[..., 1])
+        if is_v2:
+            extend_values(distributions, "all_anchors", raw_channel_names[0], raw_residual[..., 0])
+            extend_values(distributions, "all_anchors", raw_channel_names[1], raw_residual[..., 1])
         for level_index, level_name in enumerate(level_names):
             level_mask = level_ids == level_index
-            extend_values(distributions, f"{level_name}_all", "dw", residual[..., 0][level_mask])
-            extend_values(distributions, f"{level_name}_all", "dh", residual[..., 1][level_mask])
+            extend_values(distributions, f"{level_name}_all", channel_names[0], residual[..., 0][level_mask])
+            extend_values(distributions, f"{level_name}_all", channel_names[1], residual[..., 1][level_mask])
+            if is_v2:
+                extend_values(
+                    distributions,
+                    f"{level_name}_all",
+                    raw_channel_names[0],
+                    raw_residual[..., 0][level_mask],
+                )
+                extend_values(
+                    distributions,
+                    f"{level_name}_all",
+                    raw_channel_names[1],
+                    raw_residual[..., 1][level_mask],
+                )
 
         for gate_name, gate in predicted_gates.items():
             add_gate_count(gate_counts, "all_anchors", gate_name, gate)
@@ -790,30 +865,31 @@ def main() -> None:
                 add_gate_count(gate_counts, f"{level_name}_all", gate_name, gate, level_ids == level_index)
 
         current_gate = predicted_gates["current"]
-        extend_values(distributions, "current_gate", "dw", residual[..., 0][current_gate])
-        extend_values(distributions, "current_gate", "dh", residual[..., 1][current_gate])
+        extend_values(distributions, "current_gate", channel_names[0], residual[..., 0][current_gate])
+        extend_values(distributions, "current_gate", channel_names[1], residual[..., 1][current_gate])
         extend_values(
             distributions,
             "current_gate",
             "scale_w_alpha1",
-            residual[..., 0][current_gate].clamp(-clamp_value, clamp_value).exp(),
+            delta_wh[..., 0][current_gate].exp(),
         )
         extend_values(
             distributions,
             "current_gate",
             "scale_h_alpha1",
-            residual[..., 1][current_gate].clamp(-clamp_value, clamp_value).exp(),
+            delta_wh[..., 1][current_gate].exp(),
         )
         for threshold in args.conf_thresholds:
             confidence_mask = pred_scores >= threshold
             scope = f"confidence>={threshold:g}"
             add_gate_count(gate_counts, scope, "current", current_gate, confidence_mask)
             selected = confidence_mask & current_gate
-            extend_values(distributions, scope, "dw", residual[..., 0][selected])
-            extend_values(distributions, scope, "dh", residual[..., 1][selected])
+            extend_values(distributions, scope, channel_names[0], residual[..., 0][selected])
+            extend_values(distributions, scope, channel_names[1], residual[..., 1][selected])
 
         if fg_mask.any():
             coarse_fg = coarse_px[fg_mask]
+            raw_residual_fg = raw_residual[fg_mask]
             residual_fg = residual[fg_mask]
             target_fg = assignment["target_bboxes"][fg_mask]
             positive_level_ids = level_ids[fg_mask]
@@ -837,28 +913,53 @@ def main() -> None:
             confusion["gt_only"] += int((~predicted_current & gt_gate).sum().item())
             confusion["both_off"] += int((~predicted_current & ~gt_gate).sum().item())
 
-            extend_values(distributions, "positive_anchors", "dw", residual_fg[:, 0])
-            extend_values(distributions, "positive_anchors", "dh", residual_fg[:, 1])
-            extend_values(distributions, "gt_gated_positive", "dw", residual_fg[:, 0][gt_gate])
-            extend_values(distributions, "gt_gated_positive", "dh", residual_fg[:, 1][gt_gate])
-            extend_values(distributions, "pred_gated_positive", "dw", residual_fg[:, 0][predicted_current])
-            extend_values(distributions, "pred_gated_positive", "dh", residual_fg[:, 1][predicted_current])
-            short_is_width = coarse_fg[:, 2] <= coarse_fg[:, 3]
-            dshort = torch.where(short_is_width, residual_fg[:, 0], residual_fg[:, 1])
-            extend_values(distributions, "positive_anchors", "dshort", dshort)
-            extend_values(distributions, "gt_gated_positive", "dshort", dshort[gt_gate])
-            extend_values(distributions, "pred_gated_positive", "dshort", dshort[predicted_current])
+            extend_values(distributions, "positive_anchors", channel_names[0], residual_fg[:, 0])
+            extend_values(distributions, "positive_anchors", channel_names[1], residual_fg[:, 1])
+            extend_values(distributions, "gt_gated_positive", channel_names[0], residual_fg[:, 0][gt_gate])
+            extend_values(distributions, "gt_gated_positive", channel_names[1], residual_fg[:, 1][gt_gate])
+            extend_values(
+                distributions,
+                "pred_gated_positive",
+                channel_names[0],
+                residual_fg[:, 0][predicted_current],
+            )
+            extend_values(
+                distributions,
+                "pred_gated_positive",
+                channel_names[1],
+                residual_fg[:, 1][predicted_current],
+            )
+            if is_v2 and experiment != "bounded_wh":
+                dshort = residual_fg[:, 0]
+            elif is_v2:
+                short_is_width = coarse_fg[:, 2] <= coarse_fg[:, 3]
+                dshort = torch.where(short_is_width, residual_fg[:, 0], residual_fg[:, 1])
+            else:
+                short_is_width = coarse_fg[:, 2] <= coarse_fg[:, 3]
+                dshort = torch.where(short_is_width, raw_residual_fg[:, 0], raw_residual_fg[:, 1])
+            if channel_names[0] != "dshort":
+                extend_values(distributions, "positive_anchors", "dshort", dshort)
+                extend_values(distributions, "gt_gated_positive", "dshort", dshort[gt_gate])
+                extend_values(distributions, "pred_gated_positive", "dshort", dshort[predicted_current])
             extend_values(
                 distributions,
                 "gt_gated_positive",
                 "scale_short_alpha1",
-                dshort[gt_gate].clamp(-clamp_value, clamp_value).exp(),
+                (
+                    dshort[gt_gate].exp()
+                    if is_v2
+                    else dshort[gt_gate].clamp(-clamp_value, clamp_value).exp()
+                ),
             )
             extend_values(
                 distributions,
                 "pred_gated_positive",
                 "scale_short_alpha1",
-                dshort[predicted_current].clamp(-clamp_value, clamp_value).exp(),
+                (
+                    dshort[predicted_current].exp()
+                    if is_v2
+                    else dshort[predicted_current].clamp(-clamp_value, clamp_value).exp()
+                ),
             )
 
             coarse_iou = probiou(coarse_fg, target_fg).reshape(-1)
@@ -869,7 +970,14 @@ def main() -> None:
             sweep_gates["gt-oracle"] = gt_gate
             for gate_name, gate in sweep_gates.items():
                 for alpha in args.alphas:
-                    refined = apply_refine(coarse_fg, residual_fg, gate, alpha, clamp_value)
+                    refined = apply_refine(
+                        coarse_fg,
+                        raw_residual_fg,
+                        gate,
+                        alpha,
+                        clamp_value,
+                        refine_head,
+                    )
                     refined_iou = probiou(refined, target_fg).reshape(-1)
                     add_iou_values(iou_store, gate_name, alpha, "all", coarse_iou, refined_iou)
 
@@ -917,7 +1025,11 @@ def main() -> None:
         if processed_batches % 10 == 0:
             print(f"已处理 {processed_batches} batches / {seen_images} images")
 
-    distribution_frame = summarize_distributions(distributions, clamp_value)
+    distribution_frame = summarize_distributions(
+        distributions,
+        saturation_threshold,
+        residual_variables,
+    )
     gate_frame = summarize_gate_counts(gate_counts)
     iou_frame = summarize_iou(iou_store)
     gradient_frame = pd.DataFrame(gradient_rows)
@@ -943,6 +1055,9 @@ def main() -> None:
         report_path,
         args,
         clamp_value,
+        saturation_threshold,
+        "v2" if is_v2 else "legacy",
+        experiment,
         processed_batches,
         seen_images,
         gate_frame,

@@ -362,6 +362,24 @@ class v8DetectionLoss:
         self.no = m.nc + m.reg_max * 4
         self.reg_max = m.reg_max
         self.device = device
+        self.refine_head = m if hasattr(m, "cv5") else None
+        if getattr(m, "refine_version", 1) == 2:
+            delta_max = float(h.refine_delta_max)
+            target_limit = float(h.refine_target_limit)
+            smooth_l1_beta = float(h.refine_smooth_l1_beta)
+            identity_gain = float(h.refine_identity_gain)
+            if delta_max <= 0 or not 0 < target_limit < delta_max:
+                raise ValueError("Refine V2 requires 0 < refine_target_limit < refine_delta_max")
+            if smooth_l1_beta <= 0 or identity_gain < 0:
+                raise ValueError("Refine V2 requires refine_smooth_l1_beta > 0 and refine_identity_gain >= 0")
+            m.set_refine_experiment(str(h.refine_experiment))
+            m.refine_delta_max = delta_max
+            m.refine_target_limit = target_limit
+            m.refine_smooth_l1_beta = smooth_l1_beta
+            m.refine_identity_gain = identity_gain
+            m.refine_select_ar = float(h.aux_geo_ar)
+            m.refine_select_ws = float(h.aux_geo_ws)
+            m.refine_feature_detach = bool(h.refine_feature_detach)
 
         self.use_dfl = m.reg_max > 1
 
@@ -1014,9 +1032,16 @@ class v8OBBLoss(v8DetectionLoss):
         if fg_mask.any() and refine_mask.numel() and refine_mask.any():
             coarse_fg = coarse_bboxes[fg_mask]
             refine_fg = pred_refine.permute(0, 2, 1)[fg_mask]
-            short_is_w = coarse_fg[:, 2] <= coarse_fg[:, 3]
-            dh = refine_fg[:, 1] if refine_fg.shape[1] >= 2 else torch.zeros_like(refine_fg[:, 0])
-            dshort = torch.where(short_is_w, refine_fg[:, 0], dh)
+            if getattr(self.refine_head, "refine_version", 1) == 2:
+                refine_fg = self.refine_head.bound_refine(refine_fg)
+            if getattr(self.refine_head, "refine_experiment", "legacy") == "bounded_wh" or getattr(
+                self.refine_head, "refine_version", 1
+            ) == 1:
+                short_is_w = coarse_fg[:, 2] <= coarse_fg[:, 3]
+                dh = refine_fg[:, 1] if refine_fg.shape[1] >= 2 else torch.zeros_like(refine_fg[:, 0])
+                dshort = torch.where(short_is_w, refine_fg[:, 0], dh)
+            else:
+                dshort = refine_fg[:, 0]
             avg_abs_dshort = float(dshort[refine_mask].abs().mean().item())
         self._refine_diag_sums["refine_mask_ratio"] += mask_ratio
         self._refine_diag_sums["avg_abs_dshort"] += avg_abs_dshort
@@ -1064,6 +1089,21 @@ class v8OBBLoss(v8DetectionLoss):
         ws_thresh = float(self.hyp.aux_geo_ws)
         return (ar > ar_thresh) | (short_gt < ws_thresh)
 
+    def build_predicted_refine_gate(
+        self,
+        coarse_bboxes: torch.Tensor,
+        stride_tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Build the inference-equivalent Refine gate from detached coarse boxes."""
+        coarse_px = coarse_bboxes.detach().clone()
+        coarse_px[..., :4] *= stride_tensor
+        short_side = coarse_px[..., 2:4].amin(dim=-1)
+        long_side = coarse_px[..., 2:4].amax(dim=-1)
+        aspect_ratio = long_side / short_side.clamp_min(1e-6)
+        ar_thresh = float(self.hyp.aux_geo_ar)
+        ws_thresh = float(self.hyp.aux_geo_ws)
+        return (aspect_ratio > ar_thresh) | (short_side < ws_thresh)
+
     def apply_refine_to_bboxes(
         self, coarse_bboxes: torch.Tensor, pred_refine: torch.Tensor | None, detach_base: bool = False
     ) -> torch.Tensor:
@@ -1071,6 +1111,9 @@ class v8OBBLoss(v8DetectionLoss):
         base_bboxes = coarse_bboxes.detach() if detach_base else coarse_bboxes
         if pred_refine is None:
             return base_bboxes
+
+        if getattr(self.refine_head, "refine_version", 1) == 2:
+            return self.apply_refine_v2_to_bboxes(base_bboxes, pred_refine)
 
         rf = pred_refine.permute(0, 2, 1)
         refine_clamp = 1.0
@@ -1086,6 +1129,40 @@ class v8OBBLoss(v8DetectionLoss):
             dim=-1,
         )
         return refined_bboxes.to(dtype=coarse_bboxes.dtype, device=coarse_bboxes.device)
+
+    def apply_refine_v2_to_bboxes(
+        self,
+        coarse_bboxes: torch.Tensor,
+        pred_refine: torch.Tensor,
+        gate: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply smooth bounded V2 residuals in width/height or short/long space."""
+        base_bboxes = coarse_bboxes.detach()
+        raw = pred_refine.permute(0, 2, 1)
+        delta = self.refine_head.bound_refine(raw)
+        experiment = getattr(self.refine_head, "refine_experiment", "aligned_identity")
+        if experiment == "bounded_wh":
+            dw, dh = delta[..., 0:1], delta[..., 1:2]
+        else:
+            delta_short, delta_long = delta[..., 0:1], delta[..., 1:2]
+            short_is_w = base_bboxes[..., 2:3] <= base_bboxes[..., 3:4]
+            dw = torch.where(short_is_w, delta_short, delta_long)
+            dh = torch.where(short_is_w, delta_long, delta_short)
+
+        if gate is not None:
+            gate_value = gate.to(dtype=dw.dtype, device=dw.device).unsqueeze(-1)
+            dw = dw * gate_value
+            dh = dh * gate_value
+
+        return torch.cat(
+            (
+                base_bboxes[..., 0:2],
+                base_bboxes[..., 2:3] * torch.exp(dw),
+                base_bboxes[..., 3:4] * torch.exp(dh),
+                base_bboxes[..., 4:5],
+            ),
+            dim=-1,
+        ).to(dtype=coarse_bboxes.dtype, device=coarse_bboxes.device)
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
         """Calculate and return the loss for oriented bounding box detection."""
@@ -1125,7 +1202,9 @@ class v8OBBLoss(v8DetectionLoss):
         # Refine Head：若 preds 包含 "refine" 键，仅额外构造宽高 residual 监督
         pred_refine = preds.get("refine")
         refine_mask = torch.zeros(0, dtype=torch.bool, device=self.device)
-        refine_loss_value = torch.tensor(0.0, device=self.device)
+        refine_version = int(getattr(self.refine_head, "refine_version", 1))
+        refine_experiment = getattr(self.refine_head, "refine_experiment", "legacy")
+        predicted_refine_gate = None
 
         bboxes_for_assigner = coarse_bboxes.clone().detach()
         # Only the first four elements need to be scaled
@@ -1142,6 +1221,11 @@ class v8OBBLoss(v8DetectionLoss):
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
+        if pred_refine is not None and refine_version == 2 and refine_experiment in {
+            "aligned_gate",
+            "aligned_identity",
+        }:
+            predicted_refine_gate = self.build_predicted_refine_gate(coarse_bboxes, stride_tensor)
 
         # Cls loss
         # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
@@ -1151,21 +1235,32 @@ class v8OBBLoss(v8DetectionLoss):
         if fg_mask.sum():
             weight = target_scores.sum(-1)[fg_mask]
             if pred_refine is not None:
-                refine_mask = self.build_refine_mask(target_bboxes, fg_mask)
-                loss[4] = self.calculate_refine_residual_loss(
-                    coarse_bboxes,
-                    pred_refine,
-                    target_bboxes,
-                    fg_mask,
-                    weight,
-                    target_scores_sum,
-                    stride_tensor,
-                    refine_mask,
+                refine_mask = (
+                    predicted_refine_gate[fg_mask]
+                    if predicted_refine_gate is not None
+                    else self.build_refine_mask(target_bboxes, fg_mask)
                 )
-                refine_loss_value = loss[4]
-                self._accumulate_refine_diagnostics(
-                    coarse_bboxes, pred_refine, fg_mask, refine_mask, refine_loss_value * float(self.hyp.aux_geo)
-                )
+                if refine_version == 2 and refine_experiment != "bounded_wh":
+                    loss[4] = self.calculate_refine_v2_direct_loss(
+                        coarse_bboxes,
+                        pred_refine,
+                        target_bboxes,
+                        fg_mask,
+                        weight,
+                        stride_tensor,
+                        refine_mask,
+                    )
+                else:
+                    loss[4] = self.calculate_refine_residual_loss(
+                        coarse_bboxes,
+                        pred_refine,
+                        target_bboxes,
+                        fg_mask,
+                        weight,
+                        target_scores_sum,
+                        stride_tensor,
+                        refine_mask,
+                    )
             else:
                 loss[4] = self.calculate_aux_geo_loss(
                     coarse_bboxes, target_bboxes, fg_mask, weight, target_scores_sum, stride_tensor
@@ -1188,6 +1283,23 @@ class v8OBBLoss(v8DetectionLoss):
             )  # angle loss
         else:
             loss[0] += (pred_angle * 0).sum()
+        if pred_refine is not None and refine_version == 2 and refine_experiment == "aligned_identity":
+            if predicted_refine_gate is None:
+                predicted_refine_gate = self.build_predicted_refine_gate(coarse_bboxes, stride_tensor)
+            identity_gain = float(getattr(self.refine_head, "refine_identity_gain", 0.05))
+            loss[4] += identity_gain * self.calculate_refine_v2_identity_loss(
+                pred_refine,
+                predicted_refine_gate,
+                fg_mask,
+            )
+        if pred_refine is not None and fg_mask.any():
+            self._accumulate_refine_diagnostics(
+                coarse_bboxes,
+                pred_refine,
+                fg_mask,
+                refine_mask,
+                loss[4] * float(self.hyp.aux_geo),
+            )
         if pred_refine is not None:
             loss[0] += (pred_refine * 0).sum()
 
@@ -1252,6 +1364,66 @@ class v8OBBLoss(v8DetectionLoss):
         loss_w = (loss_w * weight_fg).sum() / target_scores_sum
 
         return loss_iou + float(self.hyp.aux_geo_lw) * loss_w
+
+    def calculate_refine_v2_direct_loss(
+        self,
+        coarse_bboxes: torch.Tensor,
+        pred_refine: torch.Tensor,
+        target_bboxes: torch.Tensor,
+        fg_mask: torch.Tensor,
+        weight: torch.Tensor,
+        stride_tensor: torch.Tensor,
+        refine_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Directly supervise bounded short/long log-scale residuals on active positives."""
+        if refine_mask.numel() == 0 or not refine_mask.any():
+            return pred_refine.sum() * 0.0
+
+        coarse_px = coarse_bboxes.detach().clone()
+        coarse_px[..., :4] *= stride_tensor
+        coarse_fg = coarse_px[fg_mask][refine_mask]
+        target_fg = target_bboxes[fg_mask][refine_mask]
+
+        delta = self.refine_head.bound_refine(pred_refine.permute(0, 2, 1))
+        delta_fg = delta[fg_mask][refine_mask]
+
+        coarse_short = coarse_fg[:, 2:4].amin(dim=-1)
+        coarse_long = coarse_fg[:, 2:4].amax(dim=-1)
+        target_short = target_fg[:, 2:4].amin(dim=-1)
+        target_long = target_fg[:, 2:4].amax(dim=-1)
+        eps = 1e-6
+        target_limit = float(getattr(self.refine_head, "refine_target_limit", 0.095))
+        target_delta = torch.stack(
+            (
+                torch.log((target_short + eps) / (coarse_short + eps)),
+                torch.log((target_long + eps) / (coarse_long + eps)),
+            ),
+            dim=-1,
+        ).clamp(-target_limit, target_limit)
+
+        beta = float(getattr(self.refine_head, "refine_smooth_l1_beta", 0.02))
+        element_loss = F.smooth_l1_loss(delta_fg, target_delta, reduction="none", beta=beta).mean(dim=-1)
+        active_weight = weight[refine_mask]
+        return (element_loss * active_weight).sum() / active_weight.sum().clamp_min(1e-6)
+
+    def calculate_refine_v2_identity_loss(
+        self,
+        pred_refine: torch.Tensor,
+        predicted_gate: torch.Tensor,
+        fg_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Keep predicted-gated unmatched anchors at the identity residual."""
+        identity_mask = predicted_gate & ~fg_mask
+        if not identity_mask.any():
+            return pred_refine.sum() * 0.0
+        raw = pred_refine.permute(0, 2, 1)
+        beta = float(getattr(self.refine_head, "refine_smooth_l1_beta", 0.02))
+        return F.smooth_l1_loss(
+            raw[identity_mask],
+            torch.zeros_like(raw[identity_mask]),
+            reduction="mean",
+            beta=beta,
+        )
 
     def calculate_aux_geo_loss(self, pred_bboxes, target_bboxes, fg_mask,
                                 weight, target_scores_sum, stride_tensor):
