@@ -1,501 +1,960 @@
-"""
-Refine Head 完全解耦版诊断脚本
-验证三个假设：
-1. cv5 输出 Δw/Δh 是否接近零（Refine Head 未学到有效修正）
-2. cv5 梯度量级是否远小于 cv2（梯度被 DFL 头吸收）
-3. DFL 粗框在薄目标上是否有残差（cv5 是否有修正空间）
+"""Diagnose the OBB Refine branch on the 640-pixel validation/test split.
 
-使用方法：
-    python myscripts/refine_diag.py
+This script does not replace full mAP validation. It inspects the mechanism behind
+the result: predicted-vs-GT gate mismatch, raw residual magnitude and saturation,
+per-FPN activation, matched-positive IoU changes, and optional gradient-clipping
+coupling. Use ``collect_refine_ab_curve.py`` for full-dataset metric controls.
+
+Example:
+    python myscripts/refine_diag.py \
+        --weights /root/autodl-tmp/work-dirs/exp/weights/best.pt \
+        --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml \
+        --imgsz 640 --split val --batch 8 --device 0 --workers 8 \
+        --max-batches 50 \
+        --output-dir /root/autodl-tmp/paper_exports/refine_diag_best
 """
 
+from __future__ import annotations
+
+import argparse
 import math
-import os
-import torch
-import numpy as np
 from collections import defaultdict
+from pathlib import Path
+from typing import Any
 
-from ultralytics import YOLO
-from ultralytics.cfg import get_cfg
-from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_KEYS
-from ultralytics.utils.tal import dist2rbox, make_anchors
-from ultralytics.utils.metrics import probiou
+GATE_MODES = ("current", "ar-only", "short-only", "and", "all", "none")
 
 
-# ========================== 配置 ==========================
-# 当前主线训练的 checkpoint 路径（含 OBBRefine 头）
-MODEL_PATH = "/root/autodl-tmp/work-dirs/yolo11_obb-ca-refine-decouple-coarseval/weights/best.pt"
-DATA_PATH = "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml"
-NUM_BATCHES = 100  # 诊断用的 batch 数
-DEVICE = 0
-REPORT_PATH = "/root/autodl-tmp/work-dirs/refine_diag/refine_diag_results.md"
-SMALL_SHORT_SIDE_PX = 16.0
-MEDIUM_SHORT_SIDE_PX = 32.0
+def parse_float_list(value: str, *, minimum: float | None = None, maximum: float | None = None) -> list[float]:
+    """Parse a comma-separated float list with optional bounds."""
+    result = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if not result:
+        raise argparse.ArgumentTypeError("列表不能为空")
+    if minimum is not None and any(item < minimum for item in result):
+        raise argparse.ArgumentTypeError(f"列表值不能小于 {minimum}")
+    if maximum is not None and any(item > maximum for item in result):
+        raise argparse.ArgumentTypeError(f"列表值不能大于 {maximum}")
+    return result
 
 
-def extend_stats(stats, key, tensor):
-    if tensor is None:
-        return
-    tensor = tensor.detach().reshape(-1)
-    if tensor.numel() == 0:
-        return
-    stats[key].extend(tensor.cpu().tolist())
+def parse_alphas(value: str) -> list[float]:
+    """Parse residual scales in [0, 1]."""
+    return parse_float_list(value, minimum=0.0, maximum=1.0)
 
 
-def apply_refine_to_bboxes(coarse_bboxes, pred_refine, clamp_val):
-    if pred_refine is None:
-        return coarse_bboxes
-    rf = pred_refine.permute(0, 2, 1)
-    dw = rf[..., 0:1].clamp(-clamp_val, clamp_val)
-    dh = rf[..., 1:2].clamp(-clamp_val, clamp_val) if rf.shape[-1] >= 2 else torch.zeros_like(dw)
-    return torch.cat(
-        [
-            coarse_bboxes[..., 0:2],
-            coarse_bboxes[..., 2:3] * torch.exp(dw),
-            coarse_bboxes[..., 3:4] * torch.exp(dh),
-            coarse_bboxes[..., 4:5],
-        ],
-        dim=-1,
+def parse_thresholds(value: str) -> list[float]:
+    """Parse non-negative confidence thresholds."""
+    return parse_float_list(value, minimum=0.0, maximum=1.0)
+
+
+def parse_gate_modes(value: str) -> list[str]:
+    """Parse gate modes."""
+    result = [item.strip() for item in value.split(",") if item.strip()]
+    invalid = [item for item in result if item not in GATE_MODES]
+    if not result or invalid:
+        raise argparse.ArgumentTypeError(f"gate mode 必须来自 {GATE_MODES}，收到: {invalid or value}")
+    return result
+
+
+def find_refine_head(core_model: torch.nn.Module) -> torch.nn.Module:
+    """Find the unique OBBRefine-like head."""
+    heads = [
+        module
+        for module in core_model.modules()
+        if hasattr(module, "disable_refine_inference") and hasattr(module, "cv5")
+    ]
+    if not heads:
+        raise RuntimeError("权重中未找到 OBBRefine 检测头；请确认使用 CA+Refine checkpoint")
+    if len(heads) > 1:
+        raise RuntimeError(f"检测到 {len(heads)} 个 Refine head，脚本无法确定目标模块")
+    head = heads[0]
+    if head.cv5 is None:
+        raise RuntimeError("Refine head 的 cv5 已被移除，无法采集原始残差")
+    return head
+
+
+def configure_model_args(
+    core_model: torch.nn.Module,
+    args: argparse.Namespace,
+) -> Any:
+    """Normalize checkpoint args and inject the current diagnostic settings."""
+    stored_args = getattr(core_model, "args", {})
+    overrides = dict(stored_args) if isinstance(stored_args, dict) else vars(stored_args)
+    overrides = {key: value for key, value in overrides.items() if key in DEFAULT_CFG_KEYS}
+    overrides.update(
+        {
+            "task": "obb",
+            "data": args.data,
+            "imgsz": args.imgsz,
+            "batch": args.batch,
+            "device": args.device,
+            "workers": args.workers,
+            "rect": True,
+            "cache": False,
+            "aux_geo_ar": args.ar_threshold,
+            "aux_geo_ws": args.short_threshold,
+        }
+    )
+    cfg = get_cfg(DEFAULT_CFG, overrides=overrides)
+    core_model.args = cfg
+    return cfg
+
+
+def build_split_loader(
+    cfg: Any,
+    data_dict: dict[str, Any],
+    split: str,
+    batch: int,
+    workers: int,
+    stride: int,
+):
+    """Build a deterministic validation-style loader for ``val`` or ``test``."""
+    image_path = data_dict.get(split)
+    if not image_path:
+        raise ValueError(f"dataset.yaml 未定义 split={split}")
+    dataset = build_yolo_dataset(
+        cfg,
+        image_path,
+        batch,
+        data_dict,
+        mode="val",
+        rect=True,
+        stride=stride,
+    )
+    return build_dataloader(
+        dataset,
+        batch,
+        workers,
+        shuffle=False,
+        rank=-1,
+        drop_last=False,
+        pin_memory=True,
     )
 
 
-def build_assignment_diagnostics(criterion, detect_head, preds, batch):
-    if not isinstance(preds, dict):
-        return None
-    pred_distri = preds["boxes"]
-    pred_scores = preds["scores"]
-    pred_angle = preds["angle"]
-    pred_refine = preds.get("refine")
-    feats = preds["feats"]
+def prepare_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+    """Move tensor fields to the selected device and normalize images."""
+    prepared = {}
+    for key, value in batch.items():
+        prepared[key] = value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+    prepared["img"] = prepared["img"].float() / 255.0
+    return prepared
 
-    anchor_points, stride_tensor = make_anchors(feats, detect_head.stride, 0.5)
-    pd = pred_distri.permute(0, 2, 1).contiguous()
-    pa = pred_angle.permute(0, 2, 1).contiguous()
 
-    coarse_bboxes = criterion.bbox_decode(anchor_points, pd, pa)
-    refined_bboxes = apply_refine_to_bboxes(
-        coarse_bboxes,
-        pred_refine,
-        clamp_val=float(getattr(detect_head, "refine_clamp", 1.0)),
-    )
+def extract_raw_predictions(outputs: Any) -> dict[str, torch.Tensor]:
+    """Extract the one-to-many raw prediction dictionary."""
+    raw = outputs[1] if isinstance(outputs, (tuple, list)) else outputs
+    if isinstance(raw, dict) and "one2many" in raw:
+        raw = raw["one2many"]
+    if not isinstance(raw, dict):
+        raise TypeError(f"无法从模型输出中取得 raw prediction dict，实际类型={type(raw)}")
+    required = {"boxes", "scores", "angle", "refine", "feats"}
+    missing = required.difference(raw)
+    if missing:
+        raise KeyError(f"raw predictions 缺少字段: {sorted(missing)}")
+    return raw
 
-    coarse_bboxes_px = coarse_bboxes.clone()
-    refined_bboxes_px = refined_bboxes.clone()
-    coarse_bboxes_px[..., :4] *= stride_tensor
-    refined_bboxes_px[..., :4] *= stride_tensor
+
+def build_assignments(
+    criterion,
+    raw: dict[str, torch.Tensor],
+    batch: dict[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Reproduce the coarse assignment path used by the OBB loss."""
+    pred_distri = raw["boxes"].permute(0, 2, 1).contiguous()
+    pred_scores = raw["scores"].permute(0, 2, 1).contiguous()
+    pred_angle = raw["angle"].permute(0, 2, 1).contiguous()
+    anchor_points, stride_tensor = make_anchors(raw["feats"], criterion.stride, 0.5)
+    coarse_grid = criterion.bbox_decode(anchor_points, pred_distri, pred_angle)
+    coarse_px = coarse_grid.clone()
+    coarse_px[..., :4] *= stride_tensor
 
     batch_size = pred_angle.shape[0]
     dtype = pred_scores.dtype
-    imgsz = torch.tensor(feats[0].shape[2:], device=criterion.device, dtype=dtype) * criterion.stride[0]
-    batch_idx = batch["batch_idx"].view(-1, 1)
-    targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
-    rw, rh = targets[:, 4] * float(imgsz[1]), targets[:, 5] * float(imgsz[0])
+    image_size = torch.tensor(
+        raw["feats"][0].shape[2:],
+        device=criterion.device,
+        dtype=dtype,
+    ) * criterion.stride[0]
+    batch_index = batch["batch_idx"].view(-1, 1)
+    targets = torch.cat((batch_index, batch["cls"].view(-1, 1), batch["bboxes"].view(-1, 5)), 1)
+    rw = targets[:, 4] * float(image_size[1])
+    rh = targets[:, 5] * float(image_size[0])
     targets = targets[(rw >= 2) & (rh >= 2)]
-    targets = criterion.preprocess(targets.to(criterion.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+    targets = criterion.preprocess(
+        targets.to(criterion.device),
+        batch_size,
+        scale_tensor=image_size[[1, 0, 1, 0]],
+    )
     gt_labels, gt_bboxes = targets.split((1, 5), 2)
     mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
 
     criterion.assigner._stride_tensor = stride_tensor
-    ps = pred_scores.detach().permute(0, 2, 1).contiguous().sigmoid()
     _, target_bboxes, target_scores, fg_mask, target_gt_idx = criterion.assigner(
-        ps,
-        coarse_bboxes_px.type(gt_bboxes.dtype),
+        pred_scores.detach().sigmoid(),
+        coarse_px.detach().type(gt_bboxes.dtype),
         anchor_points * stride_tensor,
         gt_labels,
         gt_bboxes,
         mask_gt,
     )
-
-    selected_refined_bboxes_px = coarse_bboxes_px.clone()
-    refine_mask = torch.zeros(0, dtype=torch.bool, device=criterion.device)
-    if fg_mask.any() and pred_refine is not None:
-        if hasattr(criterion, "build_refine_mask"):
-            refine_mask = criterion.build_refine_mask(target_bboxes, fg_mask)
-        else:
-            target_fg = target_bboxes[fg_mask]
-            short_gt = target_fg[:, 2:4].amin(dim=-1)
-            refine_mask = short_gt < float(criterion.hyp.aux_geo_ws)
-        if refine_mask.any():
-            selected_fg = selected_refined_bboxes_px[fg_mask]
-            selected_fg[refine_mask] = refined_bboxes_px[fg_mask][refine_mask]
-            selected_refined_bboxes_px[fg_mask] = selected_fg
-
     return {
-        "coarse_bboxes": coarse_bboxes,
-        "refined_bboxes": refined_bboxes,
-        "coarse_bboxes_px": coarse_bboxes_px,
-        "refined_bboxes_px": refined_bboxes_px,
-        "selected_refined_bboxes_px": selected_refined_bboxes_px,
-        "pred_refine": pred_refine,
+        "coarse_grid": coarse_grid,
+        "coarse_px": coarse_px,
+        "pred_scores": pred_scores,
+        "pred_refine": raw["refine"].permute(0, 2, 1).contiguous(),
         "target_bboxes": target_bboxes,
         "target_scores": target_scores,
         "target_gt_idx": target_gt_idx,
         "fg_mask": fg_mask,
-        "refine_mask": refine_mask,
+        "stride_tensor": stride_tensor,
     }
 
 
-def collect_diagnostics():
-    """收集诊断数据"""
-    model = YOLO(MODEL_PATH)
-    model.model.float()
-    for p in model.model.parameters():
-        p.requires_grad = True
-    model.model.to(f"cuda:{DEVICE}")
-    model.model.train()
+def build_predicted_gates(
+    coarse_px: torch.Tensor,
+    ar_threshold: float,
+    short_threshold: float,
+) -> dict[str, torch.Tensor]:
+    """Build all inference-side gate variants from coarse predicted geometry."""
+    short_side = coarse_px[..., 2:4].amin(dim=-1)
+    long_side = coarse_px[..., 2:4].amax(dim=-1)
+    aspect_ratio = long_side / short_side.clamp_min(1e-6)
+    ar_gate = aspect_ratio > ar_threshold
+    short_gate = short_side < short_threshold
+    return {
+        "current": ar_gate | short_gate,
+        "ar-only": ar_gate,
+        "short-only": short_gate,
+        "and": ar_gate & short_gate,
+        "all": torch.ones_like(ar_gate),
+        "none": torch.zeros_like(ar_gate),
+    }
 
-    # 规范化 model.args：checkpoint 中常为 dict，而 loss/criterion 期望可属性访问的配置对象
-    train_args = getattr(model.model, "args", {})
-    model_args_overrides = dict(train_args) if isinstance(train_args, dict) else vars(train_args)
-    model_args_overrides = {k: v for k, v in model_args_overrides.items() if k in DEFAULT_CFG_KEYS}
-    model_args_overrides["task"] = "obb"
-    model.model.args = get_cfg(DEFAULT_CFG, overrides=model_args_overrides)
 
-    # 获取检测头（OBBRefine）
-    detect_head = model.model.model[-1]
-    print(f"检测头类型: {type(detect_head).__name__}")
+def build_gt_gate(
+    target_fg: torch.Tensor,
+    ar_threshold: float,
+    short_threshold: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build the training-side GT gate and return GT short side/aspect ratio."""
+    short_side = target_fg[:, 2:4].amin(dim=-1)
+    long_side = target_fg[:, 2:4].amax(dim=-1)
+    aspect_ratio = long_side / short_side.clamp_min(1e-6)
+    gate = (aspect_ratio > ar_threshold) | (short_side < short_threshold)
+    return gate, short_side, aspect_ratio
 
-    # 确认 cv5 存在
-    if not hasattr(detect_head, 'cv5') or detect_head.cv5 is None:
-        print("错误: 模型没有 cv5 分支！")
+
+def apply_refine(
+    coarse_bboxes: torch.Tensor,
+    residual: torch.Tensor,
+    gate: torch.Tensor,
+    alpha: float,
+    clamp_value: float,
+) -> torch.Tensor:
+    """Apply the production width/height residual formula to selected boxes."""
+    refined = coarse_bboxes.clone()
+    delta = residual[:, :2].clamp(-clamp_value, clamp_value)
+    delta = delta * float(alpha) * gate.to(delta.dtype).unsqueeze(-1)
+    refined[:, 2:4] *= torch.exp(delta)
+    return refined
+
+
+def extend_values(
+    store: dict[tuple[str, str], list[np.ndarray]],
+    scope: str,
+    variable: str,
+    values: torch.Tensor,
+) -> None:
+    """Append finite flattened values to a distribution store."""
+    if values.numel() == 0:
         return
-    print(f"cv5 层数: {len(detect_head.cv5)}")
+    array = values.detach().float().reshape(-1).cpu().numpy()
+    array = array[np.isfinite(array)]
+    if array.size:
+        store[(scope, variable)].append(array)
 
-    # ---- 假设 1：cv5 参数和输出统计 ----
-    print("\n" + "=" * 60)
-    print("假设 1：cv5 参数统计（权重是否仍为零初始化附近）")
-    print("=" * 60)
-    for i, seq in enumerate(detect_head.cv5):
-        last_conv = seq[-1]  # 最后一层 Conv2d
-        w = last_conv.weight
-        b = last_conv.bias
-        print(f"  cv5[{i}] last Conv2d:")
-        print(f"    weight: mean={w.mean().item():.6f}, std={w.std().item():.6f}, "
-              f"abs_max={w.abs().max().item():.6f}, norm={w.norm().item():.6f}")
-        print(f"    bias:   mean={b.mean().item():.6f}, std={b.std().item():.6f}, "
-              f"abs_max={b.abs().max().item():.6f}")
 
-    # 构建 dataloader
-    overrides = {
-        "data": DATA_PATH, "batch": 8, "imgsz": 1024,
-        "device": DEVICE, "workers": 4, "cache": "disk", "task": "obb",
+def add_gate_count(
+    counts: dict[tuple[str, str], dict[str, int]],
+    scope: str,
+    gate_name: str,
+    gate: torch.Tensor,
+    eligible: torch.Tensor | None = None,
+) -> None:
+    """Accumulate active and eligible gate counts."""
+    selected = gate if eligible is None else gate[eligible]
+    entry = counts[(scope, gate_name)]
+    entry["active"] += int(selected.sum().item())
+    entry["total"] += int(selected.numel())
+
+
+def add_iou_values(
+    store: dict[tuple[str, float, str], dict[str, list[np.ndarray]]],
+    gate_name: str,
+    alpha: float,
+    subset: str,
+    coarse_iou: torch.Tensor,
+    refined_iou: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> None:
+    """Accumulate paired IoU arrays for one configuration/subgroup."""
+    if mask is not None:
+        coarse_iou = coarse_iou[mask]
+        refined_iou = refined_iou[mask]
+    if coarse_iou.numel() == 0:
+        return
+    key = (gate_name, float(alpha), subset)
+    store[key]["coarse"].append(coarse_iou.detach().float().reshape(-1).cpu().numpy())
+    store[key]["refined"].append(refined_iou.detach().float().reshape(-1).cpu().numpy())
+
+
+def fpn_level_ids(feats: list[torch.Tensor], batch_size: int, device: torch.device) -> tuple[torch.Tensor, list[str]]:
+    """Return flattened P-level indices aligned with concatenated head predictions."""
+    names = [f"P{index + 3}" for index in range(len(feats))]
+    ids = torch.cat(
+        [
+            torch.full((feature.shape[2] * feature.shape[3],), index, device=device, dtype=torch.long)
+            for index, feature in enumerate(feats)
+        ]
+    )
+    return ids.unsqueeze(0).expand(batch_size, -1), names
+
+
+def summarize_distributions(
+    store: dict[tuple[str, str], list[np.ndarray]],
+    clamp_value: float,
+) -> pd.DataFrame:
+    """Convert raw distribution chunks into quantile rows."""
+    rows = []
+    for (scope, variable), chunks in sorted(store.items()):
+        values = np.concatenate(chunks)
+        rows.append(
+            {
+                "scope": scope,
+                "variable": variable,
+                "n": int(values.size),
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+                "min": float(values.min()),
+                "p01": float(np.percentile(values, 1)),
+                "p05": float(np.percentile(values, 5)),
+                "p50": float(np.percentile(values, 50)),
+                "p95": float(np.percentile(values, 95)),
+                "p99": float(np.percentile(values, 99)),
+                "max": float(values.max()),
+                "saturation_rate": (
+                    float((np.abs(values) >= clamp_value).mean()) if variable in {"dw", "dh", "dshort"} else np.nan
+                ),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "scope",
+            "variable",
+            "n",
+            "mean",
+            "std",
+            "min",
+            "p01",
+            "p05",
+            "p50",
+            "p95",
+            "p99",
+            "max",
+            "saturation_rate",
+        ],
+    )
+
+
+def summarize_gate_counts(
+    counts: dict[tuple[str, str], dict[str, int]],
+) -> pd.DataFrame:
+    """Convert gate counters into a table."""
+    rows = []
+    for (scope, gate_name), values in sorted(counts.items()):
+        total = values["total"]
+        rows.append(
+            {
+                "scope": scope,
+                "gate": gate_name,
+                "active": values["active"],
+                "total": total,
+                "active_ratio": values["active"] / total if total else np.nan,
+            }
+        )
+    return pd.DataFrame(rows, columns=["scope", "gate", "active", "total", "active_ratio"])
+
+
+def summarize_iou(
+    store: dict[tuple[str, float, str], dict[str, list[np.ndarray]]],
+) -> pd.DataFrame:
+    """Convert paired IoU chunks into sweep statistics."""
+    rows = []
+    for (gate_name, alpha, subset), chunks in sorted(store.items()):
+        coarse = np.concatenate(chunks["coarse"])
+        refined = np.concatenate(chunks["refined"])
+        delta = refined - coarse
+        rows.append(
+            {
+                "gate": gate_name,
+                "alpha": alpha,
+                "subset": subset,
+                "n": int(delta.size),
+                "coarse_iou_mean": float(coarse.mean()),
+                "refined_iou_mean": float(refined.mean()),
+                "delta_iou_mean": float(delta.mean()),
+                "delta_iou_p25": float(np.percentile(delta, 25)),
+                "delta_iou_p50": float(np.percentile(delta, 50)),
+                "delta_iou_p75": float(np.percentile(delta, 75)),
+                "improved_ratio": float((delta > 1e-7).mean()),
+                "worsened_ratio": float((delta < -1e-7).mean()),
+                "unchanged_ratio": float((np.abs(delta) <= 1e-7).mean()),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "gate",
+            "alpha",
+            "subset",
+            "n",
+            "coarse_iou_mean",
+            "refined_iou_mean",
+            "delta_iou_mean",
+            "delta_iou_p25",
+            "delta_iou_p50",
+            "delta_iou_p75",
+            "improved_ratio",
+            "worsened_ratio",
+            "unchanged_ratio",
+        ],
+    )
+
+
+def gradient_norms(
+    core_model: torch.nn.Module,
+    refine_head: torch.nn.Module,
+    loss_vector: torch.Tensor,
+) -> dict[str, float]:
+    """Measure Refine/base gradient norms and the resulting global clipping scale."""
+    refine_parameter_ids = {id(parameter) for parameter in refine_head.cv5.parameters()}
+    base_squared = 0.0
+    refine_squared = 0.0
+    for parameter in core_model.parameters():
+        if parameter.grad is None:
+            continue
+        squared = float(parameter.grad.detach().float().pow(2).sum().item())
+        if id(parameter) in refine_parameter_ids:
+            refine_squared += squared
+        else:
+            base_squared += squared
+    base_norm = math.sqrt(base_squared)
+    refine_norm = math.sqrt(refine_squared)
+    global_norm = math.sqrt(base_squared + refine_squared)
+    max_norm = 10.0
+    return {
+        "total_loss": float(loss_vector.detach().sum().item()),
+        "base_grad_norm": base_norm,
+        "refine_grad_norm": refine_norm,
+        "global_grad_norm": global_norm,
+        "base_only_clip_scale": min(1.0, max_norm / (base_norm + 1e-12)),
+        "global_clip_scale": min(1.0, max_norm / (global_norm + 1e-12)),
     }
-    args = get_cfg(DEFAULT_CFG, overrides=overrides)
 
-    # 直接用 train loader
-    from ultralytics.data.utils import check_det_dataset
-    data_dict = check_det_dataset(DATA_PATH)
 
+def markdown_table(dataframe: pd.DataFrame, columns: list[str], max_rows: int = 30) -> str:
+    """Render a compact Markdown table without requiring the optional tabulate package."""
+    if dataframe.empty:
+        return "无数据。"
+    view = dataframe.loc[:, columns].head(max_rows).copy()
+    for column in view.select_dtypes(include=[np.number]).columns:
+        view[column] = view[column].map(lambda value: f"{value:.6f}" if pd.notna(value) else "")
+    header = "| " + " | ".join(columns) + " |"
+    divider = "| " + " | ".join(["---"] * len(columns)) + " |"
+    rows = ["| " + " | ".join(map(str, row)) + " |" for row in view.itertuples(index=False, name=None)]
+    return "\n".join([header, divider, *rows])
+
+
+def append_training_log_summary(
+    lines: list[str],
+    training_diag: Path | None,
+    training_results: Path | None,
+) -> None:
+    """Append optional training-time diagnostics to the Markdown report."""
+    if training_diag is not None:
+        frame = pd.read_csv(training_diag)
+        lines.extend(["", "## 训练期 refine_diag.csv", ""])
+        if frame.empty:
+            lines.append("文件为空。")
+        else:
+            columns = [
+                column
+                for column in ("epoch", "refine_mask_ratio", "avg_abs_dshort", "refine_loss")
+                if column in frame
+            ]
+            lines.append(markdown_table(frame.tail(10), columns, max_rows=10))
+    if training_results is not None:
+        frame = pd.read_csv(training_results)
+        lines.extend(["", "## 训练 results.csv 的末尾趋势", ""])
+        columns = [
+            column
+            for column in (
+                "epoch",
+                "train/aux_geo_loss",
+                "val/aux_geo_loss",
+                "metrics/mAP50-95(B)",
+            )
+            if column in frame
+        ]
+        lines.append(markdown_table(frame.tail(10), columns, max_rows=10))
+
+
+def write_report(
+    output_path: Path,
+    args: argparse.Namespace,
+    clamp_value: float,
+    processed_batches: int,
+    seen_images: int,
+    gate_frame: pd.DataFrame,
+    distribution_frame: pd.DataFrame,
+    iou_frame: pd.DataFrame,
+    confusion: dict[str, int],
+    gradient_frame: pd.DataFrame,
+) -> None:
+    """Write a human-readable diagnostic report and decision rules."""
+    lines = [
+        "# Refine Head 机制诊断报告",
+        "",
+        "## 运行配置",
+        "",
+        f"- 权重：`{args.weights}`",
+        f"- 数据：`{args.data}`",
+        f"- split：`{args.split}`",
+        f"- imgsz：`{args.imgsz}`",
+        f"- 已处理 batch / image：`{processed_batches}` / `{seen_images}`",
+        f"- 门控阈值：`AR>{args.ar_threshold}` 或 `short<{args.short_threshold}px`",
+        f"- residual clamp：`{clamp_value}`",
+        f"- alpha：`{args.alphas}`",
+        "",
+        "本报告中的 IoU 是匹配正样本上的 ProbIoU 机制诊断，不等价于完整验证集 mAP；完整指标应由 "
+        "`collect_refine_ab_curve.py` 生成。",
+        "",
+        "## 推理门控激活率",
+        "",
+    ]
+    gate_scopes = gate_frame[
+        gate_frame["scope"].isin(
+            ["all_anchors", "P3_all", "P4_all", "P5_all", "positive_anchors", "confidence>=0.25"]
+        )
+    ]
+    lines.append(markdown_table(gate_scopes, ["scope", "gate", "active", "total", "active_ratio"]))
+
+    confusion_total = sum(confusion.values())
+    lines.extend(["", "## GT 门控与预测门控的一致性", ""])
+    if confusion_total:
+        confusion_rows = pd.DataFrame(
+            [
+                {
+                    "case": key,
+                    "count": value,
+                    "ratio": value / confusion_total,
+                }
+                for key, value in confusion.items()
+            ]
+        )
+        lines.append(markdown_table(confusion_rows, ["case", "count", "ratio"]))
+    else:
+        lines.append("没有匹配正样本。")
+
+    lines.extend(["", "## 当前门控的 alpha 扫描（匹配正样本）", ""])
+    current = iou_frame[(iou_frame["gate"] == "current") & (iou_frame["subset"] == "all")]
+    lines.append(
+        markdown_table(
+            current,
+            [
+                "gate",
+                "alpha",
+                "n",
+                "coarse_iou_mean",
+                "refined_iou_mean",
+                "delta_iou_mean",
+                "improved_ratio",
+                "worsened_ratio",
+            ],
+        )
+    )
+
+    lines.extend(["", "## GT oracle 门控（区分门控错误与残差错误）", ""])
+    oracle = iou_frame[(iou_frame["gate"] == "gt-oracle") & (iou_frame["subset"] == "all")]
+    lines.append(
+        markdown_table(
+            oracle,
+            [
+                "gate",
+                "alpha",
+                "n",
+                "coarse_iou_mean",
+                "refined_iou_mean",
+                "delta_iou_mean",
+                "improved_ratio",
+                "worsened_ratio",
+            ],
+        )
+    )
+
+    lines.extend(["", "## 残差分布重点项", ""])
+    selected_distribution = distribution_frame[
+        distribution_frame["scope"].isin(
+            ["all_anchors", "current_gate", "positive_anchors", "gt_gated_positive", "pred_gated_positive"]
+        )
+    ]
+    lines.append(
+        markdown_table(
+            selected_distribution,
+            ["scope", "variable", "n", "mean", "std", "p05", "p50", "p95", "p99", "saturation_rate"],
+        )
+    )
+
+    if not gradient_frame.empty:
+        lines.extend(["", "## 梯度裁剪耦合", ""])
+        lines.append(
+            markdown_table(
+                gradient_frame,
+                [
+                    "batch",
+                    "total_loss",
+                    "base_grad_norm",
+                    "refine_grad_norm",
+                    "global_grad_norm",
+                    "base_only_clip_scale",
+                    "global_clip_scale",
+                ],
+            )
+        )
+
+    lines.extend(
+        [
+            "",
+            "## 判读规则",
+            "",
+            "1. `alpha=0` 的匹配正样本 ΔIoU 应为 0；完整 mAP 恒等性由 identity profile 检查。",
+            "2. 小 alpha 恢复或改善、alpha=1 明显下降：残差方向可能正确，但幅度/校准失控。",
+            "3. 所有 `alpha>0` 都下降：优先检查 residual target、宽高轴对应和损失定义。",
+            "4. GT oracle 明显优于 current gate：训练/推理门控错配是主因。",
+            "5. GT oracle 也明显下降：即使门控正确，Refine 学到的残差方向仍然错误。",
+            "6. `pred_only` 比例高：推理在大量训练期未监督位置启用了 Refine，应加入 identity 约束或统一门控。",
+            "7. `|delta|>=clamp` 的饱和比例高，或 `p95/p99` 接近/超过 1：当前 ±1 范围过大，应先缩小残差尺度。",
+            "8. `global_clip_scale` 明显小于 `base_only_clip_scale`：cv5 通过全模型梯度裁剪间接影响 coarse 分支。",
+        ]
+    )
+    append_training_log_summary(lines, args.training_diag, args.training_results)
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def main() -> None:
+    """Collect Refine mechanism diagnostics."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--weights", type=Path, required=True)
+    parser.add_argument("--data", required=True)
+    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--split", choices=("val", "test"), default="val")
+    parser.add_argument("--batch", type=int, default=8)
+    parser.add_argument("--device", default="0")
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--max-batches", type=int, default=50, help="0 表示遍历完整 split")
+    parser.add_argument("--ar-threshold", type=float, default=30.0)
+    parser.add_argument("--short-threshold", type=float, default=16.0)
+    parser.add_argument("--clamp", type=float, help="默认读取检测头 refine_clamp")
+    parser.add_argument(
+        "--alphas",
+        type=parse_alphas,
+        default=parse_alphas("0,0.05,0.1,0.2,0.5,1"),
+    )
+    parser.add_argument(
+        "--gate-modes",
+        type=parse_gate_modes,
+        default=parse_gate_modes("current,ar-only,short-only,and"),
+    )
+    parser.add_argument(
+        "--conf-thresholds",
+        type=parse_thresholds,
+        default=parse_thresholds("0.001,0.01,0.1,0.25"),
+    )
+    parser.add_argument(
+        "--gradient-batches",
+        type=int,
+        default=0,
+        help="额外反向传播的 batch 数；用于检查 cv5 是否通过全局 clip 间接影响 coarse",
+    )
+    parser.add_argument("--training-diag", type=Path, help="可选：训练目录中的 refine_diag.csv")
+    parser.add_argument("--training-results", type=Path, help="可选：训练目录中的 results.csv")
+    parser.add_argument("--output-dir", type=Path, required=True)
+    args = parser.parse_args()
+
+    if args.imgsz != 640:
+        parser.error("创新点一固定使用 imgsz=640")
+    if args.max_batches < 0 or args.gradient_batches < 0:
+        parser.error("--max-batches 和 --gradient-batches 不能为负数")
+    if args.clamp is not None and args.clamp <= 0:
+        parser.error("--clamp 必须大于 0")
+    if not args.weights.exists():
+        raise FileNotFoundError(args.weights)
+    for optional_path in (args.training_diag, args.training_results):
+        if optional_path is not None and not optional_path.exists():
+            raise FileNotFoundError(optional_path)
+
+    global DEFAULT_CFG, DEFAULT_CFG_KEYS, YOLO
+    global build_dataloader, build_yolo_dataset, check_det_dataset, get_cfg, make_anchors
+    global np, pd, probiou, select_device, torch
+    import numpy as np
+    import pandas as pd
+    import torch
+
+    from ultralytics import YOLO
+    from ultralytics.cfg import get_cfg
     from ultralytics.data import build_dataloader, build_yolo_dataset
-    dataset = build_yolo_dataset(
-        args, data_dict["train"], batch=8, data=data_dict, mode="train", rect=False
+    from ultralytics.data.utils import check_det_dataset
+    from ultralytics.utils import DEFAULT_CFG, DEFAULT_CFG_KEYS
+    from ultralytics.utils.metrics import probiou
+    from ultralytics.utils.tal import make_anchors
+    from ultralytics.utils.torch_utils import select_device
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    device = select_device(args.device)
+    yolo = YOLO(str(args.weights))
+    core_model = yolo.model
+    cfg = configure_model_args(core_model, args)
+    core_model.to(device).float().eval()
+    for parameter in core_model.parameters():
+        parameter.requires_grad_(True)
+
+    refine_head = find_refine_head(core_model)
+    clamp_value = float(args.clamp if args.clamp is not None else getattr(refine_head, "refine_clamp", 1.0))
+    criterion = core_model.init_criterion()
+    data_dict = check_det_dataset(args.data)
+    stride = max(int(core_model.stride.max().item()), 32)
+    loader = build_split_loader(cfg, data_dict, args.split, args.batch, args.workers, stride)
+
+    distributions: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
+    gate_counts: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: {"active": 0, "total": 0})
+    iou_store: dict[tuple[str, float, str], dict[str, list[np.ndarray]]] = defaultdict(
+        lambda: {"coarse": [], "refined": []}
     )
-    loader = build_dataloader(dataset, batch=8, workers=4, rank=-1)
+    confusion = {"both_on": 0, "pred_only": 0, "gt_only": 0, "both_off": 0}
+    gradient_rows = []
+    processed_batches = 0
+    seen_images = 0
 
-    # 收集统计
-    stats = defaultdict(list)
-    # 强制重新初始化 criterion 以确保其内部的 Tensor (如 self.proj) 分配在当前指定的 Device 上
-    criterion = model.model.init_criterion()
-    model.model.criterion = criterion
+    print("=" * 80)
+    print("Refine Head 机制诊断")
+    print(f"weights={args.weights}")
+    print(f"data={args.data}, split={args.split}, imgsz={args.imgsz}")
+    print(f"AR>{args.ar_threshold}, short<{args.short_threshold}px, clamp={clamp_value}")
+    print("=" * 80)
 
-    # 启动前自检：确认 loss 所需超参已就位，避免中途因 dict/缺字段报错
-    required_hyp_keys = ["box", "cls", "dfl", "angle", "aux_geo", "aux_geo_ar", "aux_geo_ws"]
-    missing_hyp_keys = [k for k in required_hyp_keys if not hasattr(criterion.hyp, k)]
-    if missing_hyp_keys:
-        raise RuntimeError(f"criterion.hyp 缺少必要字段: {missing_hyp_keys}")
-    print(
-        "[*] criterion 已初始化: "
-        f"aux_geo={criterion.hyp.aux_geo}, "
-        f"aux_geo_ar={criterion.hyp.aux_geo_ar}, "
-        f"aux_geo_ws={criterion.hyp.aux_geo_ws}"
-    )
-
-    print(f"\n开始跑 {NUM_BATCHES} 个 batch 收集诊断数据...")
-
-    for batch_idx, batch in enumerate(loader):
-        if batch_idx >= NUM_BATCHES:
+    for batch_index, raw_batch in enumerate(loader):
+        if args.max_batches and batch_index >= args.max_batches:
             break
+        batch = prepare_batch(raw_batch, device)
+        batch_size = int(batch["img"].shape[0])
+        processed_batches += 1
+        seen_images += batch_size
 
-        # 移到 GPU
-        for k in batch:
-            if isinstance(batch[k], torch.Tensor):
-                batch[k] = batch[k].to(f"cuda:{DEVICE}")
-        imgs = batch["img"].float() / 255.0
-
-        # forward
-        model.model.zero_grad()
-        preds = model.model(imgs)
-
-        # 提取 refine 输出
-        if isinstance(preds, dict):
-            train_preds = preds
-        elif isinstance(preds, tuple):
-            train_preds = preds[1] if len(preds) > 1 else preds[0]
-        else:
-            train_preds = preds
-
-        # 从 train_preds 中提取 refine
-        if isinstance(train_preds, dict) and "refine" in train_preds:
-            refine = train_preds["refine"]  # (B, 2, H*W)
-            dw = refine[:, 0, :]
-            dh = refine[:, 1, :]
-
-            stats["dw_mean"].append(dw.mean().item())
-            stats["dw_std"].append(dw.std().item())
-            stats["dw_absmax"].append(dw.abs().max().item())
-            stats["dh_mean"].append(dh.mean().item())
-            stats["dh_std"].append(dh.std().item())
-            stats["dh_absmax"].append(dh.abs().max().item())
-        else:
-            print(f"  batch {batch_idx}: 未找到 refine 输出！preds 类型={type(train_preds)}")
-            if isinstance(train_preds, dict):
-                print(f"    keys={list(train_preds.keys())}")
-            if batch_idx == 0:
-                print("  跳过后续 batch")
-                break
-            continue
-
-        # backward 计算梯度
-        loss_items, _ = criterion(train_preds, batch)
-        total_loss = loss_items.sum()
-        total_loss.backward()
-
-        # 假设 2：梯度量级对比
-        cv2_grad_norm = 0.0
-        cv2_param_count = 0
-        cv5_grad_norm = 0.0
-        cv5_param_count = 0
-
-        for name, param in detect_head.named_parameters():
-            if param.grad is None:
-                continue
-            g_norm = param.grad.norm().item()
-            if "cv2" in name:
-                cv2_grad_norm += param.grad.norm().item() ** 2
-                cv2_param_count += param.numel()
-            elif "cv5" in name:
-                cv5_grad_norm += param.grad.norm().item() ** 2
-                cv5_param_count += param.numel()
-
-        cv2_grad_norm = cv2_grad_norm ** 0.5
-        cv5_grad_norm = cv5_grad_norm ** 0.5
-        stats["cv2_grad_norm"].append(cv2_grad_norm)
-        stats["cv5_grad_norm"].append(cv5_grad_norm)
-        if cv5_grad_norm > 0:
-            stats["grad_ratio_cv2_cv5"].append(cv2_grad_norm / cv5_grad_norm)
-
-        # 假设 3：DFL 残差分析
-        # 重新 forward 但这次分别看 coarse vs refined
         with torch.no_grad():
-            preds2 = model.model(imgs)
-            if isinstance(preds2, tuple):
-                train_preds2 = preds2[1] if len(preds2) > 1 else preds2[0]
-            else:
-                train_preds2 = preds2
+            raw = extract_raw_predictions(core_model(batch["img"]))
+            assignment = build_assignments(criterion, raw, batch)
 
-            diag = build_assignment_diagnostics(criterion, detect_head, train_preds2, batch)
-            if diag is not None:
-                coarse_bboxes = diag["coarse_bboxes"]
-                refined_bboxes = diag["refined_bboxes"]
-                pred_refine = diag["pred_refine"]
-                fg_mask = diag["fg_mask"]
-                target_bboxes = diag["target_bboxes"]
-
-                if pred_refine is not None:
-                    w_diff = (refined_bboxes[..., 2] - coarse_bboxes[..., 2]).abs()
-                    h_diff = (refined_bboxes[..., 3] - coarse_bboxes[..., 3]).abs()
-                    stats["refine_w_diff_mean"].append(w_diff.mean().item())
-                    stats["refine_h_diff_mean"].append(h_diff.mean().item())
-
-                if fg_mask.any():
-                    coarse_pos = diag["coarse_bboxes_px"][fg_mask]
-                    refined_pos = diag["selected_refined_bboxes_px"][fg_mask]
-                    matched_gt_pos = target_bboxes[fg_mask]
-
-                    coarse_iou = probiou(coarse_pos, matched_gt_pos).reshape(-1)
-                    refined_iou = probiou(refined_pos, matched_gt_pos).reshape(-1)
-                    delta_iou = refined_iou - coarse_iou
-
-                    extend_stats(stats, "pos_coarse_iou", coarse_iou)
-                    extend_stats(stats, "pos_refined_iou", refined_iou)
-                    extend_stats(stats, "pos_delta_iou", delta_iou)
-                    extend_stats(stats, "pos_abs_delta_iou", delta_iou.abs())
-
-                    short_side = matched_gt_pos[:, 2:4].amin(dim=-1)
-                    long_side = matched_gt_pos[:, 2:4].amax(dim=-1)
-                    aspect_ratio = long_side / short_side.clamp_min(1e-6)
-
-                    extend_stats(stats, "pos_short_side_px", short_side)
-                    extend_stats(stats, "pos_aspect_ratio", aspect_ratio)
-
-                    thin_mask = (aspect_ratio > float(criterion.hyp.aux_geo_ar)) | (
-                        short_side < float(criterion.hyp.aux_geo_ws)
-                    )
-                    if thin_mask.any():
-                        extend_stats(stats, "thin_pos_coarse_iou", coarse_iou[thin_mask])
-                        extend_stats(stats, "thin_pos_refined_iou", refined_iou[thin_mask])
-                        extend_stats(stats, "thin_pos_delta_iou", delta_iou[thin_mask])
-                        extend_stats(stats, "thin_pos_abs_delta_iou", delta_iou[thin_mask].abs())
-
-                    bucket_masks = {
-                        "small": short_side < SMALL_SHORT_SIDE_PX,
-                        "medium": (short_side >= SMALL_SHORT_SIDE_PX) & (short_side < MEDIUM_SHORT_SIDE_PX),
-                        "large": short_side >= MEDIUM_SHORT_SIDE_PX,
-                    }
-                    for bucket_name, bucket_mask in bucket_masks.items():
-                        if bucket_mask.any():
-                            extend_stats(stats, f"{bucket_name}_pos_coarse_iou", coarse_iou[bucket_mask])
-                            extend_stats(stats, f"{bucket_name}_pos_refined_iou", refined_iou[bucket_mask])
-                            extend_stats(stats, f"{bucket_name}_pos_delta_iou", delta_iou[bucket_mask])
-                            extend_stats(stats, f"{bucket_name}_pos_abs_delta_iou", delta_iou[bucket_mask].abs())
-
-        if (batch_idx + 1) % 20 == 0:
-            print(f"  已处理 {batch_idx + 1}/{NUM_BATCHES} batches")
-
-    # ========================== 输出报告 ==========================
-    report_lines = []
-    
-    def log_and_print(text):
-        print(text)
-        report_lines.append(text)
-
-    def get_array(key):
-        return np.array(stats.get(key, []), dtype=float)
-
-    def log_iou_block(title, coarse_key, refined_key, delta_key, abs_delta_key):
-        coarse = get_array(coarse_key)
-        refined = get_array(refined_key)
-        delta = get_array(delta_key)
-        abs_delta = get_array(abs_delta_key)
-        log_and_print("\n" + "=" * 60)
-        log_and_print(title)
-        log_and_print("=" * 60)
-        if delta.size == 0:
-            log_and_print("  无样本")
-            return
-        log_and_print(f"  样本数: {delta.size}")
-        log_and_print(f"  coarse IoU:  mean={coarse.mean():.6f}, median={np.median(coarse):.6f}")
-        log_and_print(f"  refined IoU: mean={refined.mean():.6f}, median={np.median(refined):.6f}")
-        log_and_print(
-            f"  ΔIoU:        mean={delta.mean():.6f}, median={np.median(delta):.6f}, "
-            f"p25={np.percentile(delta, 25):.6f}, p75={np.percentile(delta, 75):.6f}"
+        coarse_px = assignment["coarse_px"]
+        residual = assignment["pred_refine"]
+        pred_scores = assignment["pred_scores"].sigmoid().amax(dim=-1)
+        fg_mask = assignment["fg_mask"]
+        predicted_gates = build_predicted_gates(
+            coarse_px,
+            args.ar_threshold,
+            args.short_threshold,
         )
-        log_and_print(f"  |ΔIoU| mean: {abs_delta.mean():.6f}")
-        log_and_print(f"  ΔIoU > 0 比例: {(delta > 0).mean() * 100:.2f}%")
-        log_and_print(f"  ΔIoU < 0 比例: {(delta < 0).mean() * 100:.2f}%")
+        level_ids, level_names = fpn_level_ids(raw["feats"], batch_size, device)
 
-    log_and_print("\n" + "=" * 60)
-    log_and_print("假设 1：cv5 输出（Δw/Δh）是否接近零？")
-    log_and_print("=" * 60)
-    for key in ["dw", "dh"]:
-        if f"{key}_mean" in stats:
-            means = np.array(stats[f"{key}_mean"])
-            stds = np.array(stats[f"{key}_std"])
-            maxs = np.array(stats[f"{key}_absmax"])
-            label = {"dw": "Δw", "dh": "Δh"}[key]
-            log_and_print(f"  {label}: mean={means.mean():.6f}±{means.std():.6f}, "
-                  f"std={stds.mean():.6f}, abs_max={maxs.mean():.6f} (max={maxs.max():.6f})")
+        extend_values(distributions, "all_anchors", "dw", residual[..., 0])
+        extend_values(distributions, "all_anchors", "dh", residual[..., 1])
+        for level_index, level_name in enumerate(level_names):
+            level_mask = level_ids == level_index
+            extend_values(distributions, f"{level_name}_all", "dw", residual[..., 0][level_mask])
+            extend_values(distributions, f"{level_name}_all", "dh", residual[..., 1][level_mask])
 
-    log_and_print(f"\n  判定：")
-    dw_max = np.array(stats.get("dw_absmax", [0])).max()
-    if dw_max < 0.01:
-        log_and_print("✅ 确认 — cv5 输出接近零，Refine Head 未学到有效修正")
-    else:
-        log_and_print(f"❌ 否定 — cv5 输出非零 (abs_max={dw_max:.4f})，问题可能在别处")
+        for gate_name, gate in predicted_gates.items():
+            add_gate_count(gate_counts, "all_anchors", gate_name, gate)
+            for level_index, level_name in enumerate(level_names):
+                add_gate_count(gate_counts, f"{level_name}_all", gate_name, gate, level_ids == level_index)
 
-    log_and_print("\n" + "=" * 60)
-    log_and_print("假设 2：cv5 梯度是否远小于 cv2？")
-    log_and_print("=" * 60)
-    cv2_norms = np.array(stats.get("cv2_grad_norm", [0]))
-    cv5_norms = np.array(stats.get("cv5_grad_norm", [0]))
-    ratios = np.array(stats.get("grad_ratio_cv2_cv5", [0]))
-    log_and_print(f"  cv2 梯度 L2 norm: mean={cv2_norms.mean():.6f}")
-    log_and_print(f"  cv5 梯度 L2 norm: mean={cv5_norms.mean():.6f}")
-    log_and_print(f"  比值 cv2/cv5:     mean={ratios.mean():.2f}x")
+        current_gate = predicted_gates["current"]
+        extend_values(distributions, "current_gate", "dw", residual[..., 0][current_gate])
+        extend_values(distributions, "current_gate", "dh", residual[..., 1][current_gate])
+        extend_values(
+            distributions,
+            "current_gate",
+            "scale_w_alpha1",
+            residual[..., 0][current_gate].clamp(-clamp_value, clamp_value).exp(),
+        )
+        extend_values(
+            distributions,
+            "current_gate",
+            "scale_h_alpha1",
+            residual[..., 1][current_gate].clamp(-clamp_value, clamp_value).exp(),
+        )
+        for threshold in args.conf_thresholds:
+            confidence_mask = pred_scores >= threshold
+            scope = f"confidence>={threshold:g}"
+            add_gate_count(gate_counts, scope, "current", current_gate, confidence_mask)
+            selected = confidence_mask & current_gate
+            extend_values(distributions, scope, "dw", residual[..., 0][selected])
+            extend_values(distributions, scope, "dh", residual[..., 1][selected])
 
-    log_and_print(f"\n  判定：")
-    if ratios.mean() > 10:
-        log_and_print(f"✅ 确认 — cv2 梯度是 cv5 的 {ratios.mean():.1f}x，梯度竞争严重")
-    elif ratios.mean() > 3:
-        log_and_print(f"⚠️ 部分确认 — cv2 梯度是 cv5 的 {ratios.mean():.1f}x")
-    else:
-        log_and_print(f"❌ 否定 — 梯度量级相近 ({ratios.mean():.1f}x)")
+        if fg_mask.any():
+            coarse_fg = coarse_px[fg_mask]
+            residual_fg = residual[fg_mask]
+            target_fg = assignment["target_bboxes"][fg_mask]
+            positive_level_ids = level_ids[fg_mask]
+            gt_gate, gt_short, gt_ar = build_gt_gate(
+                target_fg,
+                args.ar_threshold,
+                args.short_threshold,
+            )
+            predicted_positive_gates = {name: gate[fg_mask] for name, gate in predicted_gates.items()}
+            predicted_current = predicted_positive_gates["current"]
 
-    log_and_print("\n" + "=" * 60)
-    log_and_print("假设 3：Refine 对预测框的实际修正量")
-    log_and_print("=" * 60)
-    for key, label in [("refine_w_diff_mean", "w 修正量(grid)"),
-                       ("refine_h_diff_mean", "h 修正量(grid)")]:
-        if key in stats:
-            vals = np.array(stats[key])
-            log_and_print(f"  {label}: mean={vals.mean():.6f}")
+            add_gate_count(gate_counts, "positive_anchors", "pred_current", predicted_current)
+            add_gate_count(gate_counts, "positive_anchors", "gt_oracle", gt_gate)
+            for level_index, level_name in enumerate(level_names):
+                level_positive = positive_level_ids == level_index
+                add_gate_count(gate_counts, f"{level_name}_positive", "pred_current", predicted_current, level_positive)
+                add_gate_count(gate_counts, f"{level_name}_positive", "gt_oracle", gt_gate, level_positive)
 
-    log_iou_block(
-        "新增诊断 4：正样本上的 coarse IoU vs gated refined IoU",
-        "pos_coarse_iou",
-        "pos_refined_iou",
-        "pos_delta_iou",
-        "pos_abs_delta_iou",
+            confusion["both_on"] += int((predicted_current & gt_gate).sum().item())
+            confusion["pred_only"] += int((predicted_current & ~gt_gate).sum().item())
+            confusion["gt_only"] += int((~predicted_current & gt_gate).sum().item())
+            confusion["both_off"] += int((~predicted_current & ~gt_gate).sum().item())
+
+            extend_values(distributions, "positive_anchors", "dw", residual_fg[:, 0])
+            extend_values(distributions, "positive_anchors", "dh", residual_fg[:, 1])
+            extend_values(distributions, "gt_gated_positive", "dw", residual_fg[:, 0][gt_gate])
+            extend_values(distributions, "gt_gated_positive", "dh", residual_fg[:, 1][gt_gate])
+            extend_values(distributions, "pred_gated_positive", "dw", residual_fg[:, 0][predicted_current])
+            extend_values(distributions, "pred_gated_positive", "dh", residual_fg[:, 1][predicted_current])
+            short_is_width = coarse_fg[:, 2] <= coarse_fg[:, 3]
+            dshort = torch.where(short_is_width, residual_fg[:, 0], residual_fg[:, 1])
+            extend_values(distributions, "positive_anchors", "dshort", dshort)
+            extend_values(distributions, "gt_gated_positive", "dshort", dshort[gt_gate])
+            extend_values(distributions, "pred_gated_positive", "dshort", dshort[predicted_current])
+            extend_values(
+                distributions,
+                "gt_gated_positive",
+                "scale_short_alpha1",
+                dshort[gt_gate].clamp(-clamp_value, clamp_value).exp(),
+            )
+            extend_values(
+                distributions,
+                "pred_gated_positive",
+                "scale_short_alpha1",
+                dshort[predicted_current].clamp(-clamp_value, clamp_value).exp(),
+            )
+
+            coarse_iou = probiou(coarse_fg, target_fg).reshape(-1)
+            sweep_gates = {
+                gate_name: predicted_positive_gates[gate_name]
+                for gate_name in args.gate_modes
+            }
+            sweep_gates["gt-oracle"] = gt_gate
+            for gate_name, gate in sweep_gates.items():
+                for alpha in args.alphas:
+                    refined = apply_refine(coarse_fg, residual_fg, gate, alpha, clamp_value)
+                    refined_iou = probiou(refined, target_fg).reshape(-1)
+                    add_iou_values(iou_store, gate_name, alpha, "all", coarse_iou, refined_iou)
+
+                    if alpha == 1.0 and gate_name in {"current", "gt-oracle"}:
+                        subgroups = {
+                            "gt_gated": gt_gate,
+                            "gt_not_gated": ~gt_gate,
+                            f"short_lt_{args.short_threshold:g}": gt_short < args.short_threshold,
+                            f"short_{args.short_threshold:g}_to_32": (
+                                (gt_short >= args.short_threshold) & (gt_short < 32.0)
+                            ),
+                            "short_ge_32": gt_short >= 32.0,
+                            f"ar_gt_{args.ar_threshold:g}": gt_ar > args.ar_threshold,
+                            f"ar_le_{args.ar_threshold:g}": gt_ar <= args.ar_threshold,
+                        }
+                        for level_index, level_name in enumerate(level_names):
+                            subgroups[level_name] = positive_level_ids == level_index
+                        for subgroup, subgroup_mask in subgroups.items():
+                            add_iou_values(
+                                iou_store,
+                                gate_name,
+                                alpha,
+                                subgroup,
+                                coarse_iou,
+                                refined_iou,
+                                subgroup_mask,
+                            )
+
+        if batch_index < args.gradient_batches:
+            core_model.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                outputs_for_gradient = core_model(batch["img"])
+                loss_vector, loss_items = criterion(outputs_for_gradient, batch)
+                loss_vector.sum().backward()
+            row = {
+                "batch": batch_index,
+                **gradient_norms(core_model, refine_head, loss_vector),
+            }
+            for item_index, item_name in enumerate(("box", "cls", "dfl", "angle", "aux_geo")):
+                if item_index < loss_items.numel():
+                    row[f"{item_name}_loss"] = float(loss_items[item_index].item())
+            gradient_rows.append(row)
+            core_model.zero_grad(set_to_none=True)
+
+        if processed_batches % 10 == 0:
+            print(f"已处理 {processed_batches} batches / {seen_images} images")
+
+    distribution_frame = summarize_distributions(distributions, clamp_value)
+    gate_frame = summarize_gate_counts(gate_counts)
+    iou_frame = summarize_iou(iou_store)
+    gradient_frame = pd.DataFrame(gradient_rows)
+
+    distribution_frame.to_csv(args.output_dir / "refine_distribution.csv", index=False, encoding="utf-8-sig")
+    gate_frame.to_csv(args.output_dir / "refine_gate_stats.csv", index=False, encoding="utf-8-sig")
+    iou_frame.to_csv(args.output_dir / "refine_iou_sweep.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(
+        [
+            {
+                "case": key,
+                "count": value,
+                "ratio": value / max(sum(confusion.values()), 1),
+            }
+            for key, value in confusion.items()
+        ]
+    ).to_csv(args.output_dir / "refine_gate_confusion.csv", index=False, encoding="utf-8-sig")
+    if not gradient_frame.empty:
+        gradient_frame.to_csv(args.output_dir / "refine_gradient_stats.csv", index=False, encoding="utf-8-sig")
+
+    report_path = args.output_dir / "refine_diagnostics.md"
+    write_report(
+        report_path,
+        args,
+        clamp_value,
+        processed_batches,
+        seen_images,
+        gate_frame,
+        distribution_frame,
+        iou_frame,
+        confusion,
+        gradient_frame,
     )
-
-    log_iou_block(
-        "新增诊断 5：细长目标子集（thin positives）IoU",
-        "thin_pos_coarse_iou",
-        "thin_pos_refined_iou",
-        "thin_pos_delta_iou",
-        "thin_pos_abs_delta_iou",
-    )
-
-    log_and_print("\n" + "=" * 60)
-    log_and_print("新增诊断 6：按短边尺度分桶的 IoU 变化")
-    log_and_print("=" * 60)
-    for bucket_name, label in [
-        ("small", f"small (short < {SMALL_SHORT_SIDE_PX:.0f}px)"),
-        ("medium", f"medium ({SMALL_SHORT_SIDE_PX:.0f}px <= short < {MEDIUM_SHORT_SIDE_PX:.0f}px)"),
-        ("large", f"large (short >= {MEDIUM_SHORT_SIDE_PX:.0f}px)"),
-    ]:
-        delta = get_array(f"{bucket_name}_pos_delta_iou")
-        if delta.size == 0:
-            log_and_print(f"  {label}: 无样本")
-            continue
-        coarse = get_array(f"{bucket_name}_pos_coarse_iou")
-        refined = get_array(f"{bucket_name}_pos_refined_iou")
-        log_and_print(
-            f"  {label}: n={delta.size}, coarse={coarse.mean():.6f}, "
-            f"refined={refined.mean():.6f}, ΔIoU={delta.mean():.6f}, "
-            f"ΔIoU>0={(delta > 0).mean() * 100:.2f}%"
-        )
-
-    log_and_print("\n" + "=" * 60)
-    log_and_print("总结")
-    log_and_print("=" * 60)
-    log_and_print("当前版本应结合完全解耦训练逻辑解读：coarse 负责主任务，refine 只负责 gated residual 宽高修正")
-    log_and_print("重点关注 thin/small 是否保留正收益，以及 medium 负迁移是否明显收敛")
-    pos_delta = get_array("pos_delta_iou")
-    thin_delta = get_array("thin_pos_delta_iou")
-    if pos_delta.size:
-        log_and_print(
-            f"正样本 ΔIoU 均值={pos_delta.mean():.6f}，"
-            f"改进比例={(pos_delta > 0).mean() * 100:.2f}%"
-        )
-    if thin_delta.size:
-        log_and_print(
-            f"细长目标 ΔIoU 均值={thin_delta.mean():.6f}，"
-            f"改进比例={(thin_delta > 0).mean() * 100:.2f}%"
-        )
-    
-    # 写入 md 文件
-    md_path = REPORT_PATH
-    try:
-        os.makedirs(os.path.dirname(md_path), exist_ok=True)
-        with open(md_path, "w", encoding="utf-8") as f:
-            f.write("# Refine Head 诊断报告\n\n```text\n")
-            f.write("\n".join(report_lines))
-            f.write("\n```\n")
-        print(f"\n[*] 诊断报告已保存到 {md_path}")
-    except Exception as e:
-        print(f"\n[!] 保存 md 报告失败: {e}")
+    print("=" * 80)
+    print(f"诊断完成：{args.output_dir}")
+    print(f"人工判读入口：{report_path}")
 
 
 if __name__ == "__main__":
-    collect_diagnostics()
+    main()
