@@ -7,6 +7,7 @@ import torch
 
 from train_yolo11_obb_refine import (
     configure_refine_only_training,
+    get_refine_experiment_config,
     keep_frozen_batch_norm_eval,
     load_ca_weights_into_refine_v2,
 )
@@ -37,9 +38,10 @@ def test_refine_v2_zero_identity_and_local_gradient():
     assert torch.equal(refined, boxes)
 
 
-def test_refine_v2_short_long_mapping():
+@pytest.mark.parametrize("experiment", ["direct_short_long", "conservative_short_long"])
+def test_refine_v2_short_long_mapping(experiment):
     """Short/long residuals map back to the correct width/height axes."""
-    head = build_head("direct_short_long")
+    head = build_head(experiment)
     boxes = torch.tensor([[[0.0, 0.0], [0.0, 0.0], [2.0, 8.0], [8.0, 2.0]]])
     delta = torch.tensor([[[0.05, 0.05], [-0.02, -0.02]]])
     refined = head._apply_refine_delta(boxes, delta)
@@ -48,6 +50,22 @@ def test_refine_v2_short_long_mapping():
     assert torch.allclose(refined[:, 3, 0], boxes[:, 3, 0] * torch.exp(torch.tensor(-0.02)))
     assert torch.allclose(refined[:, 2, 1], boxes[:, 2, 1] * torch.exp(torch.tensor(-0.02)))
     assert torch.allclose(refined[:, 3, 1], boxes[:, 3, 1] * torch.exp(torch.tensor(0.05)))
+
+
+def test_refine_v21_profile_is_conservative_without_changing_legacy_defaults():
+    """V2.1 selects the reduced range while all prior profiles remain reproducible."""
+    v21 = get_refine_experiment_config("conservative_short_long")
+    assert v21 == {"run_version": "v21", "refine_delta_max": 0.05, "refine_target_limit": 0.04}
+
+    for experiment in ("bounded_wh", "direct_short_long", "aligned_gate", "aligned_identity"):
+        legacy_v2 = get_refine_experiment_config(experiment)
+        assert legacy_v2["run_version"] == "v2"
+        assert legacy_v2["refine_delta_max"] == 0.1
+        assert legacy_v2["refine_target_limit"] == 0.095
+
+    # Callers receive a copy, so one run cannot mutate the global profile table.
+    v21["refine_delta_max"] = 1.0
+    assert get_refine_experiment_config("conservative_short_long")["refine_delta_max"] == 0.05
 
 
 def test_refine_v2_profile_validation():

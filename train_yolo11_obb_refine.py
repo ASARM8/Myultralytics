@@ -4,6 +4,7 @@ YOLOv11-OBB + Refine Head 训练脚本
 使用方法:
     直接运行: python train_yolo11_obb_refine.py
     V2仅训练Refine: python train_yolo11_obb_refine.py --mode refine_only --base-weights <ca.pt>
+    V2.1保守精修: 在上一命令后增加 --refine-experiment conservative_short_long
     修改下方 CONFIG 字典中的参数即可自定义训练配置
 
 关键设计：
@@ -38,7 +39,15 @@ PRETRAIN_WEIGHTS = None
 MODEL_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine.yaml"
 MODEL_V2_YAML = "ultralytics/cfg/models/11/yolo11l-obb-ca-refine-v2.yaml"
 RUN_NAME = "yolo11_obb_640_811_ca_refine_scratch"
-REFINE_EXPERIMENTS = ("bounded_wh", "direct_short_long", "aligned_gate", "aligned_identity")
+REFINE_EXPERIMENT_CONFIGS = {
+    "bounded_wh": {"run_version": "v2", "refine_delta_max": 0.1, "refine_target_limit": 0.095},
+    "direct_short_long": {"run_version": "v2", "refine_delta_max": 0.1, "refine_target_limit": 0.095},
+    "aligned_gate": {"run_version": "v2", "refine_delta_max": 0.1, "refine_target_limit": 0.095},
+    "aligned_identity": {"run_version": "v2", "refine_delta_max": 0.1, "refine_target_limit": 0.095},
+    # V2.1 keeps the R2 topology/loss/gate and only reduces the trainable residual range.
+    "conservative_short_long": {"run_version": "v21", "refine_delta_max": 0.05, "refine_target_limit": 0.04},
+}
+REFINE_EXPERIMENTS = tuple(REFINE_EXPERIMENT_CONFIGS)
 
 VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
 RESUME_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/epoch290.pt"
@@ -122,6 +131,14 @@ CONFIG = {
     "seed": 0,
     "verbose": True,
 }
+
+
+def get_refine_experiment_config(experiment: str) -> dict[str, str | float]:
+    """Return an isolated profile configuration without changing legacy V2 defaults."""
+    try:
+        return dict(REFINE_EXPERIMENT_CONFIGS[experiment])
+    except KeyError as error:
+        raise ValueError(f"Unknown Refine experiment {experiment!r}; expected one of {REFINE_EXPERIMENTS}") from error
 
 
 def move_log_to_save_dir(log_file, save_dir):
@@ -699,8 +716,10 @@ if __name__ == "__main__":
     if cli_args.mode == "val_ab":
         run_val_ab(cli_args)
     elif cli_args.mode == "refine_only":
+        experiment_config = get_refine_experiment_config(cli_args.refine_experiment)
         run_name = cli_args.name or (
-            f"yolo11_obb_640_811_ca_refine_v2_{cli_args.refine_experiment}_seed{cli_args.seed}"
+            f"yolo11_obb_640_811_ca_refine_{experiment_config['run_version']}_"
+            f"{cli_args.refine_experiment}_seed{cli_args.seed}"
         )
         main(
             train_overrides={
@@ -720,8 +739,8 @@ if __name__ == "__main__":
                 "seed": cli_args.seed,
                 "pretrained": False,
                 "refine_experiment": cli_args.refine_experiment,
-                "refine_delta_max": 0.1,
-                "refine_target_limit": 0.095,
+                "refine_delta_max": experiment_config["refine_delta_max"],
+                "refine_target_limit": experiment_config["refine_target_limit"],
                 "refine_smooth_l1_beta": 0.02,
                 "refine_identity_gain": 0.05,
                 "aux_geo": 0.2,

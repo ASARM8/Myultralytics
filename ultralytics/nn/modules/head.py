@@ -673,6 +673,7 @@ class OBBRefineV2(OBBRefine):
         "direct_short_long",
         "aligned_gate",
         "aligned_identity",
+        "conservative_short_long",
     }
 
     def __init__(

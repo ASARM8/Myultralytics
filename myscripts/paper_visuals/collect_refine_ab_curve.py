@@ -120,6 +120,27 @@ def configure_refine_variant(model, variant: EvalVariant) -> int:
     return changed
 
 
+def read_refine_metadata(model) -> dict:
+    """Read persisted Refine semantics so diagnostic CSVs cannot hide a profile mismatch."""
+    records = []
+    for module in model.model.modules():
+        if not hasattr(module, "disable_refine_inference"):
+            continue
+        records.append(
+            {
+                "refine_version": int(getattr(module, "refine_version", 1)),
+                "refine_experiment": str(getattr(module, "refine_experiment", "legacy")),
+                "refine_delta_max": getattr(module, "refine_delta_max", None),
+                "refine_target_limit": getattr(module, "refine_target_limit", None),
+            }
+        )
+    if not records:
+        raise RuntimeError("权重中未找到 Refine Head，无法读取实验配置")
+    if any(record != records[0] for record in records[1:]):
+        raise RuntimeError(f"同一模型中的 Refine Head 配置不一致: {records}")
+    return records[0]
+
+
 def parse_float_list(value: str) -> list[float]:
     """Parse a comma-separated list of finite alpha values in [0, 1]."""
     values = [float(item.strip()) for item in value.split(",") if item.strip()]
@@ -234,6 +255,7 @@ def metrics_row(
     split: str,
     profile: str,
     variant: EvalVariant,
+    refine_metadata: dict,
     fresh_load: bool,
     results,
 ) -> dict:
@@ -259,6 +281,7 @@ def metrics_row(
         "variant": variant.key,
         "refine_alpha": variant.alpha,
         "refine_gate": variant.gate_mode,
+        **refine_metadata,
         "fresh_load": fresh_load,
         "precision": float(values["metrics/precision(B)"]),
         "recall": float(values["metrics/recall(B)"]),
@@ -382,6 +405,15 @@ def main():
             if shared_model is None:
                 verify_checkpoint_epoch(model, epoch, path)
             configure_refine_variant(model, variant)
+            refine_metadata = read_refine_metadata(model)
+            if not epoch_rows:
+                print(
+                    "  Refine config: "
+                    f"version={refine_metadata['refine_version']}, "
+                    f"experiment={refine_metadata['refine_experiment']}, "
+                    f"delta_max={refine_metadata['refine_delta_max']}, "
+                    f"target_limit={refine_metadata['refine_target_limit']}"
+                )
             results = model.val(name=f"epoch{epoch:04d}_{variant.key}", exist_ok=True, **common)
             row = metrics_row(
                 epoch=epoch,
@@ -394,6 +426,7 @@ def main():
                 split=args.split,
                 profile=args.profile,
                 variant=variant,
+                refine_metadata=refine_metadata,
                 fresh_load=not args.shared_model,
                 results=results,
             )

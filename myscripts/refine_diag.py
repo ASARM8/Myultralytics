@@ -549,6 +549,7 @@ def write_report(
     saturation_threshold: float,
     refine_version: str,
     experiment: str,
+    target_limit: float | None,
     processed_batches: int,
     seen_images: int,
     gate_frame: pd.DataFrame,
@@ -571,6 +572,7 @@ def write_report(
         f"- 门控阈值：`AR>{args.ar_threshold}` 或 `short<{args.short_threshold}px`",
         f"- Refine版本 / 实验：`{refine_version}` / `{experiment}`",
         f"- residual limit / 饱和判定：`{clamp_value}` / `|delta|>={saturation_threshold}`",
+        f"- direct target limit：`{target_limit if target_limit is not None else 'N/A'}`",
         f"- alpha：`{args.alphas}`",
         "",
         "本报告中的 IoU 是匹配正样本上的 ProbIoU 机制诊断，不等价于完整验证集 mAP；完整指标应由 "
@@ -778,6 +780,8 @@ def main() -> None:
     if is_v2 and args.clamp is not None:
         refine_head.refine_delta_max = clamp_value
     experiment = getattr(refine_head, "refine_experiment", "legacy")
+    target_limit = float(getattr(refine_head, "refine_target_limit", 0.0)) if is_v2 else None
+    refine_version_label = "v2.1" if experiment == "conservative_short_long" else ("v2" if is_v2 else "legacy")
     channel_names = ("dw", "dh") if not is_v2 or experiment == "bounded_wh" else ("dshort", "dlong")
     raw_channel_names = tuple(f"raw_{name}" for name in channel_names)
     saturation_threshold = 0.95 * clamp_value if is_v2 else clamp_value
@@ -803,7 +807,7 @@ def main() -> None:
     print(f"data={args.data}, split={args.split}, imgsz={args.imgsz}")
     print(
         f"AR>{args.ar_threshold}, short<{args.short_threshold}px, residual_limit={clamp_value}, "
-        f"version={'v2' if is_v2 else 'legacy'}, experiment={experiment}"
+        f"target_limit={target_limit}, version={refine_version_label}, experiment={experiment}"
     )
     print("=" * 80)
 
@@ -1056,8 +1060,9 @@ def main() -> None:
         args,
         clamp_value,
         saturation_threshold,
-        "v2" if is_v2 else "legacy",
+        refine_version_label,
         experiment,
+        target_limit,
         processed_batches,
         seen_images,
         gate_frame,
