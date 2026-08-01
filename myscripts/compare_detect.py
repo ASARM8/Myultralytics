@@ -38,7 +38,7 @@ CONFIG = {
     "label_a": "Baseline (reg_max=16)",
 
     # 模型 B（例如 CA 版 reg_max=32 + Coverage-Aware）
-    "model_b": "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt",
+    "model_b": "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt",
     "label_b": "CA (reg_max=32)",
 
     # ---------- 数据配置 ----------

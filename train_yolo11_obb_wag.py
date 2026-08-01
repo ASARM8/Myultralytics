@@ -93,7 +93,7 @@ class Logger(object):
 CONFIG = {
     # ---------- 模型配置 ----------
     # CA 预训练权重 (reg_max=32 + Coverage-Aware TAL)
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt",
+    "model": "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt",
 
     # ---------- 数据集配置 ----------
     "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",

@@ -262,6 +262,15 @@ def write_env(path: Path, result: dict[str, Any], weights_var: str = "SELECTED_V
     path.write_text(content, encoding="utf-8")
 
 
+def remove_stale_output(path: Path | None) -> None:
+    """Remove a previous selection artifact so a failed rerun cannot reuse stale state."""
+    if path is None or not path.exists():
+        return
+    if not path.is_file():
+        raise ValueError(f"输出路径已存在但不是文件: {path}")
+    path.unlink()
+
+
 def print_summary(result: dict[str, Any]) -> None:
     """Print the decision and enough evidence for terminal review."""
     selected = result["selected"]
@@ -300,6 +309,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    try:
+        remove_stale_output(args.output_json)
+        remove_stale_output(args.output_env)
+    except ValueError as error:
+        parser.exit(2, f"Refine checkpoint selection: FAIL\n{error}\n")
+
     thresholds = SelectionThresholds(
         min_map50_95=args.min_map50_95,
         min_ap75=args.min_ap75,
@@ -316,7 +331,10 @@ def main() -> None:
             expect_target_limit=args.expect_target_limit,
         )
     except (FileNotFoundError, ValueError) as error:
-        parser.exit(2, f"Refine checkpoint selection: FAIL\n{error}\n")
+        suffix = ""
+        if args.output_env is not None:
+            suffix = f"\n未生成 {args.output_env}；请停止后续 identity/机制诊断，或显式指定诊断权重。"
+        parser.exit(2, f"Refine checkpoint selection: FAIL\n{error}{suffix}\n")
 
     if args.output_json is not None:
         write_json(args.output_json, result)

@@ -2,7 +2,7 @@
 
 import pytest
 
-from myscripts.select_refine_checkpoint import SelectionThresholds, analyze_curve, write_env
+from myscripts.select_refine_checkpoint import SelectionThresholds, analyze_curve, remove_stale_output, write_env
 
 
 def make_pair(
@@ -132,3 +132,17 @@ def test_output_env_rejects_shell_code_as_variable_name(tmp_path):
     result = analyze(make_pair(1, d_map=0.0025, d_ap75=0.001, d_ap90=0.0, d_ap95=0.0))
     with pytest.raises(ValueError, match="shell"):
         write_env(tmp_path / "selected.env", result, "SELECTED;touch_x")
+
+
+def test_remove_stale_output_prevents_failed_rerun_from_reusing_selection(tmp_path):
+    """A failed selection must not leave a previously successful environment file available."""
+    output = tmp_path / "selected.env"
+    output.write_text("SELECTED_V23=/stale.pt\n", encoding="utf-8")
+    remove_stale_output(output)
+    assert not output.exists()
+
+
+def test_remove_stale_output_rejects_directory(tmp_path):
+    """Misconfigured output paths fail without deleting directories."""
+    with pytest.raises(ValueError, match="不是文件"):
+        remove_stale_output(tmp_path)

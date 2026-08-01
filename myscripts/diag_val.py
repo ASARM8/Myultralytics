@@ -34,7 +34,7 @@ from ultralytics.utils.metrics import batch_probiou
 # ========================== 配置 ==========================
 CONFIG = {
     # ---------- 模型 ----------
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb-ca/weights/best.pt",
+    "model": "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt",
     "model_label": "CA (reg_max=32)",  # 报告中显示的模型名
 
     # ---------- 数据集 ----------

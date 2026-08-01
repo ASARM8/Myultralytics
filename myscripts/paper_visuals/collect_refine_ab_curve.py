@@ -33,6 +33,8 @@ def parse_weight_spec(value: str) -> tuple[int, Path]:
     if "=" not in value:
         raise ValueError(f"--weights 必须使用 EPOCH=PATH: {value}")
     epoch, path = value.split("=", 1)
+    if not path.strip():
+        raise ValueError("--weights 的 checkpoint 路径不能为空；请先确认选择步骤已成功生成环境变量")
     return int(epoch), Path(path)
 
 
@@ -359,7 +361,10 @@ def main():
     if args.identity_tolerance < 0:
         parser.error("--identity-tolerance 不能为负数")
 
-    checkpoints = [parse_weight_spec(value) for value in args.weights]
+    try:
+        checkpoints = [parse_weight_spec(value) for value in args.weights]
+    except ValueError as error:
+        parser.error(str(error))
     if args.weights_glob:
         checkpoints.extend(discover_weights(args.weights_glob, args.epoch_regex, args.glob_epoch_offset))
     if not checkpoints:
@@ -380,8 +385,8 @@ def main():
         print(f"[提示] full profile 每个 checkpoint 将运行 {len(variants)} 次完整验证，建议只传一个代表性权重。")
 
     for epoch, path in checkpoints:
-        if not path.exists():
-            raise FileNotFoundError(path)
+        if not path.is_file():
+            parser.error(f"checkpoint 不是有效文件: {path}")
         common = {
             "data": args.data,
             "imgsz": args.imgsz,

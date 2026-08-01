@@ -937,8 +937,11 @@ def main() -> None:
         parser.error("--max-batches 和 --gradient-batches 不能为负数")
     if args.clamp is not None and args.clamp <= 0:
         parser.error("--clamp 必须大于 0")
-    if not args.weights.exists():
-        raise FileNotFoundError(args.weights)
+    if not args.weights.is_file():
+        parser.error(
+            f"--weights 不是有效 checkpoint 文件: {args.weights}；"
+            "若前一步 checkpoint 选择失败，请勿继续运行 identity 或机制诊断"
+        )
     for optional_path in (args.training_diag, args.training_results):
         if optional_path is not None and not optional_path.exists():
             raise FileNotFoundError(optional_path)
