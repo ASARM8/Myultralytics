@@ -23,6 +23,14 @@ from pathlib import Path
 from typing import Any
 
 GATE_MODES = ("current", "ar-only", "short-only", "and", "all", "none")
+REFINE_RUNTIME_FIELDS = (
+    "refine_experiment",
+    "refine_delta_max",
+    "refine_target_limit",
+    "refine_smooth_l1_beta",
+    "refine_identity_gain",
+    "refine_feature_detach",
+)
 
 
 def parse_float_list(value: str, *, minimum: float | None = None, maximum: float | None = None) -> list[float]:
@@ -73,14 +81,41 @@ def find_refine_head(core_model: torch.nn.Module) -> torch.nn.Module:
     return head
 
 
+def read_refine_runtime_args(refine_head: torch.nn.Module) -> dict[str, Any]:
+    """Capture checkpoint-persisted Refine attributes before model args are normalized."""
+    missing = [name for name in REFINE_RUNTIME_FIELDS if not hasattr(refine_head, name)]
+    if missing:
+        raise RuntimeError(f"Refine checkpoint 缺少运行时属性: {missing}")
+    return {name: getattr(refine_head, name) for name in REFINE_RUNTIME_FIELDS}
+
+
+def assert_refine_runtime_args(refine_head: torch.nn.Module, expected: dict[str, Any]) -> None:
+    """Fail if criterion initialization silently replaces checkpoint Refine semantics."""
+    mismatches = []
+    for name in REFINE_RUNTIME_FIELDS:
+        actual = getattr(refine_head, name, None)
+        wanted = expected[name]
+        equal = (
+            math.isclose(float(actual), float(wanted), rel_tol=0.0, abs_tol=1e-12)
+            if isinstance(wanted, float)
+            else actual == wanted
+        )
+        if not equal:
+            mismatches.append(f"{name}: checkpoint={wanted!r}, runtime={actual!r}")
+    if mismatches:
+        raise RuntimeError("Refine 运行时参数被覆盖:\n  " + "\n  ".join(mismatches))
+
+
 def configure_model_args(
     core_model: torch.nn.Module,
     args: argparse.Namespace,
+    refine_runtime_args: dict[str, Any],
 ) -> Any:
-    """Normalize checkpoint args and inject the current diagnostic settings."""
+    """Normalize model args while restoring custom Refine values stripped by checkpoint loading."""
     stored_args = getattr(core_model, "args", {})
     overrides = dict(stored_args) if isinstance(stored_args, dict) else vars(stored_args)
     overrides = {key: value for key, value in overrides.items() if key in DEFAULT_CFG_KEYS}
+    overrides.update(refine_runtime_args)
     overrides.update(
         {
             "task": "obb",
@@ -262,6 +297,20 @@ def apply_refine(
     return refined
 
 
+def apply_short_long_target(
+    coarse_bboxes: torch.Tensor,
+    target_delta: torch.Tensor,
+    gate: torch.Tensor,
+    refine_head: torch.nn.Module,
+) -> torch.Tensor:
+    """Apply clipped direct targets to quantify the attainable scale-only oracle."""
+    refined = coarse_bboxes.clone()
+    delta_wh = residual_to_wh_delta(coarse_bboxes, target_delta, refine_head)
+    delta_wh = delta_wh * gate.to(delta_wh.dtype).unsqueeze(-1)
+    refined[:, 2:4] *= torch.exp(delta_wh)
+    return refined
+
+
 def effective_residual(
     residual: torch.Tensor,
     refine_head: torch.nn.Module,
@@ -301,6 +350,24 @@ def extend_values(
     array = array[np.isfinite(array)]
     if array.size:
         store[(scope, variable)].append(array)
+
+
+def extend_alignment(
+    store: dict[tuple[str, str], dict[str, list[np.ndarray]]],
+    scope: str,
+    channel: str,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> None:
+    """Append paired effective residual predictions and direct targets."""
+    if prediction.numel() == 0:
+        return
+    pred_array = prediction.detach().float().reshape(-1).cpu().numpy()
+    target_array = target.detach().float().reshape(-1).cpu().numpy()
+    finite = np.isfinite(pred_array) & np.isfinite(target_array)
+    if finite.any():
+        store[(scope, channel)]["prediction"].append(pred_array[finite])
+        store[(scope, channel)]["target"].append(target_array[finite])
 
 
 def add_gate_count(
@@ -353,11 +420,14 @@ def summarize_distributions(
     store: dict[tuple[str, str], list[np.ndarray]],
     saturation_threshold: float,
     residual_variables: set[str],
+    boundary_thresholds: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """Convert raw distribution chunks into quantile rows."""
+    boundary_thresholds = boundary_thresholds or {}
     rows = []
     for (scope, variable), chunks in sorted(store.items()):
         values = np.concatenate(chunks)
+        boundary = saturation_threshold if variable in residual_variables else boundary_thresholds.get(variable)
         rows.append(
             {
                 "scope": scope,
@@ -373,10 +443,10 @@ def summarize_distributions(
                 "p99": float(np.percentile(values, 99)),
                 "max": float(values.max()),
                 "saturation_rate": (
-                    float((np.abs(values) >= saturation_threshold).mean())
-                    if variable in residual_variables
-                    else np.nan
+                    float((np.abs(values) >= boundary).mean()) if boundary is not None else np.nan
                 ),
+                "lower_boundary_rate": float((values <= -boundary).mean()) if boundary is not None else np.nan,
+                "upper_boundary_rate": float((values >= boundary).mean()) if boundary is not None else np.nan,
             }
         )
     return pd.DataFrame(
@@ -395,6 +465,54 @@ def summarize_distributions(
             "p99",
             "max",
             "saturation_rate",
+            "lower_boundary_rate",
+            "upper_boundary_rate",
+        ],
+    )
+
+
+def summarize_alignment(
+    store: dict[tuple[str, str], dict[str, list[np.ndarray]]],
+) -> pd.DataFrame:
+    """Measure whether effective residuals track instance-level direct targets."""
+    rows = []
+    for (scope, channel), chunks in sorted(store.items()):
+        prediction = np.concatenate(chunks["prediction"])
+        target = np.concatenate(chunks["target"])
+        pred_std = float(prediction.std())
+        target_std = float(target.std())
+        pearson = float(np.corrcoef(prediction, target)[0, 1]) if pred_std > 0 and target_std > 0 else np.nan
+        rows.append(
+            {
+                "scope": scope,
+                "channel": channel,
+                "n": int(target.size),
+                "prediction_mean": float(prediction.mean()),
+                "prediction_std": pred_std,
+                "target_mean": float(target.mean()),
+                "target_std": target_std,
+                "pearson_r": pearson,
+                "direction_agreement": float((np.sign(prediction) == np.sign(target)).mean()),
+                "mae": float(np.abs(prediction - target).mean()),
+                "zero_baseline_mae": float(np.abs(target).mean()),
+                "mean_baseline_mae": float(np.abs(target - target.mean()).mean()),
+            }
+        )
+    return pd.DataFrame(
+        rows,
+        columns=[
+            "scope",
+            "channel",
+            "n",
+            "prediction_mean",
+            "prediction_std",
+            "target_mean",
+            "target_std",
+            "pearson_r",
+            "direction_agreement",
+            "mae",
+            "zero_baseline_mae",
+            "mean_baseline_mae",
         ],
     )
 
@@ -554,6 +672,7 @@ def write_report(
     seen_images: int,
     gate_frame: pd.DataFrame,
     distribution_frame: pd.DataFrame,
+    alignment_frame: pd.DataFrame,
     iou_frame: pd.DataFrame,
     confusion: dict[str, int],
     gradient_frame: pd.DataFrame,
@@ -641,6 +760,24 @@ def write_report(
         )
     )
 
+    lines.extend(["", "## 裁剪目标的 scale-only oracle", ""])
+    target_oracle = iou_frame[(iou_frame["gate"] == "target-oracle") & (iou_frame["subset"] == "all")]
+    lines.append(
+        markdown_table(
+            target_oracle,
+            [
+                "gate",
+                "alpha",
+                "n",
+                "coarse_iou_mean",
+                "refined_iou_mean",
+                "delta_iou_mean",
+                "improved_ratio",
+                "worsened_ratio",
+            ],
+        )
+    )
+
     lines.extend(["", "## 残差分布重点项", ""])
     selected_distribution = distribution_frame[
         distribution_frame["scope"].isin(
@@ -650,9 +787,67 @@ def write_report(
     lines.append(
         markdown_table(
             selected_distribution,
-            ["scope", "variable", "n", "mean", "std", "p05", "p50", "p95", "p99", "saturation_rate"],
+            [
+                "scope",
+                "variable",
+                "n",
+                "mean",
+                "std",
+                "p05",
+                "p50",
+                "p95",
+                "p99",
+                "saturation_rate",
+                "lower_boundary_rate",
+                "upper_boundary_rate",
+            ],
         )
     )
+
+    target_distribution = distribution_frame[
+        distribution_frame["variable"].astype(str).str.startswith("target_")
+    ]
+    if not target_distribution.empty:
+        lines.extend(["", "## 短边/长边直接监督目标", ""])
+        lines.append(
+            markdown_table(
+                target_distribution,
+                [
+                    "scope",
+                    "variable",
+                    "n",
+                    "mean",
+                    "std",
+                    "p05",
+                    "p50",
+                    "p95",
+                    "saturation_rate",
+                    "lower_boundary_rate",
+                    "upper_boundary_rate",
+                ],
+            )
+        )
+
+    if not alignment_frame.empty:
+        lines.extend(["", "## 预测残差与直接监督目标的一致性", ""])
+        lines.append(
+            markdown_table(
+                alignment_frame,
+                [
+                    "scope",
+                    "channel",
+                    "n",
+                    "prediction_mean",
+                    "prediction_std",
+                    "target_mean",
+                    "target_std",
+                    "pearson_r",
+                    "direction_agreement",
+                    "mae",
+                    "zero_baseline_mae",
+                ],
+            )
+        )
 
     if not gradient_frame.empty:
         lines.extend(["", "## 梯度裁剪耦合", ""])
@@ -684,10 +879,12 @@ def write_report(
             "6. `pred_only` 比例高：推理在大量训练期未监督位置启用了 Refine，应加入 identity 约束或统一门控。",
             (
                 "7. `saturation_rate` 应低于 5%；V2 按 `|delta|>=0.95*delta_max` 判定平滑边界饱和。"
-                if refine_version == "v2"
+                if refine_version != "legacy"
                 else "7. legacy按 `|raw_delta|>=clamp` 判定硬截断饱和。"
             ),
-            "8. `global_clip_scale` 明显小于 `base_only_clip_scale`：cv5 通过全模型梯度裁剪间接影响 coarse 分支。",
+            "8. target 边界率高：直接监督目标被大量裁剪，需先检查目标分布而不是继续缩小输出范围。",
+            "9. 预测标准差接近 0、相关系数低或 MAE 不优于零基线：分支退化为常数修正。",
+            "10. `global_clip_scale` 明显小于 `base_only_clip_scale`：cv5 通过全模型梯度裁剪间接影响 coarse 分支。",
         ]
     )
     append_training_log_summary(lines, args.training_diag, args.training_results)
@@ -766,13 +963,18 @@ def main() -> None:
     device = select_device(args.device)
     yolo = YOLO(str(args.weights))
     core_model = yolo.model
-    cfg = configure_model_args(core_model, args)
     core_model.to(device).float().eval()
     for parameter in core_model.parameters():
         parameter.requires_grad_(True)
 
     refine_head = find_refine_head(core_model)
     is_v2 = getattr(refine_head, "refine_version", 1) == 2
+    checkpoint_runtime_args = read_refine_runtime_args(refine_head) if is_v2 else {}
+    cfg = configure_model_args(core_model, args, checkpoint_runtime_args)
+    criterion = core_model.init_criterion()
+    if is_v2:
+        assert_refine_runtime_args(refine_head, checkpoint_runtime_args)
+
     default_limit = getattr(refine_head, "refine_delta_max", None) if is_v2 else None
     if default_limit is None:
         default_limit = getattr(refine_head, "refine_clamp", 1.0)
@@ -781,17 +983,35 @@ def main() -> None:
         refine_head.refine_delta_max = clamp_value
     experiment = getattr(refine_head, "refine_experiment", "legacy")
     target_limit = float(getattr(refine_head, "refine_target_limit", 0.0)) if is_v2 else None
-    refine_version_label = "v2.1" if experiment == "conservative_short_long" else ("v2" if is_v2 else "legacy")
+    refine_version_label = (
+        "v2.2"
+        if experiment == "stable_raw_short_long"
+        else "v2.1"
+        if experiment == "conservative_short_long"
+        else "v2"
+        if is_v2
+        else "legacy"
+    )
     channel_names = ("dw", "dh") if not is_v2 or experiment == "bounded_wh" else ("dshort", "dlong")
     raw_channel_names = tuple(f"raw_{name}" for name in channel_names)
     saturation_threshold = 0.95 * clamp_value if is_v2 else clamp_value
     residual_variables = set(channel_names) | {"dshort"}
-    criterion = core_model.init_criterion()
+    boundary_thresholds = (
+        {
+            "target_dshort": target_limit * (1.0 - 1e-6),
+            "target_dlong": target_limit * (1.0 - 1e-6),
+        }
+        if target_limit is not None and target_limit > 0
+        else {}
+    )
     data_dict = check_det_dataset(args.data)
     stride = max(int(core_model.stride.max().item()), 32)
     loader = build_split_loader(cfg, data_dict, args.split, args.batch, args.workers, stride)
 
     distributions: dict[tuple[str, str], list[np.ndarray]] = defaultdict(list)
+    alignments: dict[tuple[str, str], dict[str, list[np.ndarray]]] = defaultdict(
+        lambda: {"prediction": [], "target": []}
+    )
     gate_counts: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: {"active": 0, "total": 0})
     iou_store: dict[tuple[str, float, str], dict[str, list[np.ndarray]]] = defaultdict(
         lambda: {"coarse": [], "refined": []}
@@ -905,6 +1125,58 @@ def main() -> None:
             predicted_positive_gates = {name: gate[fg_mask] for name, gate in predicted_gates.items()}
             predicted_current = predicted_positive_gates["current"]
 
+            direct_target_delta = None
+            if is_v2 and experiment != "bounded_wh":
+                coarse_short = coarse_fg[:, 2:4].amin(dim=-1)
+                coarse_long = coarse_fg[:, 2:4].amax(dim=-1)
+                target_short = target_fg[:, 2:4].amin(dim=-1)
+                target_long = target_fg[:, 2:4].amax(dim=-1)
+                eps = 1e-6
+                direct_target_raw = torch.stack(
+                    (
+                        torch.log((target_short + eps) / (coarse_short + eps)),
+                        torch.log((target_long + eps) / (coarse_long + eps)),
+                    ),
+                    dim=-1,
+                )
+                direct_target_delta = direct_target_raw.clamp(-target_limit, target_limit)
+                target_scopes = {
+                    "positive_anchors": torch.ones_like(gt_gate),
+                    "gt_gated_positive": gt_gate,
+                    "pred_gated_positive": predicted_current,
+                }
+                for scope, scope_mask in target_scopes.items():
+                    for channel_index, channel_name in enumerate(("dshort", "dlong")):
+                        extend_values(
+                            distributions,
+                            scope,
+                            f"target_raw_{channel_name}",
+                            direct_target_raw[:, channel_index][scope_mask],
+                        )
+                        extend_values(
+                            distributions,
+                            scope,
+                            f"target_{channel_name}",
+                            direct_target_delta[:, channel_index][scope_mask],
+                        )
+                        extend_alignment(
+                            alignments,
+                            scope,
+                            channel_name,
+                            residual_fg[:, channel_index][scope_mask],
+                            direct_target_delta[:, channel_index][scope_mask],
+                        )
+                for level_index, level_name in enumerate(level_names):
+                    level_gt_gated = (positive_level_ids == level_index) & gt_gate
+                    for channel_index, channel_name in enumerate(("dshort", "dlong")):
+                        extend_alignment(
+                            alignments,
+                            f"{level_name}_gt_gated",
+                            channel_name,
+                            residual_fg[:, channel_index][level_gt_gated],
+                            direct_target_delta[:, channel_index][level_gt_gated],
+                        )
+
             add_gate_count(gate_counts, "positive_anchors", "pred_current", predicted_current)
             add_gate_count(gate_counts, "positive_anchors", "gt_oracle", gt_gate)
             for level_index, level_name in enumerate(level_names):
@@ -967,6 +1239,22 @@ def main() -> None:
             )
 
             coarse_iou = probiou(coarse_fg, target_fg).reshape(-1)
+            if direct_target_delta is not None:
+                target_oracle_boxes = apply_short_long_target(
+                    coarse_fg,
+                    direct_target_delta,
+                    gt_gate,
+                    refine_head,
+                )
+                target_oracle_iou = probiou(target_oracle_boxes, target_fg).reshape(-1)
+                add_iou_values(
+                    iou_store,
+                    "target-oracle",
+                    1.0,
+                    "all",
+                    coarse_iou,
+                    target_oracle_iou,
+                )
             sweep_gates = {
                 gate_name: predicted_positive_gates[gate_name]
                 for gate_name in args.gate_modes
@@ -1033,12 +1321,16 @@ def main() -> None:
         distributions,
         saturation_threshold,
         residual_variables,
+        boundary_thresholds,
     )
+    alignment_frame = summarize_alignment(alignments)
     gate_frame = summarize_gate_counts(gate_counts)
     iou_frame = summarize_iou(iou_store)
     gradient_frame = pd.DataFrame(gradient_rows)
 
     distribution_frame.to_csv(args.output_dir / "refine_distribution.csv", index=False, encoding="utf-8-sig")
+    if not alignment_frame.empty:
+        alignment_frame.to_csv(args.output_dir / "refine_target_alignment.csv", index=False, encoding="utf-8-sig")
     gate_frame.to_csv(args.output_dir / "refine_gate_stats.csv", index=False, encoding="utf-8-sig")
     iou_frame.to_csv(args.output_dir / "refine_iou_sweep.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(
@@ -1067,6 +1359,7 @@ def main() -> None:
         seen_images,
         gate_frame,
         distribution_frame,
+        alignment_frame,
         iou_frame,
         confusion,
         gradient_frame,

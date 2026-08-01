@@ -5,6 +5,7 @@ YOLOv11-OBB + Refine Head 训练脚本
     直接运行: python train_yolo11_obb_refine.py
     V2仅训练Refine: python train_yolo11_obb_refine.py --mode refine_only --base-weights <ca.pt>
     V2.1保守精修: 在上一命令后增加 --refine-experiment conservative_short_long
+    V2.2稳定试验: 在上一命令后增加 --refine-experiment stable_raw_short_long
     修改下方 CONFIG 字典中的参数即可自定义训练配置
 
 关键设计：
@@ -24,7 +25,7 @@ import shutil
 import traceback
 from pathlib import Path
 
-os.environ["OMP_NUM_THREADS"] = "8"
+os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 import torch
 from ultralytics import YOLO
@@ -46,6 +47,16 @@ REFINE_EXPERIMENT_CONFIGS = {
     "aligned_identity": {"run_version": "v2", "refine_delta_max": 0.1, "refine_target_limit": 0.095},
     # V2.1 keeps the R2 topology/loss/gate and only reduces the trainable residual range.
     "conservative_short_long": {"run_version": "v21", "refine_delta_max": 0.05, "refine_target_limit": 0.04},
+    # V2.2 uses standard tanh logits plus raw-space targets to keep recovery gradients outside the bounded output.
+    "stable_raw_short_long": {
+        "run_version": "v22",
+        "refine_delta_max": 0.05,
+        "refine_target_limit": 0.04,
+        "epochs": 15,
+        "save_period": 1,
+        "lr0": 1e-4,
+        "warmup_epochs": 1.0,
+    },
 }
 REFINE_EXPERIMENTS = tuple(REFINE_EXPERIMENT_CONFIGS)
 
@@ -133,7 +144,7 @@ CONFIG = {
 }
 
 
-def get_refine_experiment_config(experiment: str) -> dict[str, str | float]:
+def get_refine_experiment_config(experiment: str) -> dict[str, str | float | int]:
     """Return an isolated profile configuration without changing legacy V2 defaults."""
     try:
         return dict(REFINE_EXPERIMENT_CONFIGS[experiment])
@@ -725,17 +736,17 @@ if __name__ == "__main__":
             train_overrides={
                 "model": MODEL_V2_YAML,
                 "data": cli_args.data,
-                "epochs": 30,
+                "epochs": int(experiment_config.get("epochs", 30)),
                 "batch": cli_args.batch,
                 "imgsz": cli_args.imgsz,
                 "device": cli_args.device,
                 "workers": cli_args.workers,
                 "project": cli_args.project,
                 "name": run_name,
-                "save_period": 5,
+                "save_period": int(experiment_config.get("save_period", 5)),
                 "optimizer": "AdamW",
-                "lr0": 3e-4,
-                "warmup_epochs": 3.0,
+                "lr0": float(experiment_config.get("lr0", 3e-4)),
+                "warmup_epochs": float(experiment_config.get("warmup_epochs", 3.0)),
                 "seed": cli_args.seed,
                 "pretrained": False,
                 "refine_experiment": cli_args.refine_experiment,

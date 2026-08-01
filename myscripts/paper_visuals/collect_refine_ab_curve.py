@@ -415,6 +415,12 @@ def main():
                     f"target_limit={refine_metadata['refine_target_limit']}"
                 )
             results = model.val(name=f"epoch{epoch:04d}_{variant.key}", exist_ok=True, **common)
+            runtime_metadata = read_refine_metadata(model)
+            if runtime_metadata != refine_metadata:
+                raise RuntimeError(
+                    "验证过程改写了 Refine checkpoint 语义: "
+                    f"before={refine_metadata}, after={runtime_metadata}"
+                )
             row = metrics_row(
                 epoch=epoch,
                 weights=path,

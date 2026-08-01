@@ -674,7 +674,9 @@ class OBBRefineV2(OBBRefine):
         "aligned_gate",
         "aligned_identity",
         "conservative_short_long",
+        "stable_raw_short_long",
     }
+    raw_space_profiles = {"stable_raw_short_long"}
 
     def __init__(
         self,
@@ -751,7 +753,19 @@ class OBBRefineV2(OBBRefine):
         delta_max = float(self.refine_delta_max)
         if delta_max <= 0:
             raise ValueError(f"refine_delta_max must be positive, received {delta_max}")
+        if self.refine_experiment in self.raw_space_profiles:
+            return delta_max * torch.tanh(refine)
         return delta_max * torch.tanh(refine / delta_max)
+
+    def refine_target_to_raw(self, target_delta: torch.Tensor) -> torch.Tensor:
+        """Map bounded V2.2 delta targets to finite raw logits for direct supervision."""
+        if self.refine_experiment not in self.raw_space_profiles:
+            raise RuntimeError("Raw-space targets are only defined for stable Refine profiles")
+        delta_max = float(self.refine_delta_max)
+        if delta_max <= 0:
+            raise ValueError(f"refine_delta_max must be positive, received {delta_max}")
+        normalized = (target_delta / delta_max).clamp(-1.0 + 1e-4, 1.0 - 1e-4)
+        return torch.atanh(normalized)
 
     def _apply_refine_delta(
         self,

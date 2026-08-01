@@ -1384,8 +1384,7 @@ class v8OBBLoss(v8DetectionLoss):
         coarse_fg = coarse_px[fg_mask][refine_mask]
         target_fg = target_bboxes[fg_mask][refine_mask]
 
-        delta = self.refine_head.bound_refine(pred_refine.permute(0, 2, 1))
-        delta_fg = delta[fg_mask][refine_mask]
+        raw = pred_refine.permute(0, 2, 1)
 
         coarse_short = coarse_fg[:, 2:4].amin(dim=-1)
         coarse_long = coarse_fg[:, 2:4].amax(dim=-1)
@@ -1401,8 +1400,20 @@ class v8OBBLoss(v8DetectionLoss):
             dim=-1,
         ).clamp(-target_limit, target_limit)
 
+        if getattr(self.refine_head, "refine_experiment", "") in self.refine_head.raw_space_profiles:
+            prediction = raw[fg_mask][refine_mask]
+            supervision_target = self.refine_head.refine_target_to_raw(target_delta)
+        else:
+            prediction = self.refine_head.bound_refine(raw)[fg_mask][refine_mask]
+            supervision_target = target_delta
+
         beta = float(getattr(self.refine_head, "refine_smooth_l1_beta", 0.02))
-        element_loss = F.smooth_l1_loss(delta_fg, target_delta, reduction="none", beta=beta).mean(dim=-1)
+        element_loss = F.smooth_l1_loss(
+            prediction,
+            supervision_target,
+            reduction="none",
+            beta=beta,
+        ).mean(dim=-1)
         active_weight = weight[refine_mask]
         return (element_loss * active_weight).sum() / active_weight.sum().clamp_min(1e-6)
 

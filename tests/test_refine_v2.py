@@ -11,6 +11,8 @@ from train_yolo11_obb_refine import (
     keep_frozen_batch_norm_eval,
     load_ca_weights_into_refine_v2,
 )
+from myscripts.check_refine_checkpoint_drift import tensor_digest
+from myscripts.refine_diag import assert_refine_runtime_args, read_refine_runtime_args
 from ultralytics import YOLO
 from ultralytics.nn.modules.head import OBBRefine, OBBRefineV2
 from ultralytics.nn.tasks import OBBModel
@@ -38,7 +40,10 @@ def test_refine_v2_zero_identity_and_local_gradient():
     assert torch.equal(refined, boxes)
 
 
-@pytest.mark.parametrize("experiment", ["direct_short_long", "conservative_short_long"])
+@pytest.mark.parametrize(
+    "experiment",
+    ["direct_short_long", "conservative_short_long", "stable_raw_short_long"],
+)
 def test_refine_v2_short_long_mapping(experiment):
     """Short/long residuals map back to the correct width/height axes."""
     head = build_head(experiment)
@@ -67,12 +72,103 @@ def test_refine_v21_profile_is_conservative_without_changing_legacy_defaults():
     v21["refine_delta_max"] = 1.0
     assert get_refine_experiment_config("conservative_short_long")["refine_delta_max"] == 0.05
 
+    head = build_head("conservative_short_long")
+    head.refine_delta_max = 0.05
+    raw = torch.zeros(1, 2, 1, requires_grad=True)
+    head.bound_refine(raw).sum().backward()
+    assert torch.allclose(raw.grad, torch.ones_like(raw))
+
+
+def test_refine_v22_profile_uses_stable_raw_parameterization():
+    """V2.2 keeps bounded inference but avoids the tiny raw saturation interval."""
+    config = get_refine_experiment_config("stable_raw_short_long")
+    assert config == {
+        "run_version": "v22",
+        "refine_delta_max": 0.05,
+        "refine_target_limit": 0.04,
+        "epochs": 15,
+        "save_period": 1,
+        "lr0": 1e-4,
+        "warmup_epochs": 1.0,
+    }
+
+    head = build_head("stable_raw_short_long")
+    head.refine_delta_max = config["refine_delta_max"]
+    raw = torch.zeros(1, 2, 1, requires_grad=True)
+    head.bound_refine(raw).sum().backward()
+    assert torch.allclose(raw.grad, torch.full_like(raw, 0.05))
+    assert torch.allclose(head.bound_refine(torch.ones_like(raw)), 0.05 * torch.tanh(torch.ones_like(raw)))
+
+    target_delta = torch.tensor([[[-0.04], [0.04]]])
+    target_raw = head.refine_target_to_raw(target_delta)
+    assert torch.allclose(head.bound_refine(target_raw), target_delta, atol=1e-7)
+
+
+def test_refine_v22_raw_target_loss_retains_recovery_gradient():
+    """Raw-space supervision remains trainable even when inference output is near its bound."""
+    head = build_head("stable_raw_short_long")
+    head.refine_delta_max = 0.05
+    head.refine_target_limit = 0.04
+    criterion = object.__new__(v8OBBLoss)
+    criterion.refine_head = head
+
+    coarse = torch.tensor([[[0.0, 0.0, 2.0, 8.0, 0.0]]])
+    target = coarse.clone()
+    target[..., 2:4] *= torch.exp(torch.tensor(-0.04))
+    pred_refine = torch.full((1, 2, 1), 10.0, requires_grad=True)
+    loss = criterion.calculate_refine_v2_direct_loss(
+        coarse,
+        pred_refine,
+        target,
+        torch.tensor([[True]]),
+        torch.ones(1),
+        torch.ones(1, 1),
+        torch.tensor([True]),
+    )
+    loss.backward()
+    assert loss.item() > 0
+    assert pred_refine.grad is not None
+    assert pred_refine.grad.abs().min().item() > 0
+
 
 def test_refine_v2_profile_validation():
     """Unknown experiment names fail instead of silently changing residual semantics."""
     head = build_head()
     with pytest.raises(ValueError, match="Unknown Refine V2 experiment"):
         head.set_refine_experiment("unknown")
+
+
+def test_refine_diag_detects_runtime_profile_overwrite():
+    """Diagnostic initialization must preserve the semantics stored inside the full checkpoint."""
+    head = build_head("conservative_short_long")
+    head.refine_delta_max = 0.05
+    head.refine_target_limit = 0.04
+    expected = read_refine_runtime_args(head)
+    assert_refine_runtime_args(head, expected)
+
+    head.refine_delta_max = 0.1
+    with pytest.raises(RuntimeError, match="refine_delta_max"):
+        assert_refine_runtime_args(head, expected)
+
+
+def test_refine_checkpoint_hash_separates_cv5_updates_from_shared_state():
+    """The checkpoint audit hashes Refine tensors independently from the frozen CA tensors."""
+    state = {
+        "model.0.conv.weight": torch.tensor([1.0, 2.0]),
+        "model.23.cv5.0.weight": torch.tensor([3.0, 4.0]),
+    }
+    is_refine = lambda key: ".cv5." in key
+    cv5_before, cv5_keys = tensor_digest(state, is_refine, torch)
+    shared_before, shared_keys = tensor_digest(state, lambda key: not is_refine(key), torch)
+
+    state["model.23.cv5.0.weight"] = torch.tensor([3.0, 5.0])
+    cv5_after, _ = tensor_digest(state, is_refine, torch)
+    shared_after, _ = tensor_digest(state, lambda key: not is_refine(key), torch)
+
+    assert cv5_keys == ["model.23.cv5.0.weight"]
+    assert shared_keys == ["model.0.conv.weight"]
+    assert cv5_after != cv5_before
+    assert shared_after == shared_before
 
 
 def test_refine_v2_rejects_legacy_cv5_state():
