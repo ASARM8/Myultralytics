@@ -42,7 +42,7 @@ def test_refine_v2_zero_identity_and_local_gradient():
 
 @pytest.mark.parametrize(
     "experiment",
-    ["direct_short_long", "conservative_short_long", "stable_raw_short_long"],
+    ["direct_short_long", "conservative_short_long", "stable_raw_short_long", "stable_aligned_gate"],
 )
 def test_refine_v2_short_long_mapping(experiment):
     """Short/long residuals map back to the correct width/height axes."""
@@ -129,6 +129,25 @@ def test_refine_v22_raw_target_loss_retains_recovery_gradient():
     assert loss.item() > 0
     assert pred_refine.grad is not None
     assert pred_refine.grad.abs().min().item() > 0
+
+
+def test_refine_v23_profile_keeps_v22_parameterization_and_aligns_gate():
+    """V2.3 changes only the training gate while retaining every V2.2 optimization setting."""
+    v22 = get_refine_experiment_config("stable_raw_short_long")
+    v23 = get_refine_experiment_config("stable_aligned_gate")
+    assert v23 == {
+        **v22,
+        "run_version": "v23",
+    }
+
+    head = build_head("stable_aligned_gate")
+    assert "stable_aligned_gate" in head.raw_space_profiles
+    assert "stable_aligned_gate" in head.predicted_gate_profiles
+    assert "stable_raw_short_long" not in head.predicted_gate_profiles
+
+    head.refine_delta_max = v23["refine_delta_max"]
+    raw = torch.tensor([[[-0.5], [0.5]]])
+    assert torch.allclose(head.bound_refine(raw), 0.05 * torch.tanh(raw))
 
 
 def test_refine_v2_profile_validation():

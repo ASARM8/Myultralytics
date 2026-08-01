@@ -675,8 +675,10 @@ class OBBRefineV2(OBBRefine):
         "aligned_identity",
         "conservative_short_long",
         "stable_raw_short_long",
+        "stable_aligned_gate",
     }
-    raw_space_profiles = {"stable_raw_short_long"}
+    raw_space_profiles = {"stable_raw_short_long", "stable_aligned_gate"}
+    predicted_gate_profiles = {"aligned_gate", "aligned_identity", "stable_aligned_gate"}
 
     def __init__(
         self,

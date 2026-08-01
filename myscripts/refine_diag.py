@@ -984,7 +984,9 @@ def main() -> None:
     experiment = getattr(refine_head, "refine_experiment", "legacy")
     target_limit = float(getattr(refine_head, "refine_target_limit", 0.0)) if is_v2 else None
     refine_version_label = (
-        "v2.2"
+        "v2.3"
+        if experiment == "stable_aligned_gate"
+        else "v2.2"
         if experiment == "stable_raw_short_long"
         else "v2.1"
         if experiment == "conservative_short_long"

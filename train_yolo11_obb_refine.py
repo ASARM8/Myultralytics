@@ -57,6 +57,16 @@ REFINE_EXPERIMENT_CONFIGS = {
         "lr0": 1e-4,
         "warmup_epochs": 1.0,
     },
+    # V2.3 changes only the positive training mask: use the same detached coarse-prediction gate as inference.
+    "stable_aligned_gate": {
+        "run_version": "v23",
+        "refine_delta_max": 0.05,
+        "refine_target_limit": 0.04,
+        "epochs": 15,
+        "save_period": 1,
+        "lr0": 1e-4,
+        "warmup_epochs": 1.0,
+    },
 }
 REFINE_EXPERIMENTS = tuple(REFINE_EXPERIMENT_CONFIGS)
 

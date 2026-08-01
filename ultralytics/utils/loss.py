@@ -1221,10 +1221,8 @@ class v8OBBLoss(v8DetectionLoss):
         )
 
         target_scores_sum = max(target_scores.sum(), 1)
-        if pred_refine is not None and refine_version == 2 and refine_experiment in {
-            "aligned_gate",
-            "aligned_identity",
-        }:
+        predicted_gate_profiles = getattr(self.refine_head, "predicted_gate_profiles", set())
+        if pred_refine is not None and refine_version == 2 and refine_experiment in predicted_gate_profiles:
             predicted_refine_gate = self.build_predicted_refine_gate(coarse_bboxes, stride_tensor)
 
         # Cls loss

@@ -2,7 +2,7 @@
 
 import pytest
 
-from myscripts.select_refine_checkpoint import SelectionThresholds, analyze_curve
+from myscripts.select_refine_checkpoint import SelectionThresholds, analyze_curve, write_env
 
 
 def make_pair(
@@ -115,3 +115,20 @@ def test_rejects_test_split_selection():
 
     with pytest.raises(ValueError, match="validation split"):
         analyze(rows)
+
+
+def test_output_env_supports_version_specific_weight_variable(tmp_path):
+    """V2.3 can reuse the selector without exporting a misleading V2.2 variable name."""
+    result = analyze(make_pair(1, d_map=0.0025, d_ap75=0.001, d_ap90=0.0, d_ap95=0.0))
+    output = tmp_path / "selected.env"
+    write_env(output, result, "SELECTED_V23")
+    assert output.read_text(encoding="utf-8") == (
+        "SELECTED_EPOCH=1\nSELECTED_V23=/runs/weights/epoch0.pt\n"
+    )
+
+
+def test_output_env_rejects_shell_code_as_variable_name(tmp_path):
+    """The configurable shell variable name must remain a plain identifier."""
+    result = analyze(make_pair(1, d_map=0.0025, d_ap75=0.001, d_ap90=0.0, d_ap95=0.0))
+    with pytest.raises(ValueError, match="shell"):
+        write_env(tmp_path / "selected.env", result, "SELECTED;touch_x")

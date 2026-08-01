@@ -16,6 +16,7 @@ import argparse
 import csv
 import json
 import math
+import re
 import shlex
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -248,13 +249,15 @@ def write_json(path: Path, result: dict[str, Any]) -> None:
         file.write("\n")
 
 
-def write_env(path: Path, result: dict[str, Any]) -> None:
+def write_env(path: Path, result: dict[str, Any], weights_var: str = "SELECTED_V22") -> None:
     """Write shell-safe variables for subsequent validation commands."""
+    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", weights_var) is None:
+        raise ValueError(f"非法 shell 变量名: {weights_var!r}")
     path.parent.mkdir(parents=True, exist_ok=True)
     selected = result["selected"]
     content = (
         f"SELECTED_EPOCH={selected['epoch']}\n"
-        f"SELECTED_V22={shlex.quote(selected['weights'])}\n"
+        f"{weights_var}={shlex.quote(selected['weights'])}\n"
     )
     path.write_text(content, encoding="utf-8")
 
@@ -290,6 +293,11 @@ def main() -> None:
     parser.add_argument("--expect-target-limit", type=float)
     parser.add_argument("--output-json", type=Path)
     parser.add_argument("--output-env", type=Path)
+    parser.add_argument(
+        "--env-weights-var",
+        default="SELECTED_V22",
+        help="output-env 中保存所选权重的 shell 变量名（默认保持 V2.2 兼容）",
+    )
     args = parser.parse_args()
 
     thresholds = SelectionThresholds(
@@ -313,7 +321,10 @@ def main() -> None:
     if args.output_json is not None:
         write_json(args.output_json, result)
     if args.output_env is not None:
-        write_env(args.output_env, result)
+        try:
+            write_env(args.output_env, result, args.env_weights_var)
+        except ValueError as error:
+            parser.exit(2, f"Refine checkpoint selection: FAIL\n{error}\n")
     print_summary(result)
 
 
