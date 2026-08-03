@@ -12,6 +12,7 @@ import argparse
 import csv
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,13 @@ VARIANTS = (
     "oracle_angle",
     "oracle_scale_center",
     "oracle_full_geometry",
+    "postnms_coarse",
+    "postnms_oracle_scale",
+    "postnms_oracle_center",
+    "postnms_oracle_scale_center",
+    "postnms_oracle_full_geometry",
 )
+CANONICAL_CA_WEIGHTS = Path("/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt")
 
 
 def parse_iou_thresholds(value: str) -> tuple[float, ...]:
@@ -40,7 +47,7 @@ def parse_iou_thresholds(value: str) -> tuple[float, ...]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--weights", type=Path, required=True, help="Canonical pure-CA best.pt")
+    parser.add_argument("--weights", type=Path, default=CANONICAL_CA_WEIGHTS, help="Canonical pure-CA best.pt")
     parser.add_argument("--data", required=True)
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=8)
@@ -48,16 +55,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--split", choices=("val",), default="val")
     parser.add_argument("--proposal-topk", type=int, default=1000)
-    parser.add_argument("--proposal-conf", type=float, default=0.001)
+    parser.add_argument(
+        "--proposal-conf",
+        type=float,
+        default=0.01,
+        help="OBB validation confidence threshold; Ultralytics OBB val defaults to 0.01",
+    )
     parser.add_argument("--oracle-match-iou", type=float, default=0.30)
     parser.add_argument("--recall-ious", type=parse_iou_thresholds, default=parse_iou_thresholds("0.5,0.75,0.9"))
     parser.add_argument("--nms-iou", type=float, default=0.70)
     parser.add_argument("--max-det", type=int, default=300)
+    parser.add_argument("--expected-ca-map50-95", type=float, default=None)
+    parser.add_argument("--baseline-tolerance", type=float, default=0.002)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser
 
 
 def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.weights.as_posix() != CANONICAL_CA_WEIGHTS.as_posix():
+        parser.error(f"V3 oracle is locked to the canonical CA checkpoint: {CANONICAL_CA_WEIGHTS}")
     if args.imgsz != 640:
         parser.error("Innovation-one experiments are fixed at imgsz=640")
     if args.proposal_topk <= 0 or args.max_det <= 0 or args.batch <= 0:
@@ -68,6 +84,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
             parser.error(f"--{name.replace('_', '-')} must be in [0, 1]")
     if not args.weights.is_file():
         parser.error(f"weights not found: {args.weights}")
+    if args.expected_ca_map50_95 is not None and not 0.0 <= args.expected_ca_map50_95 <= 1.0:
+        parser.error("--expected-ca-map50-95 must be in [0, 1]")
+    if args.baseline_tolerance < 0:
+        parser.error("--baseline-tolerance must be non-negative")
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -83,19 +103,23 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def aggregate_recall(rows: list[dict[str, Any]], thresholds: tuple[float, ...]) -> list[dict[str, Any]]:
     """Aggregate image-level proposal recall counts without averaging image ratios."""
-    gt_total = sum(int(row["gt_count"]) for row in rows)
     result = []
-    for threshold in thresholds:
-        key = f"recalled_{threshold:.2f}"
-        recalled = sum(int(row[key]) for row in rows)
-        result.append(
-            {
-                "iou_threshold": threshold,
-                "gt_count": gt_total,
-                "recalled_gt": recalled,
-                "proposal_recall": recalled / gt_total if gt_total else math.nan,
-            }
-        )
+    sources = tuple(dict.fromkeys(str(row.get("source", "proposal")) for row in rows))
+    for source in sources:
+        selected = [row for row in rows if str(row.get("source", "proposal")) == source]
+        gt_total = sum(int(row["gt_count"]) for row in selected)
+        for threshold in thresholds:
+            key = f"recalled_{threshold:.2f}"
+            recalled = sum(int(row[key]) for row in selected)
+            result.append(
+                {
+                    "source": source,
+                    "iou_threshold": threshold,
+                    "gt_count": gt_total,
+                    "recalled_gt": recalled,
+                    "proposal_recall": recalled / gt_total if gt_total else math.nan,
+                }
+            )
     return result
 
 
@@ -147,9 +171,9 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
             alternative[:, 2] = targets[:, 3]
             alternative[:, 3] = targets[:, 2]
             alternative[:, 4] = targets[:, 4] + math.pi / 2.0
-            use_alternative = self._periodic_angle_distance(alternative[:, 4], proposals[:, 4]) < self._periodic_angle_distance(
-                targets[:, 4], proposals[:, 4]
-            )
+            alternative_distance = self._periodic_angle_distance(alternative[:, 4], proposals[:, 4])
+            original_distance = self._periodic_angle_distance(targets[:, 4], proposals[:, 4])
+            use_alternative = alternative_distance < original_distance
             return torch.where(use_alternative[:, None], alternative, targets)
 
         def _raw_tensor(self, preds):
@@ -185,11 +209,12 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
                 indices = indices[order]
             return raw_image[:, indices].clone()
 
-        def _match_proposals(self, selected, pbatch, image_index):
-            proposal_count = selected.shape[1]
+        def _match_boxes(self, boxes, pred_cls, pbatch, image_index, source):
+            proposal_count = boxes.shape[0]
             gt_boxes = pbatch["bboxes"]
             gt_cls = pbatch["cls"]
             row = {
+                "source": source,
                 "image": str(pbatch["im_file"]),
                 "image_index": image_index,
                 "gt_count": int(gt_boxes.shape[0]),
@@ -200,8 +225,6 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
                     row[f"recalled_{threshold:.2f}"] = 0
                 return None, None, row
 
-            boxes = torch.cat((selected[:4].T, selected[4 + self.nc : 5 + self.nc].T), dim=-1)
-            scores, pred_cls = selected[4 : 4 + self.nc].T.max(dim=1)
             iou = batch_probiou(gt_boxes, boxes)
             same_class = gt_cls[:, None].long() == pred_cls[None, :].long()
             class_iou = torch.where(same_class, iou, torch.full_like(iou, -1.0))
@@ -213,6 +236,11 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
             matched_targets = gt_boxes[best_gt.clamp_min(0)]
             matched_targets = self._align_targets(boxes, matched_targets)
             return matched, matched_targets, row
+
+        def _match_pre_nms(self, selected, pbatch, image_index):
+            boxes = torch.cat((selected[:4].T, selected[4 + self.nc : 5 + self.nc].T), dim=-1)
+            pred_cls = selected[4 : 4 + self.nc].T.argmax(dim=1)
+            return self._match_boxes(boxes, pred_cls, pbatch, image_index, "pre_nms_topk")
 
         def _oracle_raw(self, selected, matched, targets, variant):
             output = selected.clone()
@@ -228,6 +256,29 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
                 output[4 + self.nc, idx] = target[:, 4]
             return output
 
+        def _prediction_to_raw(self, prediction):
+            count = prediction["bboxes"].shape[0]
+            raw = prediction["bboxes"].new_zeros((4 + self.nc + 1, count))
+            if count:
+                raw[:4] = prediction["bboxes"][:, :4].T
+                indices = torch.arange(count, device=raw.device)
+                raw[4 + prediction["cls"].long(), indices] = prediction["conf"]
+                raw[4 + self.nc] = prediction["bboxes"][:, 4]
+            return raw
+
+        def _postnms_oracle(self, prediction, matched, targets, variant):
+            output = {key: value.clone() for key, value in prediction.items()}
+            if matched is not None and matched.any() and variant != "postnms_coarse":
+                index = torch.where(matched)[0]
+                target = targets[index]
+                if variant in {"postnms_oracle_center", "postnms_oracle_scale_center", "postnms_oracle_full_geometry"}:
+                    output["bboxes"][index, :2] = target[:, :2]
+                if variant in {"postnms_oracle_scale", "postnms_oracle_scale_center", "postnms_oracle_full_geometry"}:
+                    output["bboxes"][index, 2:4] = target[:, 2:4]
+                if variant == "postnms_oracle_full_geometry":
+                    output["bboxes"][index, 4] = target[:, 4]
+            return self._format_nms(self._prediction_to_raw(output))
+
         def postprocess(self, preds):
             raw = self._raw_tensor(preds)
             standard = super().postprocess(preds)
@@ -241,13 +292,18 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
             for image_index, raw_image in enumerate(raw):
                 selected = self._topk_raw(raw_image)
                 pbatch = self._prepare_batch(image_index, self._current_batch)
-                matched, targets, recall_row = self._match_proposals(selected, pbatch, image_index)
+                matched, targets, recall_row = self._match_pre_nms(selected, pbatch, image_index)
                 self.proposal_recall_rows.append(recall_row)
-                for variant in VARIANTS:
-                    if variant == "standard_ca":
-                        continue
+                for variant in VARIANTS[1:7]:
                     variant_raw = self._oracle_raw(selected, matched, targets, variant)
                     payload[variant].append(self._format_nms(variant_raw))
+                post_prediction = standard[image_index]
+                post_matched, post_targets, post_recall = self._match_boxes(
+                    post_prediction["bboxes"], post_prediction["cls"], pbatch, image_index, "post_nms"
+                )
+                self.proposal_recall_rows.append(post_recall)
+                for variant in VARIANTS[7:]:
+                    payload[variant].append(self._postnms_oracle(post_prediction, post_matched, post_targets, variant))
             return payload
 
         def _update_extra_metric(self, metric, preds, batch):
@@ -283,7 +339,12 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
     return ProposalOracleValidator
 
 
-def write_report(path: Path, args: argparse.Namespace, metrics: list[dict[str, Any]], recall: list[dict[str, Any]]) -> None:
+def write_report(
+    path: Path,
+    args: argparse.Namespace,
+    metrics: list[dict[str, Any]],
+    recall: list[dict[str, Any]],
+) -> None:
     lookup = {row["variant"]: row for row in metrics}
     standard = lookup["standard_ca"]
     topk = lookup["topk_coarse"]
@@ -300,12 +361,13 @@ def write_report(path: Path, args: argparse.Namespace, metrics: list[dict[str, A
         "",
         "## Proposal recall",
         "",
-        "| IoU | GT | recalled | recall |",
-        "|---:|---:|---:|---:|",
+        "| source | IoU | GT | recalled | recall |",
+        "|---|---:|---:|---:|---:|",
     ]
     for row in recall:
         lines.append(
-            f"| {row['iou_threshold']:.2f} | {row['gt_count']} | {row['recalled_gt']} | {row['proposal_recall']:.6f} |"
+            f"| {row['source']} | {row['iou_threshold']:.2f} | {row['gt_count']} | {row['recalled_gt']} | "
+            f"{row['proposal_recall']:.6f} |"
         )
     lines.extend(
         [
@@ -340,6 +402,9 @@ def main() -> None:
     args = parser.parse_args()
     validate_args(parser, args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    omp_threads = os.environ.get("OMP_NUM_THREADS", "")
+    if not omp_threads.isdigit() or int(omp_threads) <= 0:
+        os.environ["OMP_NUM_THREADS"] = "1"
 
     import numpy as np
     import torch
@@ -394,6 +459,11 @@ def main() -> None:
     write_csv(args.output_dir / "proposal_oracle_metrics.csv", metrics)
     write_csv(args.output_dir / "proposal_recall_by_image.csv", validator.proposal_recall_rows)
     write_csv(args.output_dir / "proposal_recall_summary.csv", recall)
+    baseline_error = (
+        abs(standard["map50_95"] - args.expected_ca_map50_95)
+        if args.expected_ca_map50_95 is not None
+        else None
+    )
     manifest = {
         "weights": str(args.weights),
         "data": args.data,
@@ -404,12 +474,21 @@ def main() -> None:
         "oracle_match_iou": args.oracle_match_iou,
         "nms_iou": args.nms_iou,
         "max_det": args.max_det,
+        "expected_ca_map50_95": args.expected_ca_map50_95,
+        "baseline_tolerance": args.baseline_tolerance,
+        "baseline_abs_error": baseline_error,
+        "baseline_check_passed": baseline_error is None or baseline_error <= args.baseline_tolerance,
         "test_used": False,
     }
     (args.output_dir / "run_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
     write_report(args.output_dir / "proposal_oracle_report.md", args, metrics, recall)
+    if baseline_error is not None and baseline_error > args.baseline_tolerance:
+        raise RuntimeError(
+            f"CA baseline drift: observed={standard['map50_95']:.6f}, expected={args.expected_ca_map50_95:.6f}, "
+            f"abs_error={baseline_error:.6f} > tolerance={args.baseline_tolerance:.6f}"
+        )
     print(args.output_dir)
 
 

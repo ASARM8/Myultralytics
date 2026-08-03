@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 
 from ultralytics.nn.modules.refine_v3 import OBBProposalRefinerV3
 
@@ -55,3 +56,39 @@ def test_v3_invalid_proposals_are_identity_masked():
     assert output["residual"][0, 0].abs().sum() > 0
     assert torch.equal(output["residual"][0, 1], torch.zeros(4))
     assert output["quality_logit"][0, 1, 0] == -20
+
+
+def test_v3_default_is_scale_only_with_asymmetric_bounds():
+    module = build_module()
+    raw = torch.tensor([[[-10.0, -10.0], [10.0, 10.0]]])
+    residual = module.bound_residual(raw)
+    assert residual.shape[-1] == 4
+    assert residual[0, 0, 0] >= -module.short_negative_limit
+    assert residual[0, 1, 0] <= module.short_positive_limit
+    assert residual[0, 0, 1] >= -module.long_negative_limit
+    assert residual[0, 1, 1] <= module.long_positive_limit
+    assert torch.equal(residual[..., 2:], torch.zeros_like(residual[..., 2:]))
+
+
+def test_v3_clipped_targets_remain_inside_tanh_limits():
+    module = build_module()
+    target = torch.tensor([[[-10.0, 10.0, 3.0, -3.0]]])
+    clipped = module.clip_target(target)
+    assert torch.isclose(clipped[0, 0, 0], torch.tensor(-module.short_negative_limit * module.target_margin))
+    assert torch.isclose(clipped[0, 0, 1], torch.tensor(module.long_positive_limit * module.target_margin))
+    assert torch.equal(clipped[..., 2:], torch.zeros_like(clipped[..., 2:]))
+
+
+def test_v3_uses_no_batchnorm_that_padding_could_contaminate():
+    assert not any(isinstance(layer, nn.modules.batchnorm._BatchNorm) for layer in build_module().modules())
+
+
+def test_v3_proposal_state_is_invariant_to_equivalent_obb_representation():
+    first = torch.tensor([[[50.0, 60.0, 40.0, 8.0, 0.3]]])
+    equivalent = torch.tensor([[[50.0, 60.0, 8.0, 40.0, 0.3 + torch.pi / 2]]])
+    score = torch.tensor([[0.8]])
+    first_state = OBBProposalRefinerV3.proposal_state(first, score, (128, 128))
+    equivalent_state = OBBProposalRefinerV3.proposal_state(equivalent, score, (128, 128))
+    assert torch.allclose(first_state, equivalent_state, atol=1e-6)
+    module = build_module()
+    assert torch.allclose(module._rotated_grid(first, (128, 128)), module._rotated_grid(equivalent, (128, 128)))

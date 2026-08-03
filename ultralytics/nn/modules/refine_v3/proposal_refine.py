@@ -12,16 +12,30 @@ import torch.nn.functional as F
 __all__ = ("OBBProposalRefinerV3",)
 
 
+def _group_norm(channels: int) -> nn.GroupNorm:
+    """Return a padding-independent normalization with a valid group count."""
+    groups = next(group for group in (8, 4, 2, 1) if channels % group == 0)
+    return nn.GroupNorm(groups, channels)
+
+
+def _canonical_long_angle(width: torch.Tensor, height: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+    """Map equivalent OBB representations to one undirected long-axis angle in [0, pi)."""
+    long_angle = torch.where(width <= height, angle + math.pi / 2.0, angle)
+    return torch.remainder(long_angle, math.pi)
+
+
 class OBBProposalRefinerV3(nn.Module):
     """Refine post-NMS OBB proposals using P2/P3 rotated-aligned strips.
 
     This module is deliberately independent of the legacy dense ``OBBRefine``
     and ``OBBRefineV2`` heads.  It consumes a bounded number of proposal boxes,
-    preserves the base detector scores/classes, and predicts four residuals:
+    preserves the base detector scores/classes, and returns four residual slots:
 
     ``[delta_short, delta_long, delta_center_long, delta_center_short]``.
 
-    The final geometry layer is zero initialized, so a newly constructed module
+    The evidence-backed default trains scale only and keeps both center slots at
+    zero. Center prediction remains an explicit opt-in for later ablation. The
+    final geometry layer is zero initialized, so a newly constructed module
     is an exact identity mapping.  A separate quality logit is returned rather
     than silently changing the detector's classification score.
     """
@@ -34,8 +48,8 @@ class OBBProposalRefinerV3(nn.Module):
         "log_aspect_ratio",
         "center_x_norm",
         "center_y_norm",
-        "sin_2theta",
-        "cos_2theta",
+        "sin_2long_axis",
+        "cos_2long_axis",
     )
 
     def __init__(
@@ -49,7 +63,12 @@ class OBBProposalRefinerV3(nn.Module):
         long_context: float = 1.2,
         short_context: float = 4.0,
         min_short_context_px: float = 16.0,
-        scale_limit: float = 0.5,
+        short_negative_limit: float = 1.5,
+        short_positive_limit: float = 0.25,
+        long_negative_limit: float = 0.15,
+        long_positive_limit: float = 0.15,
+        target_margin: float = 0.99,
+        enable_center: bool = False,
         center_limit: float = 1.0,
     ) -> None:
         super().__init__()
@@ -57,33 +76,49 @@ class OBBProposalRefinerV3(nn.Module):
             raise ValueError("feature and hidden channel counts must be positive")
         if len(roi_size) != 2 or min(roi_size) <= 0:
             raise ValueError(f"roi_size must contain two positive integers, received {roi_size}")
-        if min(long_context, short_context, min_short_context_px, scale_limit, center_limit) <= 0:
+        if min(
+            long_context,
+            short_context,
+            min_short_context_px,
+            short_negative_limit,
+            short_positive_limit,
+            long_negative_limit,
+            long_positive_limit,
+            center_limit,
+        ) <= 0:
             raise ValueError("context sizes and residual limits must be positive")
+        if not 0.0 < target_margin < 1.0:
+            raise ValueError("target_margin must be strictly between 0 and 1")
 
         self.roi_size = (int(roi_size[0]), int(roi_size[1]))
         self.long_context = float(long_context)
         self.short_context = float(short_context)
         self.min_short_context_px = float(min_short_context_px)
-        self.scale_limit = float(scale_limit)
+        self.short_negative_limit = float(short_negative_limit)
+        self.short_positive_limit = float(short_positive_limit)
+        self.long_negative_limit = float(long_negative_limit)
+        self.long_positive_limit = float(long_positive_limit)
+        self.target_margin = float(target_margin)
+        self.enable_center = bool(enable_center)
         self.center_limit = float(center_limit)
 
         self.p2_projection = nn.Sequential(
             nn.Conv2d(p2_channels, roi_channels, 1, bias=False),
-            nn.BatchNorm2d(roi_channels),
+            _group_norm(roi_channels),
             nn.SiLU(),
         )
         self.p3_projection = nn.Sequential(
             nn.Conv2d(p3_channels, roi_channels, 1, bias=False),
-            nn.BatchNorm2d(roi_channels),
+            _group_norm(roi_channels),
             nn.SiLU(),
         )
         combined_channels = 2 * roi_channels
         self.roi_encoder = nn.Sequential(
             nn.Conv2d(combined_channels, hidden_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
+            _group_norm(hidden_channels),
             nn.SiLU(),
             nn.Conv2d(hidden_channels, hidden_channels, 3, stride=(1, 2), padding=1, bias=False),
-            nn.BatchNorm2d(hidden_channels),
+            _group_norm(hidden_channels),
             nn.SiLU(),
             nn.AdaptiveAvgPool2d((2, 6)),
         )
@@ -100,7 +135,8 @@ class OBBProposalRefinerV3(nn.Module):
             nn.Linear(hidden_channels, hidden_channels),
             nn.SiLU(),
         )
-        self.geometry_head = nn.Linear(hidden_channels, len(self.residual_names))
+        self.geometry_channels = len(self.residual_names) if self.enable_center else 2
+        self.geometry_head = nn.Linear(hidden_channels, self.geometry_channels)
         self.quality_head = nn.Linear(hidden_channels, 1)
         nn.init.zeros_(self.geometry_head.weight)
         nn.init.zeros_(self.geometry_head.bias)
@@ -137,8 +173,7 @@ class OBBProposalRefinerV3(nn.Module):
         width, height, angle = proposals[..., 2], proposals[..., 3], proposals[..., 4]
         short = torch.minimum(width, height)
         long = torch.maximum(width, height)
-        short_is_width = width <= height
-        long_angle = torch.where(short_is_width, angle + math.pi / 2.0, angle)
+        long_angle = _canonical_long_angle(width, height, angle)
         long_extent = long * self.long_context
         short_extent = torch.maximum(
             short * self.short_context,
@@ -170,6 +205,7 @@ class OBBProposalRefinerV3(nn.Module):
         width, height, angle = proposals[..., 2], proposals[..., 3], proposals[..., 4]
         short = torch.minimum(width, height).clamp_min(1e-3)
         long = torch.maximum(width, height).clamp_min(1e-3)
+        long_angle = _canonical_long_angle(width, height, angle)
         return torch.stack(
             (
                 scores,
@@ -178,17 +214,54 @@ class OBBProposalRefinerV3(nn.Module):
                 torch.log(long / short),
                 proposals[..., 0] / image_width,
                 proposals[..., 1] / image_height,
-                torch.sin(2.0 * angle),
-                torch.cos(2.0 * angle),
+                torch.sin(2.0 * long_angle),
+                torch.cos(2.0 * long_angle),
             ),
             dim=-1,
         )
 
+    @staticmethod
+    def _asymmetric_bound(raw: torch.Tensor, negative_limit: float, positive_limit: float) -> torch.Tensor:
+        """Apply sign-dependent tanh limits with value 0 and derivative 1 at the origin."""
+        negative = float(negative_limit) * torch.tanh(raw / float(negative_limit))
+        positive = float(positive_limit) * torch.tanh(raw / float(positive_limit))
+        return torch.where(raw < 0, negative, positive)
+
     def bound_residual(self, raw: torch.Tensor) -> torch.Tensor:
-        """Smoothly bound residuals while keeping unit derivative at zero."""
-        scale = self.scale_limit * torch.tanh(raw[..., :2] / self.scale_limit)
-        center = self.center_limit * torch.tanh(raw[..., 2:] / self.center_limit)
-        return torch.cat((scale, center), dim=-1)
+        """Return bounded scale residuals and optional center residuals."""
+        if raw.shape[-1] != self.geometry_channels:
+            raise ValueError(f"expected {self.geometry_channels} raw geometry channels, received {raw.shape[-1]}")
+        short = self._asymmetric_bound(raw[..., 0:1], self.short_negative_limit, self.short_positive_limit)
+        long = self._asymmetric_bound(raw[..., 1:2], self.long_negative_limit, self.long_positive_limit)
+        if self.enable_center:
+            center = self.center_limit * torch.tanh(raw[..., 2:4] / self.center_limit)
+        else:
+            center = raw.new_zeros((*raw.shape[:-1], 2))
+        return torch.cat((short, long, center), dim=-1)
+
+    def clip_target(self, target: torch.Tensor) -> torch.Tensor:
+        """Clip encoded supervision to exactly the residual range available at inference."""
+        if target.shape[-1] != len(self.residual_names):
+            raise ValueError(f"expected {len(self.residual_names)} target channels, received {target.shape[-1]}")
+        # tanh only approaches its exact bound asymptotically. Keeping targets
+        # just inside that range avoids an unreachable endpoint and vanishing
+        # gradients for clipped examples.
+        short = target[..., 0:1].clamp(
+            -self.short_negative_limit * self.target_margin,
+            self.short_positive_limit * self.target_margin,
+        )
+        long = target[..., 1:2].clamp(
+            -self.long_negative_limit * self.target_margin,
+            self.long_positive_limit * self.target_margin,
+        )
+        if self.enable_center:
+            center = target[..., 2:4].clamp(
+                -self.center_limit * self.target_margin,
+                self.center_limit * self.target_margin,
+            )
+        else:
+            center = target.new_zeros((*target.shape[:-1], 2))
+        return torch.cat((short, long, center), dim=-1)
 
     def forward(
         self,
@@ -213,7 +286,7 @@ class OBBProposalRefinerV3(nn.Module):
         state = self.proposal_state(proposals, scores, image_size).flatten(0, 1)
         state = self.state_encoder(state)
         fused = self.fusion(torch.cat((spatial, state), dim=1))
-        raw = self.geometry_head(fused).reshape(*proposals.shape[:2], len(self.residual_names))
+        raw = self.geometry_head(fused).reshape(*proposals.shape[:2], self.geometry_channels)
         quality_logit = self.quality_head(fused).reshape(*proposals.shape[:2], 1)
         residual = self.bound_residual(raw)
         if valid_mask is not None:
@@ -235,8 +308,7 @@ class OBBProposalRefinerV3(nn.Module):
             (torch.log(target_short / proposal_short), torch.log(target_long / proposal_long)),
             dim=-1,
         )
-        short_is_width = proposals[..., 2] <= proposals[..., 3]
-        long_angle = torch.where(short_is_width, proposals[..., 4] + math.pi / 2.0, proposals[..., 4])
+        long_angle = _canonical_long_angle(proposals[..., 2], proposals[..., 3], proposals[..., 4])
         difference = targets[..., :2] - proposals[..., :2]
         long_offset = difference[..., 0] * long_angle.cos() + difference[..., 1] * long_angle.sin()
         short_offset = -difference[..., 0] * long_angle.sin() + difference[..., 1] * long_angle.cos()
@@ -259,7 +331,7 @@ class OBBProposalRefinerV3(nn.Module):
         refined[..., 3] *= torch.exp(delta_height)
         short = proposals[..., 2:4].amin(dim=-1).clamp_min(4.0)
         long = proposals[..., 2:4].amax(dim=-1).clamp_min(1e-3)
-        long_angle = torch.where(short_is_width, proposals[..., 4] + math.pi / 2.0, proposals[..., 4])
+        long_angle = _canonical_long_angle(proposals[..., 2], proposals[..., 3], proposals[..., 4])
         long_offset = residual[..., 2] * long
         short_offset = residual[..., 3] * short
         refined[..., 0] += long_offset * long_angle.cos() - short_offset * long_angle.sin()
