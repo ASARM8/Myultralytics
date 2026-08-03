@@ -11,6 +11,8 @@ from myscripts.V3.runtime import (
     align_equivalent_targets,
     greedy_class_match,
     group_key,
+    prediction_to_raw,
+    rerun_rotated_nms,
     split_dataset_indices,
 )
 
@@ -90,3 +92,18 @@ def test_frozen_ca_features_are_normal_tensors_available_to_downstream_backward(
         assert downstream.weight.grad is not None
     finally:
         extractor.close()
+
+
+def test_six_one_class_obb_proposals_do_not_trigger_end2end_shape_shortcut():
+    boxes = torch.tensor(
+        [[10.0 + 20.0 * index, 16.0, 4.0, 12.0, 0.1] for index in range(6)], dtype=torch.float32
+    )
+    scores = torch.linspace(0.9, 0.4, 6)
+    classes = torch.zeros(6, dtype=torch.long)
+    raw = prediction_to_raw(boxes, scores, classes, nc=1)
+    assert raw.shape == (6, 7)
+    assert torch.equal(raw[:, -1], torch.zeros(6))
+    output = rerun_rotated_nms(boxes, scores, classes, nc=1, conf=0.01, nms_iou=0.7, max_det=300)
+    assert output["bboxes"].shape[0] == 6
+    assert torch.allclose(output["bboxes"], boxes)
+    assert torch.allclose(output["conf"], scores)

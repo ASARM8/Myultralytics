@@ -325,12 +325,18 @@ def build_supervision(
 
 def prediction_to_raw(boxes, scores, classes, nc: int):
     count = boxes.shape[0]
-    raw = boxes.new_zeros((4 + nc + 1, count))
+    # ``non_max_suppression`` treats any tensor whose final dimension is 6 as
+    # an end-to-end BNC result. A one-class OBB raw tensor is BCN with exactly
+    # six channels, so K=6 would otherwise create the ambiguous shape [1,6,6].
+    # Add one zero-confidence sentinel column; it is filtered before NMS and
+    # leaves every real proposal unchanged.
+    safe_count = count + int(count == 6)
+    raw = boxes.new_zeros((4 + nc + 1, safe_count))
     if count:
-        raw[:4] = boxes[:, :4].T
+        raw[:4, :count] = boxes[:, :4].T
         index = torch.arange(count, device=boxes.device)
         raw[4 + classes.long(), index] = scores
-        raw[4 + nc] = boxes[:, 4]
+        raw[4 + nc, :count] = boxes[:, 4]
     return raw
 
 

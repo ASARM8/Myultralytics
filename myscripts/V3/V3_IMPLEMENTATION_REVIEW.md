@@ -87,6 +87,7 @@ val 共 3,603 个实例。短边 P05/P50/P95 约为 3.61/10.83/32.82 px；短边
 | 冻结特征无法供 V3 反向传播 | 已修复 | CA 前向使用 `torch.no_grad()`，不用会产生 inference tensor 的 `inference_mode()` |
 | 新头初始破坏 coarse | 已防护 | geometry head 零初始化；roundtrip mAP 容差为 5e-4 |
 | 验证置信度口径不一致 | 已修复 | D1、trainer、validator 统一为 0.01并校验 CA mAP |
+| 单类别 OBB 的 `[1,6,6]` NMS 形状碰撞 | 已修复 | K=6 时追加零置信度哨兵列，并对 post-NMS coarse identity 做硬检查 |
 | V3 作用位置与 oracle 不一致 | 已修复 | D1 新增 post-NMS coarse 与 post-NMS 几何 oracle |
 | OBB 宽高/角度等价歧义 | 已防护 | 监督前选择最近等价 GT；状态方向改用等价表示不变的长轴方向 |
 | 多 proposal 重复匹配同一 GT | 正式训练已防护 | 类别感知、一对一 greedy matching；D1 oracle仍是上限分析 |

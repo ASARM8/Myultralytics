@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-det", type=int, default=300)
     parser.add_argument("--expected-ca-map50-95", type=float, default=None)
     parser.add_argument("--baseline-tolerance", type=float, default=0.002)
+    parser.add_argument("--roundtrip-tolerance", type=float, default=5e-4)
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser
 
@@ -86,8 +87,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error(f"weights not found: {args.weights}")
     if args.expected_ca_map50_95 is not None and not 0.0 <= args.expected_ca_map50_95 <= 1.0:
         parser.error("--expected-ca-map50-95 must be in [0, 1]")
-    if args.baseline_tolerance < 0:
-        parser.error("--baseline-tolerance must be non-negative")
+    if args.baseline_tolerance < 0 or args.roundtrip_tolerance < 0:
+        parser.error("--baseline-tolerance and --roundtrip-tolerance must be non-negative")
 
 
 def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -183,6 +184,14 @@ def build_validator_class(*, OBBValidator, OBBMetrics, batch_probiou, nms_module
             return value.detach().clone()
 
         def _format_nms(self, raw_image):
+            # A one-class OBB tensor has six channels. If it also contains
+            # exactly six proposals, its [1,6,6] shape collides with the NMS
+            # end-to-end BNC shortcut. Append a zero-confidence sentinel so
+            # the tensor remains unambiguously BCN; NMS removes the sentinel.
+            if raw_image.shape[-1] == 6:
+                padded = raw_image.new_zeros((raw_image.shape[0], 7))
+                padded[:, :6] = raw_image
+                raw_image = padded
             outputs = nms_module.non_max_suppression(
                 raw_image.unsqueeze(0),
                 options.proposal_conf,
@@ -454,6 +463,7 @@ def main() -> None:
     metrics = sorted(validator.variant_summaries, key=lambda row: VARIANTS.index(row["variant"]))
     recall = aggregate_recall(validator.proposal_recall_rows, args.recall_ious)
     standard = next(row for row in metrics if row["variant"] == "standard_ca")
+    postnms_coarse = next(row for row in metrics if row["variant"] == "postnms_coarse")
     for row in metrics:
         row["delta_map50_95_vs_standard"] = row["map50_95"] - standard["map50_95"]
     write_csv(args.output_dir / "proposal_oracle_metrics.csv", metrics)
@@ -464,6 +474,7 @@ def main() -> None:
         if args.expected_ca_map50_95 is not None
         else None
     )
+    roundtrip_error = abs(postnms_coarse["map50_95"] - standard["map50_95"])
     manifest = {
         "weights": str(args.weights),
         "data": args.data,
@@ -478,6 +489,9 @@ def main() -> None:
         "baseline_tolerance": args.baseline_tolerance,
         "baseline_abs_error": baseline_error,
         "baseline_check_passed": baseline_error is None or baseline_error <= args.baseline_tolerance,
+        "roundtrip_tolerance": args.roundtrip_tolerance,
+        "postnms_roundtrip_abs_error": roundtrip_error,
+        "postnms_roundtrip_check_passed": roundtrip_error <= args.roundtrip_tolerance,
         "test_used": False,
     }
     (args.output_dir / "run_manifest.json").write_text(
@@ -488,6 +502,11 @@ def main() -> None:
         raise RuntimeError(
             f"CA baseline drift: observed={standard['map50_95']:.6f}, expected={args.expected_ca_map50_95:.6f}, "
             f"abs_error={baseline_error:.6f} > tolerance={args.baseline_tolerance:.6f}"
+        )
+    if roundtrip_error > args.roundtrip_tolerance:
+        raise RuntimeError(
+            f"post-NMS coarse identity drift: abs_error={roundtrip_error:.6f} > "
+            f"tolerance={args.roundtrip_tolerance:.6f}"
         )
     print(args.output_dir)
 

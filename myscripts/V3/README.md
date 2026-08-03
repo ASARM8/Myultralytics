@@ -83,13 +83,14 @@ python -m myscripts.V3.refine_proposal_oracle \
   --max-det 300 \
   --expected-ca-map50-95 0.45413 \
   --baseline-tolerance 0.002 \
-  --output-dir "$EXPORT/proposal_oracle_corrected"
+  --roundtrip-tolerance 0.0005 \
+  --output-dir "$EXPORT/proposal_oracle_corrected_v2"
 ```
 
 首先检查：
 
 - `standard_ca` 是否落在 `0.45413±0.002`；否则脚本会在产出诊断文件后报错，不应启动正式训练。
-- `postnms_coarse` 是否与 `standard_ca` 基本一致。
+- `postnms_coarse` 与 `standard_ca` 的 mAP50-95 绝对差是否不超过 `5e-4`；否则脚本会在保存诊断后报错。
 - `postnms_oracle_scale` 是否相对 `postnms_coarse` 有明确正上限。它比 pre-NMS oracle 更贴近 V3 的实际作用位置。
 
 ## 5. seed0 正式训练
