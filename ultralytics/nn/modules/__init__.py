@@ -96,6 +96,7 @@ from .head import (
     YOLOESegment26,
     v10Detect,
 )
+from .refine_v3 import OBBProposalRefinerV3
 from .transformer import (
     AIFI,
     MLP,
@@ -125,6 +126,7 @@ __all__ = (
     "OBB26",
     "OBBRefine",
     "OBBRefineV2",
+    "OBBProposalRefinerV3",
     "PSA",
     "SPP",
     "SPPELAN",
