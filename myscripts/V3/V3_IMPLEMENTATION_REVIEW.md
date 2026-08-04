@@ -10,19 +10,31 @@
 
 ### 2.1 D1 proposal oracle
 
-旧 D1 的 `standard_ca` 与 `topk_coarse` 完全一致，mAP50-95 都为 0.421885；pre-NMS oracle 相对该基线的变化如下：
+修正版 D1 v2 已使用统一口径完成。运行条件为 `imgsz=640`、`conf=0.01`、NMS IoU=0.70、max_det=300、oracle match IoU=0.30，权重为固定纯 CA checkpoint，数据划分为 val，未读取 test。
+
+三项前置恒等性检查全部通过：
+
+| 检查项 | 结果 | 判定 |
+|---|---:|---|
+| standard CA mAP50-95 | 0.4541379 | 与预期 0.45413 的绝对误差约 `7.9e-6`，PASS |
+| top-K coarse mAP50-95 | 0.4541379 | 与 standard CA 六项指标完全一致，PASS |
+| post-NMS coarse mAP50-95 | 0.4541379 | roundtrip 绝对误差为 0，PASS |
+
+在这一有效基线上，pre-NMS oracle 相对 coarse 的变化如下：
 
 | 变量 | mAP50-95 | 相对 coarse |
 |---|---:|---:|
-| scale | 0.769248 | +0.347364 |
-| center | 0.458432 | +0.036548 |
-| angle | 0.431152 | +0.009267 |
-| scale+center | 0.890063 | +0.468178 |
-| full geometry | 0.950014 | +0.528130 |
+| scale | 0.784832 | +0.330694 |
+| center | 0.491885 | +0.037747 |
+| angle | 0.464110 | +0.009972 |
+| scale+center | 0.898739 | +0.444601 |
+| full geometry | 0.952698 | +0.498560 |
 
-pre-NMS top-K 的 GT recall 为：IoU 0.50/0.75/0.90 下分别为 0.845129/0.623647/0.428254。它说明候选集合含有大量可利用几何信息，也说明高 IoU recall 仍是上限约束。
+与 V3 实际作用位置一致的 post-NMS oracle 结果为：scale 0.787313（+0.333175）、center 0.492989（+0.038852）、scale+center 0.898685（+0.444547）、full geometry 0.951378（+0.497240）。其中 scale-only 在 AP75/AP90/AP95 上分别达到约 0.881252/0.546571/0.229690，说明尺度仍是最主要的可修正几何因素，并且该上限在重新 NMS 后没有消失。
 
-但旧 D1 显式使用 `conf=0.001`，当前仓库 OBB val 默认是 `conf=0.01`，而训练记录中的 CA 最佳 mAP50-95 为约 0.45413。因此 0.421885 不是同口径基线，不能直接用于正式决策。代码已将默认值改为 0.01，并加入 `0.45413±0.002` 硬校验；还新增 post-NMS oracle，因为正式 V3 处理的是 post-NMS proposal。
+pre-NMS top-K 的 GT recall 在 IoU 0.50/0.75/0.90 下分别为 0.834582/0.615598/0.423536；post-NMS 后分别为 0.822648/0.576742/0.351096。它一方面证明保留 proposal 中仍有较大的定位优化空间，另一方面明确了 V3 的边界：post-NMS Refine 不能恢复已经漏掉或被 NMS 删除的候选框，只能改善保留下来的候选框定位。
+
+上述 oracle 是把 proposal 几何直接替换为匹配 GT 后得到的理论上限，不是可学习模型成绩，也不能作为论文中的实际精度。它只用于支持“优先训练 scale-only Refine”的结构选择。旧 `conf=0.001`、mAP50-95=0.421885 的 D1 结果口径无效，仅保留为问题追溯记录，不再用于后续决策。
 
 ### 2.2 D2 rotated ROI probe
 
@@ -44,6 +56,14 @@ val 共 3,603 个实例。短边 P05/P50/P95 约为 3.61/10.83/32.82 px；短边
 在 val 中，1 px 扰动的平均 `1-ProbIoU`：短轴中心移动约 0.14595、短边增加约 0.05975、端点诱导角度变化约 0.08682。说明极细目标对像素量化敏感。实现中不硬删除 tiny 样本，而是按 `clamp(short/8, 0.25, 1)` 平滑降权，避免少量离散标注噪声主导尺度损失。
 
 尺度目标分布也明显非对称：`dshort` 均值约 -0.408、P05 约 -1.487、P95 约 +0.151；`dlong` 大多集中在 0 附近。V3 因此使用短边 `[-1.5,+0.25]`、长边 `[-0.15,+0.15]`，而不是对称 `±0.5`。
+
+### 2.4 seed0 与独立复现
+
+seed0 在 train-holdout 选择 epoch15、quality threshold=0.3。AMP/batch=8 的 val coarse/refined mAP50-95 为 0.453562/0.695961（Δ=+0.242399），AP75、AP90 分别提高 0.347656、0.096331；gate ratio 为 0.739932。重新加载 `best.pt` 的独立验证产出与首次 val 的指标和残差 JSON 逐字节一致，排除了 checkpoint 保存/加载、阈值恢复和训练内存态导致的偶然结果。
+
+FP32/batch=1 进一步得到 coarse/refined=0.454151/0.698983（Δ=+0.244832），roundtrip 仍严格恒等。相对 AMP/batch=8，refined 绝对值变化约 +0.00302，其中 CA baseline 变化约 +0.00059。收益方向和量级稳定，但变化超过此前建议的 5e-4 数值阈值，因此正式结果固定为 FP32，并补做 FP32/batch=8 与 AMP/batch=1 的 2×2 精度/批大小审计。
+
+当前结果已经证明冻结 checkpoint 在现有 V3 评估链中稳定有效，但尚不能单凭聚合 mAP 证明实例级 ROI、quality gate 和 re-NMS 分别必要。为排除全局短边校准、proposal 错配和数据重复等替代解释，已新增完整机制真实性审计和 train/val 图像重复审计；在这些结果返回前，`+0.242～0.245` 仍按强 seed0 证据而非正式论文结论处理。
 
 ## 3. 已实现的正式 V3 定义
 
@@ -100,6 +120,11 @@ val 共 3,603 个实例。短边 P05/P50/P95 约为 3.61/10.83/32.82 px；短边
 | test 泄漏 | 已避免 | 参数 choices 不提供 test |
 | 本地无 torch/pytest | 预期环境差异 | 重型导入延迟到 main；本地完成 AST/`--help`，完整测试在云端运行 |
 | 静态测试未覆盖真实数据接口 | 已补充 | `smoke_refine_v3.py` 用一个 train batch 检查 hook、匹配、identity、反向传播和 CA 无梯度 |
+| seed0 大幅收益可能是统一缩放捷径 | 已新增审计 | 固定 holdout 均值残差、all-refine、short/long-only 对照 |
+| residual/quality 与 proposal 对应可能无关 | 已新增审计 | 图像内 residual/quality shuffle，保持边际分布并破坏对应关系 |
+| ROI 空间特征可能没有实际贡献 | 已新增审计 | 打乱有效 proposal 的 ROI 编码，同时保持 proposal state 不变 |
+| re-NMS 可能解释主要收益 | 已新增审计 | 同一预测输出比较 selected gate 与 selected-no-reNMS |
+| train/val 图像重复 | 已新增审计 | 完整路径、SHA256、dHash 近重复与人工拼图；test 不读取 |
 
 另外，train-fit 为便于随机打乱和任意分组子集，使用无增强的方形 640 letterbox；val 按标准 rect 模式评估。该差异不会改变标签坐标一致性，但可能形成轻微域差异，已列为 seed0 后的观察项。若 seed0 出现“holdout 正向、val 反向”，优先复核该项和场景分组，而不是直接扩大网络。
 
@@ -115,9 +140,9 @@ val 共 3,603 个实例。短边 P05/P50/P95 约为 3.61/10.83/32.82 px；短边
 
 ### 可行性
 
-实现可以直接进入云端 D1 修正版和 seed0 训练。D2 的跨分组结果表明该方向具有可学习性；scale oracle 上限也足够大。主要不确定性不在“有没有尺度信号”，而在三个转换环节：ROI 回归是否能在完整 proposal 分布上保持收益、quality gate 能否识别净受益 proposal、微小几何改善能否在重新 NMS 后转化为 mAP。
+修正版 D1、seed0 训练、checkpoint 独立复现和 FP32/batch=1 稳定性检查均已通过，说明尺度方向不仅存在 oracle 上限，而且已转化为很强的单 checkpoint val 收益。当前主要不确定性已经收敛为机制归因与数据完整性：实例级 ROI 是否优于固定尺度校准、quality gate 是否真正识别受益 proposal、re-NMS 贡献多大，以及 train/val 是否存在视觉近重复。
 
-因此当前最小可行实验不是再扩张结构，而是先运行已实现的闭环。seed0 结果将区分后续方向：
+因此当前不扩张结构，先运行已实现的真实性审计。结果将区分后续方向：
 
 - 若尺度回归诊断正向但 gate 较差：优先改 quality target/采样与阈值学习。
 - 若匹配样本损失下降但 residual 近常数：增加 proposal jitter、分层条件或 hard-example sampling。
@@ -129,9 +154,9 @@ val 共 3,603 个实例。短边 P05/P50/P95 约为 3.61/10.83/32.82 px；短边
 
 硬前置条件：
 
-- corrected D1 的 standard CA mAP50-95 在 `0.45413±0.002`；
-- post-NMS roundtrip 与 coarse 的 mAP50-95 差值不超过 `5e-4`；
-- CA SHA256、head 类型和 `reg_max` 检查全部通过。
+- corrected D1 的 standard CA mAP50-95 在 `0.45413±0.002`：已通过（0.4541379）；
+- post-NMS roundtrip 与 coarse 的 mAP50-95 差值不超过 `5e-4`：已通过（差值 0）；
+- CA SHA256、head 类型和 `reg_max` 检查全部通过：已通过。
 
 seed0 初筛门槛：
 
@@ -145,11 +170,15 @@ seed0 初筛门槛：
 
 ## 7. 执行顺序
 
-1. 运行完整 V3 `python -m pytest`。
-2. 运行一个 train batch 的 `smoke_refine_v3.py`，确认云端真实接口闭环。
-3. 运行 corrected D1，确认同口径 CA baseline 与 post-NMS scale oracle。
-4. 运行 `train_refine_v3.py` 完成 seed0 训练、holdout 选择和一次 val。
-5. 下载整个输出目录，重点提供 `run_manifest.json`、`train_history.csv`、`holdout_metrics.csv`、`selection.json`、`val_metrics.csv`、`val_diagnostics.json` 和 `acceptance.json`。
-6. `validate_refine_v3.py` 仅用于复现审核，不用于重新选择阈值。
+1. 完整 V3 `python -m pytest`：已完成。
+2. 一个 train batch 的 `smoke_refine_v3.py`：已完成并通过真实接口闭环。
+3. corrected D1 v2：已完成；同口径 CA baseline、top-K identity、post-NMS roundtrip 和 scale oracle 均通过。
+4. seed0 训练与冻结后一次 val：已完成，筛选通过。
+5. `best.pt` 独立复现：已完成，输出逐字节一致。
+6. FP32/batch=1：已完成，收益方向与量级稳定；发现约 0.003 的精度/批大小联合差异。
+7. 下一步运行 FP32/batch=8 与 AMP/batch=1，拆分精度和 batch 影响。
+8. 运行 `audit_refine_v3.py` 完成机制对照与逐 proposal/subgroup 审计。
+9. 运行 `audit_dataset_splits_v3.py` 完成 train/val 精确及感知近重复检查。
+10. 上述审计通过后才进入独立 CA seed 配对训练；test 继续封存。
 
 完整命令见同目录 `README.md`。

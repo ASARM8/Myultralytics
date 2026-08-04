@@ -24,6 +24,8 @@
 | `smoke_refine_v3.py` | 只读取一个 train batch，检查真实数据上的特征 hook、identity、匹配、反向传播和 CA 无梯度 |
 | `train_refine_v3.py` | 正式 seed0 训练；train-fit/holdout 选择 epoch 与质量阈值，随后只评一次 val |
 | `validate_refine_v3.py` | 复现冻结 checkpoint；校验 CA 文件哈希、baseline 和 NMS roundtrip identity |
+| `audit_refine_v3.py` | 冻结 checkpoint 的完整真实性审计：门控、均值残差、shuffle、短/长边、re-NMS、匹配 IoU 与分组统计 |
+| `audit_dataset_splits_v3.py` | train/val 路径、文件 SHA256、dHash 近重复与人工拼图审计；不读取 test |
 | `V3_IMPLEMENTATION_REVIEW.md` | 数据结论、设计依据、代码审核、风险边界和验收标准 |
 | `ultralytics/nn/modules/refine_v3/proposal_refine.py` | P2/P3 旋转条带编码和尺度/质量预测模块 |
 
@@ -33,7 +35,7 @@
 export OMP_NUM_THREADS=1
 BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
 DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-EXPORT=/root/autodl-tmp/paper_exports/refine_v3
+EXPORT=/root/autodl-tmp/paper_exports/refine_v3_seed0_01
 
 python -m pytest -q \
   tests/V3/test_refine_proposal_oracle.py \
@@ -41,7 +43,9 @@ python -m pytest -q \
   tests/V3/test_refine_rotated_roi_probe.py \
   tests/V3/test_proposal_refine_v3.py \
   tests/V3/test_runtime_v3.py \
-  tests/V3/test_train_refine_v3.py
+  tests/V3/test_train_refine_v3.py \
+  tests/V3/test_audit_refine_v3.py \
+  tests/V3/test_audit_dataset_splits_v3.py
 ```
 
 测试覆盖：参数边界、GT 加权 recall、分桶、分组无泄漏、类别感知一对一匹配、OBB 等价表示、零初始化 identity、非对称残差边界和 checkpoint 选择规则。
@@ -66,7 +70,7 @@ python -m myscripts.V3.smoke_refine_v3 \
 ```bash
 BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
 DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-EXPORT=/root/autodl-tmp/paper_exports/refine_v3
+EXPORT=/root/autodl-tmp/paper_exports/refine_v3_seed0_01
 
 python -m myscripts.V3.refine_proposal_oracle \
   --weights "$BASE" \
@@ -93,6 +97,8 @@ python -m myscripts.V3.refine_proposal_oracle \
 - `postnms_coarse` 与 `standard_ca` 的 mAP50-95 绝对差是否不超过 `5e-4`；否则脚本会在保存诊断后报错。
 - `postnms_oracle_scale` 是否相对 `postnms_coarse` 有明确正上限。它比 pre-NMS oracle 更贴近 V3 的实际作用位置。
 
+当前 D1 v2 已完成，结果为：standard CA=0.4541379，基线绝对误差约 `7.9e-6`；top-K coarse 与 standard CA 六项指标完全一致；post-NMS roundtrip 误差为 0；post-NMS scale oracle=0.787313（相对 coarse +0.333175）。三项训练前硬检查均已通过。oracle 仅表示几何上限，不是模型实际成绩。
+
 ## 5. seed0 正式训练
 
 ```bash
@@ -112,11 +118,20 @@ python -m myscripts.V3.train_refine_v3 \
   --match-iou 0.30 \
   --quality-min-gain 0.002 \
   --quality-thresholds 0.3,0.5,0.7,0.9 \
+  --roi-height 5 \
+  --roi-width 24 \
+  --roi-channels 32 \
+  --hidden-channels 128 \
+  --short-negative-limit 1.5 \
+  --short-positive-limit 0.25 \
+  --long-negative-limit 0.15 \
+  --long-positive-limit 0.15 \
+  --target-margin 0.99 \
   --lr 3e-4 \
   --warmup-epochs 3 \
   --weight-decay 1e-4 \
   --expected-ca-map50-95 0.45413 \
-  --output-dir "$EXPORT/train_seed0"
+  --output-dir "$EXPORT/train_seed0_scale_only"
 ```
 
 若文件名能识别同一场景的连续帧，应在命令中增加类似：
@@ -144,7 +159,7 @@ python -m myscripts.V3.train_refine_v3 \
 
 ```bash
 python -m myscripts.V3.validate_refine_v3 \
-  --checkpoint "$EXPORT/train_seed0/checkpoints/best.pt" \
+  --checkpoint "$EXPORT/train_seed0_scale_only/checkpoints/best.pt" \
   --ca-weights "$BASE" \
   --data "$DATA" \
   --split val \
@@ -158,7 +173,89 @@ python -m myscripts.V3.validate_refine_v3 \
 
 验证器默认从 checkpoint 读取 train-holdout 已选阈值，并拒绝 CA 文件哈希不一致、非纯 CA 头、非 `reg_max=32`、baseline 漂移或 post-NMS roundtrip 不恒等。
 
-## 7. 当前训练定义
+当前 seed0 已完成独立复现：AMP/batch=8 的 `val_metrics.csv` 与训练后首次 val 逐字节一致，mAP50-95 为 0.695961。FP32/batch=1 得到 coarse=0.454151、refined=0.698983、Δ=+0.244832，方向和幅度稳定，但说明半精度与批大小需要拆开记录，正式审计固定使用 FP32。
+
+## 7. 完整真实性审计
+
+### 7.1 先拆分 batch 与精度影响
+
+以下两次只用于数值稳定性审核，不重新选择 checkpoint 或 threshold：
+
+```bash
+python -m myscripts.V3.validate_refine_v3 \
+  --checkpoint "$EXPORT/train_seed0_scale_only/checkpoints/best.pt" \
+  --ca-weights "$BASE" \
+  --data "$DATA" \
+  --split val \
+  --imgsz 640 \
+  --batch 8 \
+  --device 0 \
+  --workers 8 \
+  --no-amp \
+  --expected-ca-map50-95 0.45413 \
+  --output-dir "$EXPORT/validate_seed0_fp32_batch8"
+
+python -m myscripts.V3.validate_refine_v3 \
+  --checkpoint "$EXPORT/train_seed0_scale_only/checkpoints/best.pt" \
+  --ca-weights "$BASE" \
+  --data "$DATA" \
+  --split val \
+  --imgsz 640 \
+  --batch 1 \
+  --device 0 \
+  --workers 8 \
+  --amp \
+  --expected-ca-map50-95 0.45413 \
+  --output-dir "$EXPORT/validate_seed0_amp_batch1"
+```
+
+与已有 AMP/batch=8、FP32/batch=1 组成 2×2 对照。论文正式口径采用 FP32；batch 变化不应改变结论方向，且同精度下 mAP50-95 建议相差不超过 `0.002`。
+
+### 7.2 机制真实性审计
+
+```bash
+python -m myscripts.V3.audit_refine_v3 \
+  --checkpoint "$EXPORT/train_seed0_scale_only/checkpoints/best.pt" \
+  --ca-weights "$BASE" \
+  --data "$DATA" \
+  --split val \
+  --imgsz 640 \
+  --batch 8 \
+  --device 0 \
+  --workers 8 \
+  --no-amp \
+  --shuffle-seed 20250301 \
+  --expected-ca-map50-95 0.45413 \
+  --expected-refined-map50-95 0.69898 \
+  --refined-tolerance 0.002 \
+  --output-dir "$EXPORT/truth_audit_fp32_batch8"
+```
+
+脚本从 checkpoint 读取 epoch15 和 train-holdout 已选 threshold=0.3，不允许在 val 重选。它输出：
+
+- `mechanism_metrics.csv`：coarse、roundtrip、gate-off、正常门控、全开、短/长边、冻结均值残差、residual/quality/spatial shuffle、去除 re-NMS；
+- `matched_proposal_diagnostics.csv`：逐匹配 proposal 的预测残差、quality、coarse/refined/oracle IoU；
+- `quality_audit.json`：quality 对真实学习收益和 bounded oracle 收益的 AUC、Brier、精确率/召回率及相关性；
+- `subgroup_metrics.csv`：按短边、长宽比和置信度的改善/恶化比例；
+- `truth_audit.json` 与 `truth_audit_report.md`：硬完整性检查和各机制差值。
+
+`gate_off`、`roundtrip` 必须与 coarse 恒等。若正常结果不能明显优于均值残差或 residual shuffle，整体增益仍可是真实的，但论文不能把它解释为实例级 ROI 精修；若 quality shuffle 与正常结果接近，则 quality gate 的独立贡献不足。
+
+### 7.3 train/val 数据划分审计
+
+```bash
+python -m myscripts.V3.audit_dataset_splits_v3 \
+  --data "$DATA" \
+  --imgsz 640 \
+  --near-hamming 4 \
+  --max-near-pairs 5000 \
+  --contact-sheet-pairs 40 \
+  --output-dir "$EXPORT/dataset_split_audit"
+```
+
+完整路径或文件 SHA256 跨 train/val 重复会在保存证据后报错。dHash 近重复只作为人工核对候选，脚本会生成 `near_duplicate_contact_sheet_*.jpg`，不能仅凭感知哈希自动判为泄漏。test 全程不读取。
+
+## 8. 当前训练定义
 
 - 处理 CA 的 post-NMS proposal，保留类别和置信度。
 - 使用 P2/P3 旋转对齐条带及 proposal 状态特征。
