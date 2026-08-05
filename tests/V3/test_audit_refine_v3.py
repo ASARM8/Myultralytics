@@ -5,10 +5,13 @@ import math
 import pytest
 
 from myscripts.V3.audit_refine_v3 import (
+    VARIANTS,
     assign_bin,
     binary_auc,
     binary_summary,
     pearson,
+    read_excluded_images,
+    retained_indices,
     stable_seed,
     summarize_rows,
 )
@@ -17,6 +20,13 @@ from myscripts.V3.audit_refine_v3 import (
 def test_stable_seed_is_repeatable_and_key_sensitive():
     assert stable_seed("image-a", 7) == stable_seed("image-a", 7)
     assert stable_seed("image-a", 7) != stable_seed("image-b", 7)
+
+
+def test_v31_prefreeze_variants_isolate_branch_gate_and_renms():
+    assert "short_only_all" in VARIANTS
+    assert "short_only_all_no_renms" in VARIANTS
+    assert "all_refine_no_renms" in VARIANTS
+    assert "long_only_all" in VARIANTS
 
 
 def test_binary_auc_is_tie_aware_and_exact_for_perfect_ordering():
@@ -62,3 +72,17 @@ def test_subgroup_summary_reports_improvement_and_gate_ratios():
     assert first["improved_ratio"] == pytest.approx(0.5)
     assert first["worsened_ratio"] == pytest.approx(0.5)
     assert first["gate_ratio"] == pytest.approx(1.0)
+
+
+def test_image_exclusion_manifest_requires_every_path_to_match(tmp_path):
+    excluded = tmp_path / "excluded.txt"
+    excluded.write_text("/data/val/b.jpg\n", encoding="utf-8")
+    rows = read_excluded_images(excluded)
+    indices, found = retained_indices(["/data/val/a.jpg", "/data/val/b.jpg"], rows)
+    assert indices == [0]
+    assert found == ["/data/val/b.jpg"]
+    with pytest.raises(RuntimeError, match="absent"):
+        retained_indices(["/data/val/a.jpg"], rows)
+
+    excluded.write_text("# no exact overlap\n", encoding="utf-8")
+    assert read_excluded_images(excluded) == set()

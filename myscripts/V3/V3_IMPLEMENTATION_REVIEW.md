@@ -182,3 +182,35 @@ seed0 初筛门槛：
 10. 上述审计通过后才进入独立 CA seed 配对训练；test 继续封存。
 
 完整命令见同目录 `README.md`。
+
+## 8. 已完成的真实性审计与数据审计
+
+### 8.1 机制真实性
+
+FP32/batch=8 下，coarse/selected/all-refine 的 mAP50-95 分别为 `0.454137/0.698984/0.699697`。关键控制结果：
+
+- gate-off、roundtrip 与 coarse 完全恒等；
+- mean-residual-selected 为 `0.450306`，排除统一缩放捷径；
+- residual shuffle、quality shuffle、spatial shuffle 分别为 `0.617736/0.660680/0.534323`，均明显低于正确 proposal 对应；
+- short-only（当前 gate）为 `0.699072`，long-only 为 `0.453802`；
+- selected-no-reNMS 与 selected 完全一致；
+- quality 对实际受益标签 ROC AUC 为 `0.7220`，但当前门控比 all-refine 低 `0.000713`。
+
+这些结果支持“proposal 对应的旋转 ROI 残差是真实信号”，但不支持把长边分支、当前质量门控或二次 NMS 分别写成独立有效组件。
+
+### 8.2 数据划分
+
+train/val 路径和 stem 没有交叉，但发现 13 对逐字节重复图像，涉及 7 张唯一 val 图像；另有 1883 对 dHash≤4 候选。精确重复是硬风险，dHash 候选只允许人工复核。原 val 结果继续作为历史审计数据，不作为最终无污染结论。
+
+## 9. V3.1 冻结前验证
+
+V3.1 前不直接按 val 最高分选择组合。新增验证固定在两个范围运行：
+
+1. 复现原训练规则并排除 train-fit 精确重复的 deterministic clean-holdout；
+2. 排除 7 张精确重复 val 图像后的 clean-val。
+
+同口径比较 `all_refine`、`short_only_all`、质量门控和 no-reNMS，并按预声明的 `0.002` 非劣性容差和 `5e-4` 恒等性容差决定是否删除长边、质量门控和二次 NMS。实现与命令见 `../V3_1/README.md`。
+
+冻结前准备还会检查同一源帧切片是否跨 train-fit/holdout。若存在，当前 checkpoint 仍可用于删减方向的敏感性分析，但 V3.1 正式训练必须先采用来源分组重新构造 fit/holdout。
+
+完整跨版本记录见：`../../mydocs/创新点一/Refine_V1至V3.1工作记录.md`。

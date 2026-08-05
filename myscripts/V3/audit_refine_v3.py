@@ -28,8 +28,12 @@ VARIANTS = (
     "selected_gate",
     "selected_no_renms",
     "all_refine",
+    "all_refine_no_renms",
     "short_only",
+    "short_only_all",
+    "short_only_all_no_renms",
     "long_only",
+    "long_only_all",
     "mean_residual_selected",
     "mean_residual_all",
     "residual_shuffle",
@@ -44,6 +48,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ca-weights", default=CANONICAL_CA_WEIGHTS)
     parser.add_argument("--data", required=True)
     parser.add_argument("--split", choices=("val",), default="val")
+    parser.add_argument(
+        "--evaluation-scope",
+        choices=("val", "train-holdout"),
+        default="val",
+        help="Evaluate the normal validation split or reproduce the deterministic train-holdout partition.",
+    )
+    parser.add_argument("--holdout-fraction", type=float, default=0.20)
+    parser.add_argument("--holdout-seed", type=int, default=0)
+    parser.add_argument(
+        "--group-regex",
+        default="",
+        help="Must match the training run when --evaluation-scope=train-holdout.",
+    )
+    parser.add_argument(
+        "--exclude-images-file",
+        default="",
+        help="Optional UTF-8 file containing one absolute image path per line for leakage-sensitivity audits.",
+    )
     parser.add_argument("--imgsz", type=int, choices=(640,), default=640)
     parser.add_argument("--batch", type=int, default=8)
     parser.add_argument("--device", default="0")
@@ -52,10 +74,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--amp",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Use autocast. The canonical truth audit defaults to FP32; use --amp only for a precision sensitivity run.",
+        help=(
+            "Use autocast. The canonical truth audit defaults to FP32; use --amp only for a precision sensitivity run."
+        ),
     )
     parser.add_argument("--shuffle-seed", type=int, default=20250301)
     parser.add_argument("--expected-ca-map50-95", type=float, default=0.45413)
+    parser.add_argument(
+        "--skip-baseline-reference",
+        action="store_true",
+        help="Skip comparison with a previously known aggregate CA score while retaining hash and identity checks.",
+    )
     parser.add_argument("--baseline-tolerance", type=float, default=0.002)
     parser.add_argument("--identity-tolerance", type=float, default=5e-4)
     parser.add_argument("--expected-refined-map50-95", type=float, default=None)
@@ -68,9 +97,13 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     if Path(args.ca_weights).as_posix() != Path(CANONICAL_CA_WEIGHTS).as_posix():
         parser.error(f"V3 truth audit is locked to the canonical CA checkpoint: {CANONICAL_CA_WEIGHTS}")
     if args.batch <= 1:
-        parser.error("--batch must be at least 2 because the spatial-shuffle control operates across proposals in a batch")
+        parser.error(
+            "--batch must be at least 2 because the spatial-shuffle control operates across proposals in a batch"
+        )
     if args.workers < 0:
         parser.error("--workers must be non-negative")
+    if not 0.0 < args.holdout_fraction < 1.0:
+        parser.error("--holdout-fraction must be in (0, 1)")
     if not 0.0 <= args.expected_ca_map50_95 <= 1.0:
         parser.error("--expected-ca-map50-95 must be in [0, 1]")
     if args.expected_refined_map50_95 is not None and not 0.0 <= args.expected_refined_map50_95 <= 1.0:
@@ -98,6 +131,45 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+def normalized_image_path(path: str | Path) -> str:
+    """Normalize an image path for stable exclusion matching."""
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def read_excluded_images(path: str | Path) -> set[str]:
+    """Read a newline-delimited image exclusion manifest."""
+    if not path:
+        return set()
+    manifest = Path(path)
+    if not manifest.is_file():
+        raise FileNotFoundError(f"image exclusion manifest not found: {manifest}")
+    rows = {
+        normalized_image_path(line.strip())
+        for line in manifest.read_text(encoding="utf-8-sig").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+    return rows
+
+
+def retained_indices(image_paths: Iterable[str], excluded: set[str]) -> tuple[list[int], list[str]]:
+    """Return dataset indices after exclusions and the exclusions actually found."""
+    kept: list[int] = []
+    found: list[str] = []
+    for index, image_path in enumerate(image_paths):
+        normalized = normalized_image_path(image_path)
+        if normalized in excluded:
+            found.append(str(image_path))
+        else:
+            kept.append(index)
+    missing = excluded - {normalized_image_path(path) for path in found}
+    if missing:
+        preview = ", ".join(sorted(missing)[:3])
+        raise RuntimeError(f"{len(missing)} excluded images are absent from the selected dataset, e.g. {preview}")
+    if not kept:
+        raise RuntimeError("all images were removed by the exclusion manifest")
+    return kept, found
 
 
 def stable_seed(text: str, seed: int) -> int:
@@ -214,6 +286,8 @@ def write_report(path: Path, audit: dict[str, Any], metrics: list[dict[str, Any]
         "# Refine V3 完整真实性审计",
         "",
         f"- checkpoint epoch：{audit['checkpoint_epoch']}",
+        f"- 评估范围：{audit['evaluation_scope']}（{audit['evaluated_images']} 张）",
+        f"- 排除图像：{audit['excluded_images']} 张",
         f"- train-holdout 预选 quality threshold：{audit['quality_threshold']:.3f}",
         f"- 精度模式：{'AMP' if audit['amp'] else 'FP32'}；batch={audit['batch']}",
         f"- hard integrity：{audit['hard_integrity_pass']}",
@@ -235,11 +309,17 @@ def write_report(path: Path, audit: dict[str, Any], metrics: list[dict[str, Any]
             "## 机制差值",
             "",
             f"- selected − all-refine：{_metric_delta(lookup, 'selected_gate', 'all_refine'):+.6f}",
-            f"- selected − mean-residual-selected：{_metric_delta(lookup, 'selected_gate', 'mean_residual_selected'):+.6f}",
+            f"- selected − mean-residual-selected："
+            f"{_metric_delta(lookup, 'selected_gate', 'mean_residual_selected'):+.6f}",
             f"- selected − residual-shuffle：{_metric_delta(lookup, 'selected_gate', 'residual_shuffle'):+.6f}",
             f"- selected − quality-shuffle：{_metric_delta(lookup, 'selected_gate', 'quality_shuffle'):+.6f}",
             f"- selected − spatial-shuffle：{_metric_delta(lookup, 'selected_gate', 'spatial_shuffle'):+.6f}",
             f"- selected − no-reNMS：{_metric_delta(lookup, 'selected_gate', 'selected_no_renms'):+.6f}",
+            f"- all-refine − all-refine-no-reNMS：{_metric_delta(lookup, 'all_refine', 'all_refine_no_renms'):+.6f}",
+            f"- short-only-all − short-only-gated：{_metric_delta(lookup, 'short_only_all', 'short_only'):+.6f}",
+            f"- short-only-all − full-all-refine：{_metric_delta(lookup, 'short_only_all', 'all_refine'):+.6f}",
+            f"- short-only-all − short-only-all-no-reNMS："
+            f"{_metric_delta(lookup, 'short_only_all', 'short_only_all_no_renms'):+.6f}",
             "",
             "## 解释边界",
             "",
@@ -278,6 +358,8 @@ def main() -> None:
         pad_detections,
         rerun_rotated_nms,
         sha256_file,
+        split_dataset_indices,
+        subset_loader,
         update_metric,
     )
 
@@ -311,6 +393,20 @@ def main() -> None:
     training_args = checkpoint.get("arguments") or {}
     if training_args.get("output_dir") is None:
         raise RuntimeError("checkpoint is missing frozen training arguments")
+    if args.evaluation_scope == "train-holdout":
+        expected_holdout = float(training_args.get("holdout_fraction", 0.20))
+        expected_seed = int(training_args.get("seed", 0))
+        expected_group_regex = str(training_args.get("group_regex", ""))
+        if abs(args.holdout_fraction - expected_holdout) > 1e-12:
+            raise RuntimeError(
+                f"holdout fraction differs from checkpoint training: {args.holdout_fraction} != {expected_holdout}"
+            )
+        if args.holdout_seed != expected_seed:
+            raise RuntimeError(f"holdout seed differs from checkpoint training: {args.holdout_seed} != {expected_seed}")
+        if args.group_regex != expected_group_regex:
+            raise RuntimeError(
+                f"group regex differs from checkpoint training: {args.group_regex!r} != {expected_group_regex!r}"
+            )
     ca_hash = sha256_file(ca_path)
     if checkpoint.get("ca_sha256") != ca_hash:
         raise RuntimeError("CA SHA256 differs from the checkpoint training source")
@@ -333,8 +429,46 @@ def main() -> None:
     max_det = int(training_args.get("max_det", 300))
     match_iou = float(training_args.get("match_iou", 0.30))
     quality_min_gain = float(training_args.get("quality_min_gain", 0.002))
-    dataset, data = build_dataset(args.data, args.split, args.imgsz, args.batch, args.workers, rect=True)
-    loader = full_loader(dataset, args.batch, args.workers)
+    source_split = "train" if args.evaluation_scope == "train-holdout" else args.split
+    use_rect = args.evaluation_scope == "val"
+    dataset, data = build_dataset(args.data, source_split, args.imgsz, args.batch, args.workers, rect=use_rect)
+    selected_indices: list[int] | None = None
+    split_metadata: dict[str, Any] = {}
+    if args.evaluation_scope == "train-holdout":
+        _, selected_indices, fit_groups, holdout_groups = split_dataset_indices(
+            dataset.im_files,
+            args.holdout_fraction,
+            args.holdout_seed,
+            args.group_regex,
+        )
+        split_metadata = {
+            "holdout_fraction": args.holdout_fraction,
+            "holdout_seed": args.holdout_seed,
+            "group_regex": args.group_regex,
+            "fit_groups": len(fit_groups),
+            "holdout_groups": len(holdout_groups),
+            "group_overlap": len(fit_groups & holdout_groups),
+        }
+    excluded = read_excluded_images(args.exclude_images_file)
+    excluded_found: list[str] = []
+    if excluded:
+        retained, excluded_found = retained_indices(dataset.im_files, excluded)
+        if selected_indices is not None:
+            selected_set = set(selected_indices)
+            excluded_indices = set(range(len(dataset))) - set(retained)
+            outside_scope = excluded_indices - selected_set
+            if outside_scope:
+                raise RuntimeError(
+                    f"{len(outside_scope)} excluded images are outside the deterministic train-holdout scope"
+                )
+            retained_set = set(retained)
+            selected_indices = [index for index in selected_indices if index in retained_set]
+    if selected_indices is None:
+        loader = full_loader(dataset, args.batch, args.workers)
+        evaluated_images = len(dataset) - len(excluded_found)
+    else:
+        loader = subset_loader(dataset, selected_indices, args.batch, args.workers, shuffle=False)
+        evaluated_images = len(selected_indices)
     names = getattr(ca_model, "names", data["names"])
     nc = len(names)
     extractor = FrozenCAExtractor(
@@ -390,8 +524,14 @@ def main() -> None:
                 ):
                     output = refiner(p2, p3, boxes, scores, images.shape[2:], valid)
 
-                flat_valid = valid.reshape(-1)
-                spatial_key = "|".join(str(item) for item in batch.get("im_file", ()))
+                batch_files = [str(path) for path in batch.get("im_file", ())]
+                analysis_valid = valid.clone()
+                if excluded:
+                    for image_index, image_path in enumerate(batch_files):
+                        if normalized_image_path(image_path) in excluded:
+                            analysis_valid[image_index] = False
+                flat_valid = analysis_valid.reshape(-1)
+                spatial_key = "|".join(batch_files)
 
                 def shuffle_spatial(_module, _inputs, encoded):
                     indices = torch.where(flat_valid.to(encoded.device))[0]
@@ -413,9 +553,12 @@ def main() -> None:
                 quality = output["quality_logit"].float().sigmoid().squeeze(-1)
                 spatial_residual = spatial_output["residual"].float()
                 spatial_quality = spatial_output["quality_logit"].float().sigmoid().squeeze(-1)
-                valid_count += int(valid.sum().item())
+                valid_count += int(analysis_valid.sum().item())
 
                 for image_index, coarse_detection in enumerate(detections):
+                    image_name = batch_files[image_index] if batch_files else f"batch{batch_index}_image{image_index}"
+                    if excluded and normalized_image_path(image_name) in excluded:
+                        continue
                     count = int(valid[image_index].sum().item())
                     image_boxes = boxes[image_index, :count].float()
                     image_scores = scores[image_index, :count].float()
@@ -425,7 +568,6 @@ def main() -> None:
                     selected_gate = image_quality >= threshold
                     all_gate = torch.ones_like(selected_gate)
                     zero_gate = torch.zeros_like(selected_gate)
-                    image_name = str(batch.get("im_file", [f"batch{batch_index}_image{image_index}"])[image_index])
                     order = permutation(count, f"proposal:{image_name}", image_boxes.device) if count else None
                     shuffled_residual = image_residual[order] if count else image_residual
                     shuffled_quality = image_quality[order] if count else image_quality
@@ -445,8 +587,12 @@ def main() -> None:
                         "selected_gate": (image_residual, selected_gate, True),
                         "selected_no_renms": (image_residual, selected_gate, False),
                         "all_refine": (image_residual, all_gate, True),
+                        "all_refine_no_renms": (image_residual, all_gate, False),
                         "short_only": (short_residual, selected_gate, True),
+                        "short_only_all": (short_residual, all_gate, True),
+                        "short_only_all_no_renms": (short_residual, all_gate, False),
                         "long_only": (long_residual, selected_gate, True),
+                        "long_only_all": (long_residual, all_gate, True),
                         "mean_residual_selected": (mean_residual, selected_gate, True),
                         "mean_residual_all": (mean_residual, all_gate, True),
                         "residual_shuffle": (shuffled_residual, selected_gate, True),
@@ -484,7 +630,9 @@ def main() -> None:
                     encoded = refiner.encode_targets(matched_boxes, matched_targets)
                     oracle_residual = refiner.clip_target(encoded)
                     coarse_iou = probiou(matched_boxes, matched_targets).reshape(-1)
-                    all_iou = probiou(refiner.apply_residual(matched_boxes, matched_residual), matched_targets).reshape(-1)
+                    all_iou = probiou(
+                        refiner.apply_residual(matched_boxes, matched_residual), matched_targets
+                    ).reshape(-1)
                     selected_iou = probiou(
                         refiner.apply_residual(
                             matched_boxes, matched_residual * matched_gate[:, None].to(matched_residual.dtype)
@@ -495,11 +643,17 @@ def main() -> None:
                         refiner.apply_residual(matched_boxes, short_residual[proposal_index] * matched_gate[:, None]),
                         matched_targets,
                     ).reshape(-1)
+                    short_all_iou = probiou(
+                        refiner.apply_residual(matched_boxes, short_residual[proposal_index]),
+                        matched_targets,
+                    ).reshape(-1)
                     long_iou = probiou(
                         refiner.apply_residual(matched_boxes, long_residual[proposal_index] * matched_gate[:, None]),
                         matched_targets,
                     ).reshape(-1)
-                    oracle_iou = probiou(refiner.apply_residual(matched_boxes, oracle_residual), matched_targets).reshape(-1)
+                    oracle_iou = probiou(
+                        refiner.apply_residual(matched_boxes, oracle_residual), matched_targets
+                    ).reshape(-1)
                     matched_short = matched_boxes[:, 2:4].amin(dim=1)
                     matched_long = matched_boxes[:, 2:4].amax(dim=1)
                     for local_index, proposal_slot in enumerate(proposal_index.tolist()):
@@ -514,7 +668,9 @@ def main() -> None:
                                 "confidence": float(image_scores[proposal_slot]),
                                 "coarse_short": float(matched_short[local_index]),
                                 "coarse_long": float(matched_long[local_index]),
-                                "aspect_ratio": float(matched_long[local_index] / matched_short[local_index].clamp_min(1e-6)),
+                                "aspect_ratio": float(
+                                    matched_long[local_index] / matched_short[local_index].clamp_min(1e-6)
+                                ),
                                 "quality_probability": float(image_quality[proposal_slot]),
                                 "gate": int(matched_gate[local_index]),
                                 "dshort": float(matched_residual[local_index, 0]),
@@ -523,10 +679,12 @@ def main() -> None:
                                 "all_refine_iou": float(all_iou[local_index]),
                                 "selected_iou": float(selected_iou[local_index]),
                                 "short_only_iou": float(short_iou[local_index]),
+                                "short_only_all_iou": float(short_all_iou[local_index]),
                                 "long_only_iou": float(long_iou[local_index]),
                                 "bounded_oracle_iou": float(oracle_iou[local_index]),
                                 "all_refine_delta_iou": all_gain,
                                 "selected_delta_iou": selected_gain,
+                                "short_only_all_delta_iou": float(short_all_iou[local_index] - coarse_iou[local_index]),
                                 "bounded_oracle_delta_iou": oracle_gain,
                                 "learned_benefit_target": int(all_gain >= quality_min_gain),
                                 "bounded_oracle_target": int(oracle_gain >= quality_min_gain),
@@ -590,9 +748,11 @@ def main() -> None:
             if args.expected_refined_map50_95 is not None
             else None
         )
+        baseline_error = None if args.skip_baseline_reference else abs(coarse_map - args.expected_ca_map50_95)
         checks = {
-            "baseline_abs_error": abs(coarse_map - args.expected_ca_map50_95),
-            "baseline_pass": abs(coarse_map - args.expected_ca_map50_95) <= args.baseline_tolerance,
+            "baseline_reference_required": not args.skip_baseline_reference,
+            "baseline_abs_error": baseline_error,
+            "baseline_pass": baseline_error is None or baseline_error <= args.baseline_tolerance,
             "roundtrip_identity_abs_error": roundtrip_error,
             "roundtrip_identity_pass": roundtrip_error <= args.identity_tolerance,
             "gate_off_identity_abs_error": gate_off_error,
@@ -609,6 +769,12 @@ def main() -> None:
             "ca_sha256": ca_hash,
             "data": args.data,
             "split": args.split,
+            "evaluation_scope": args.evaluation_scope,
+            "source_split": source_split,
+            "evaluated_images": evaluated_images,
+            "excluded_images": len(excluded_found),
+            "exclude_images_file": args.exclude_images_file or None,
+            "split_metadata": split_metadata,
             "imgsz": args.imgsz,
             "batch": args.batch,
             "amp": use_amp,
@@ -622,6 +788,12 @@ def main() -> None:
             "checks": checks,
             "mechanism_margins_map50_95": {
                 "selected_minus_all_refine": _metric_delta(lookup, "selected_gate", "all_refine"),
+                "all_refine_minus_no_renms": _metric_delta(lookup, "all_refine", "all_refine_no_renms"),
+                "short_only_all_minus_short_only_gated": _metric_delta(lookup, "short_only_all", "short_only"),
+                "short_only_all_minus_all_refine": _metric_delta(lookup, "short_only_all", "all_refine"),
+                "short_only_all_minus_no_renms": _metric_delta(
+                    lookup, "short_only_all", "short_only_all_no_renms"
+                ),
                 "selected_minus_mean_selected": _metric_delta(lookup, "selected_gate", "mean_residual_selected"),
                 "selected_minus_mean_all": _metric_delta(lookup, "selected_gate", "mean_residual_all"),
                 "selected_minus_residual_shuffle": _metric_delta(lookup, "selected_gate", "residual_shuffle"),
@@ -655,6 +827,10 @@ def main() -> None:
                 "stage": "V3 frozen-checkpoint truth audit",
                 "arguments": vars(args),
                 "variants": VARIANTS,
+                "evaluation_scope": args.evaluation_scope,
+                "evaluated_images": evaluated_images,
+                "excluded_images": excluded_found,
+                "split_metadata": split_metadata,
                 "quality_threshold": threshold,
                 "quality_threshold_source": "checkpoint.train-holdout selection",
                 "test_used": False,

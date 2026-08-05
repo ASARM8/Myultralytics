@@ -266,3 +266,21 @@ python -m myscripts.V3.audit_dataset_splits_v3 \
 - 质量阴性或未匹配 proposal 加轻量 identity 约束；精修后重新执行旋转 NMS。
 
 所有数值仍属于 seed0 筛选设计，不应在完成多种子配对实验前写成正式论文结论。
+
+## 9. V3 已完成审计与 V3.1 入口
+
+V3 的独立复现、FP32/AMP 与 batch 对照、完整机制真实性审计和 train/val 划分审计均已完成。当前证据为：
+
+- proposal 对应 residual 和旋转 ROI 空间特征均有真实贡献；
+- 仅短边残差基本复现完整收益；
+- 当前 quality gate 略低于 all-refine；
+- selected 路径的二次 NMS 不改变指标；
+- 数据中存在 13 对精确 train/val 重复，涉及 7 张唯一 val 图像。
+
+下一步不在本目录继续扩张 V3，而是运行独立的冻结前验证：
+
+```text
+myscripts/V3_1/README.md
+```
+
+该验证会在 train-holdout 和 clean-val 上用同一组预声明规则判断 V3.1 是否删除长边分支、质量门控与二次 NMS。完整历史记录见 `mydocs/创新点一/Refine_V1至V3.1工作记录.md`。
