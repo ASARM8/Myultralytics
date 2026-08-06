@@ -28,6 +28,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--identity-tolerance", type=float, default=5e-4)
     parser.add_argument("--minimum-map-gain", type=float, default=0.03)
     parser.add_argument("--max-ap90-drop", type=float, default=0.002)
+    parser.add_argument("--max-ap95-drop", type=float, default=0.002)
+    parser.add_argument("--max-boundary-ratio", type=float, default=0.10)
     parser.add_argument("--output-dir", required=True)
     return parser
 
@@ -37,13 +39,20 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error(f"V3.1 validation is locked to the canonical CA checkpoint: {CANONICAL_CA_WEIGHTS}")
     if args.batch <= 0 or args.workers < 0:
         parser.error("batch must be positive and workers must be non-negative")
-    if min(args.baseline_tolerance, args.identity_tolerance, args.minimum_map_gain, args.max_ap90_drop) <= 0:
+    if min(
+        args.baseline_tolerance,
+        args.identity_tolerance,
+        args.minimum_map_gain,
+        args.max_ap90_drop,
+        args.max_ap95_drop,
+        args.max_boundary_ratio,
+    ) <= 0:
         parser.error("tolerances and minimum gain must be positive")
 
 
-def main() -> None:
+def main(argv: list[str] | None = None, *, required_architecture: str | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_args(parser, args)
     if not os.environ.get("OMP_NUM_THREADS", "").isdigit() or int(os.environ.get("OMP_NUM_THREADS", "0")) <= 0:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -52,6 +61,7 @@ def main() -> None:
 
     from ultralytics import YOLO
     from ultralytics.nn.modules.refine_v31 import OBBProposalRefinerV31
+    from ultralytics.nn.modules.refine_v311 import OBBProposalRefinerV311
     from ultralytics.utils.torch_utils import select_device
 
     from .runtime import FrozenCAExtractor, build_dataset, evaluate_refiner_v31, full_loader, sha256_file
@@ -65,8 +75,15 @@ def main() -> None:
     if not ca_path.is_file():
         raise FileNotFoundError(f"canonical CA checkpoint not found: {ca_path}")
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    if checkpoint.get("format_version") != 1 or checkpoint.get("architecture") != "OBBProposalRefinerV31":
-        raise RuntimeError("unsupported or non-V3.1 checkpoint format")
+    architecture = checkpoint.get("architecture")
+    refiner_classes = {
+        "OBBProposalRefinerV31": OBBProposalRefinerV31,
+        "OBBProposalRefinerV311": OBBProposalRefinerV311,
+    }
+    if checkpoint.get("format_version") != 1 or architecture not in refiner_classes:
+        raise RuntimeError("unsupported Refine V3.1/V3.1.1 checkpoint format")
+    if required_architecture is not None and architecture != required_architecture:
+        raise RuntimeError(f"expected {required_architecture} checkpoint, received {architecture}")
     ca_hash = sha256_file(ca_path)
     if checkpoint.get("ca_sha256") != ca_hash:
         raise RuntimeError("CA checkpoint hash mismatch; V3.1 features/proposals no longer match training")
@@ -100,7 +117,7 @@ def main() -> None:
         expected_channels = int(config["p2_channels"]), int(config["p3_channels"])
         if observed_channels != expected_channels:
             raise RuntimeError(f"CA feature-channel mismatch: expected {expected_channels}, got {observed_channels}")
-        refiner = OBBProposalRefinerV31(**config).to(device).float().eval()
+        refiner = refiner_classes[architecture](**config).to(device).float().eval()
         refiner.load_state_dict(checkpoint["model_state"], strict=True)
         rows, diagnostics = evaluate_refiner_v31(
             extractor,
@@ -119,11 +136,20 @@ def main() -> None:
         delta_map = refined["map50_95"] - coarse["map50_95"]
         delta_ap75 = refined["ap75"] - coarse["ap75"]
         delta_ap90 = refined["ap90"] - coarse["ap90"]
+        delta_ap95 = refined["ap95"] - coarse["ap95"]
+        residual_non_constant = max(
+            diagnostics["short_residual_std"], diagnostics["long_residual_std"]
+        ) > 1e-4
         audit = {
             "checkpoint": str(checkpoint_path),
             "checkpoint_sha256": sha256_file(checkpoint_path),
             "checkpoint_epoch": checkpoint.get("epoch"),
+            "architecture": architecture,
             "experiment": checkpoint.get("experiment"),
+            "target_transform": (
+                "smooth_compression" if architecture == "OBBProposalRefinerV311" else "hard_clip"
+            ),
+            "supervision_margin": config.get("supervision_margin", config.get("target_margin")),
             "ca_weights": str(ca_path),
             "ca_sha256": ca_hash,
             "data": args.data,
@@ -137,17 +163,42 @@ def main() -> None:
             "delta_map50_95": delta_map,
             "delta_ap75": delta_ap75,
             "delta_ap90": delta_ap90,
+            "delta_ap95": delta_ap95,
             "minimum_gain_pass": delta_map >= args.minimum_map_gain,
             "ap75_pass": delta_ap75 >= 0,
             "ap90_pass": delta_ap90 >= -args.max_ap90_drop,
+            "ap95_pass": delta_ap95 >= -args.max_ap95_drop,
             "matched_delta_iou_mean": diagnostics["matched_delta_iou_mean"],
             "matched_improved_ratio": diagnostics["matched_improved_ratio"],
             "matched_worsened_ratio": diagnostics["matched_worsened_ratio"],
+            "matched_iou_pass": diagnostics["matched_delta_iou_mean"] >= 0.0,
+            "matched_ratio_pass": diagnostics["matched_improved_ratio"] >= diagnostics["matched_worsened_ratio"],
+            "short_boundary_ratio": diagnostics["short_boundary_ratio"],
+            "long_boundary_ratio": diagnostics["long_boundary_ratio"],
+            "short_boundary_pass": diagnostics["short_boundary_ratio"] <= args.max_boundary_ratio,
+            "long_boundary_pass": diagnostics["long_boundary_ratio"] <= args.max_boundary_ratio,
+            "residual_non_constant": residual_non_constant,
             "proposal_policy": "all",
             "quality_used_at_inference": False,
             "rerun_nms": False,
             "test_used": False,
         }
+        audit["reproduction_pass"] = all(
+            audit[key]
+            for key in (
+                "baseline_pass",
+                "identity_pass",
+                "minimum_gain_pass",
+                "ap75_pass",
+                "ap90_pass",
+                "ap95_pass",
+                "matched_iou_pass",
+                "matched_ratio_pass",
+                "short_boundary_pass",
+                "long_boundary_pass",
+                "residual_non_constant",
+            )
+        )
         write_csv(output_dir / "val_metrics.csv", rows)
         write_json(output_dir / "val_diagnostics.json", diagnostics)
         write_json(output_dir / "validation_audit.json", audit)

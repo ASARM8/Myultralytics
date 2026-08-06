@@ -12,6 +12,7 @@ from .train_refine_v31 import CANONICAL_CA_WEIGHTS, EXPERIMENTS
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Smoke-test one V3.1 forward/backward step on train only.")
+    parser.add_argument("--refiner-version", choices=("v31", "v311"), default="v31", help=argparse.SUPPRESS)
     parser.add_argument("--experiment", required=True, choices=EXPERIMENTS)
     parser.add_argument("--ca-weights", default=CANONICAL_CA_WEIGHTS)
     parser.add_argument("--data", required=True)
@@ -24,13 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if Path(args.ca_weights).as_posix() != Path(CANONICAL_CA_WEIGHTS).as_posix():
         parser.error(f"V3.1 smoke test is locked to the canonical CA checkpoint: {CANONICAL_CA_WEIGHTS}")
     if args.batch <= 0 or args.workers < 0:
         parser.error("batch must be positive and workers must be non-negative")
+    if args.refiner_version == "v311" and args.experiment != "geometry_only":
+        parser.error("Refine V3.1.1 smoke test is fixed to --experiment geometry_only")
     if not os.environ.get("OMP_NUM_THREADS", "").isdigit() or int(os.environ.get("OMP_NUM_THREADS", "0")) <= 0:
         os.environ["OMP_NUM_THREADS"] = "1"
 
@@ -39,6 +42,7 @@ def main() -> None:
 
     from ultralytics import YOLO
     from ultralytics.nn.modules.refine_v31 import OBBProposalRefinerV31
+    from ultralytics.nn.modules.refine_v311 import OBBProposalRefinerV311
     from ultralytics.utils.torch_utils import select_device
 
     from myscripts.V3.train_refine_v3 import focal_binary_loss
@@ -70,11 +74,11 @@ def main() -> None:
     try:
         p2_channels, p3_channels = extractor.infer_channels(args.imgsz)
         use_quality_aux = args.experiment == "quality_aux"
-        refiner = OBBProposalRefinerV31(
-            p2_channels,
-            p3_channels,
-            use_quality_aux=use_quality_aux,
-        ).to(device).float().train()
+        if args.refiner_version == "v311":
+            refiner = OBBProposalRefinerV311(p2_channels, p3_channels, supervision_margin=0.80)
+        else:
+            refiner = OBBProposalRefinerV31(p2_channels, p3_channels, use_quality_aux=use_quality_aux)
+        refiner = refiner.to(device).float().train()
         optimizer = torch.optim.AdamW(refiner.parameters(), lr=3e-4, weight_decay=1e-4)
         batch = next(iter(loader))
         images, p2, p3, detections = extractor.infer(batch)
@@ -145,6 +149,7 @@ def main() -> None:
             raise RuntimeError("canonical CA weight file changed during the V3.1 smoke test")
         result = {
             "status": "PASS",
+            "architecture": type(refiner).__name__,
             "experiment": args.experiment,
             "split": "train",
             "val_used": False,

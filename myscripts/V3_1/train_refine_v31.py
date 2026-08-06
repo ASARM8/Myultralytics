@@ -22,6 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Inference always refines all valid proposals and never reruns NMS."
         )
     )
+    parser.add_argument("--refiner-version", choices=("v31", "v311"), default="v31", help=argparse.SUPPRESS)
     parser.add_argument("--experiment", required=True, choices=EXPERIMENTS)
     parser.add_argument("--ca-weights", default=CANONICAL_CA_WEIGHTS)
     parser.add_argument("--data", required=True)
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--identity-tolerance", type=float, default=5e-4)
     parser.add_argument("--minimum-map-gain", type=float, default=0.03)
     parser.add_argument("--max-ap90-drop", type=float, default=0.002)
+    parser.add_argument("--max-ap95-drop", type=float, default=0.002)
     parser.add_argument("--max-boundary-ratio", type=float, default=0.10)
     parser.add_argument("--output-dir", required=True)
     return parser
@@ -106,6 +108,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         "identity_tolerance",
         "minimum_map_gain",
         "max_ap90_drop",
+        "max_ap95_drop",
         "max_boundary_ratio",
     )
     if any(getattr(args, name) <= 0 for name in positive):
@@ -116,10 +119,12 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
         parser.error("quality-min-gain, identity-gain, weight-decay and focal-gamma must be non-negative")
     if args.warmup_epochs < 0 or not 0 <= args.expected_ca_map50_95 <= 1:
         parser.error("warmup-epochs must be non-negative and expected CA mAP must be in [0,1]")
+    if args.refiner_version == "v311" and args.experiment != "geometry_only":
+        parser.error("Refine V3.1.1 is fixed to --experiment geometry_only")
 
 
 def model_config(args: argparse.Namespace, p2_channels: int, p3_channels: int) -> dict[str, Any]:
-    return {
+    config = {
         "p2_channels": p2_channels,
         "p3_channels": p3_channels,
         "roi_channels": args.roi_channels,
@@ -132,9 +137,13 @@ def model_config(args: argparse.Namespace, p2_channels: int, p3_channels: int) -
         "short_positive_limit": args.short_positive_limit,
         "long_negative_limit": args.long_negative_limit,
         "long_positive_limit": args.long_positive_limit,
-        "target_margin": args.target_margin,
-        "use_quality_aux": args.experiment == "quality_aux",
     }
+    if args.refiner_version == "v311":
+        config["supervision_margin"] = args.target_margin
+    else:
+        config["target_margin"] = args.target_margin
+        config["use_quality_aux"] = args.experiment == "quality_aux"
+    return config
 
 
 def save_checkpoint(torch, path: Path, refiner, optimizer, epoch: int, config: dict[str, Any], metadata: dict[str, Any]):
@@ -142,7 +151,7 @@ def save_checkpoint(torch, path: Path, refiner, optimizer, epoch: int, config: d
     torch.save(
         {
             "format_version": 1,
-            "architecture": "OBBProposalRefinerV31",
+            "architecture": type(refiner).__name__,
             "experiment": metadata["arguments"]["experiment"],
             "epoch": epoch,
             "model_config": config,
@@ -159,9 +168,9 @@ def _candidate_key(candidate: dict[str, Any]):
     return row["map50_95"], row["ap75"], row["ap90"], -candidate["epoch"]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     validate_args(parser, args)
     if not os.environ.get("OMP_NUM_THREADS", "").isdigit() or int(os.environ.get("OMP_NUM_THREADS", "0")) <= 0:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -172,6 +181,7 @@ def main() -> None:
 
     from ultralytics import YOLO
     from ultralytics.nn.modules.refine_v31 import OBBProposalRefinerV31
+    from ultralytics.nn.modules.refine_v311 import OBBProposalRefinerV311
     from ultralytics.utils.torch_utils import select_device
 
     from .runtime import (
@@ -235,13 +245,14 @@ def main() -> None:
     try:
         p2_channels, p3_channels = extractor.infer_channels(args.imgsz)
         config = model_config(args, p2_channels, p3_channels)
-        refiner = OBBProposalRefinerV31(**config).to(device).float()
+        refiner_class = OBBProposalRefinerV311 if args.refiner_version == "v311" else OBBProposalRefinerV31
+        refiner = refiner_class(**config).to(device).float()
         optimizer = torch.optim.AdamW(refiner.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
         manifest = {
-            "stage": "Refine V3.1 original-split seed run",
+            "stage": f"Refine {args.refiner_version.upper()} original-split seed run",
             "experiment": args.experiment,
-            "architecture": "OBBProposalRefinerV31",
+            "architecture": type(refiner).__name__,
             "ca_weights": str(ca_path),
             "ca_sha256_before": ca_hash_before,
             "data": args.data,
@@ -255,6 +266,7 @@ def main() -> None:
             "proposal_policy": "all",
             "rerun_nms": False,
             "quality_used_at_inference": False,
+            "target_transform": "smooth_compression" if args.refiner_version == "v311" else "hard_clip",
             "test_used": False,
             "model_config": config,
             "arguments": vars(args),
@@ -372,6 +384,8 @@ def main() -> None:
 
             if not totals["batches"]:
                 raise RuntimeError("no train-fit batch contained a valid CA proposal")
+            short_outside_ratio = totals["short_target_clipped"] / max(totals["matched_proposals"], 1)
+            long_outside_ratio = totals["long_target_clipped"] / max(totals["matched_proposals"], 1)
             record = {
                 "epoch": epoch,
                 "loss": totals["loss"] / totals["batches"],
@@ -382,8 +396,14 @@ def main() -> None:
                 "matched_proposals": totals["matched_proposals"],
                 "matched_ratio": totals["matched_proposals"] / max(totals["valid_proposals"], 1),
                 "quality_positive_ratio": totals["quality_positives"] / max(totals["valid_proposals"], 1),
-                "short_target_clip_ratio": totals["short_target_clipped"] / max(totals["matched_proposals"], 1),
-                "long_target_clip_ratio": totals["long_target_clipped"] / max(totals["matched_proposals"], 1),
+                "short_target_clip_ratio": short_outside_ratio if args.refiner_version == "v31" else None,
+                "long_target_clip_ratio": long_outside_ratio if args.refiner_version == "v31" else None,
+                "short_target_outside_supervision_ratio": (
+                    short_outside_ratio if args.refiner_version == "v311" else None
+                ),
+                "long_target_outside_supervision_ratio": (
+                    long_outside_ratio if args.refiner_version == "v311" else None
+                ),
                 "learning_rate": optimizer.param_groups[0]["lr"],
             }
             history.append(record)
@@ -470,11 +490,14 @@ def main() -> None:
         delta_map = refined["map50_95"] - coarse["map50_95"]
         delta_ap75 = refined["ap75"] - coarse["ap75"]
         delta_ap90 = refined["ap90"] - coarse["ap90"]
+        delta_ap95 = refined["ap95"] - coarse["ap95"]
         residual_non_constant = max(
             val_diagnostics["short_residual_std"], val_diagnostics["long_residual_std"]
         ) > 1e-4
         acceptance = {
             "experiment": args.experiment,
+            "architecture": type(refiner).__name__,
+            "target_transform": "smooth_compression" if args.refiner_version == "v311" else "hard_clip",
             "selected_epoch": best["epoch"],
             "expected_ca_map50_95": args.expected_ca_map50_95,
             "observed_ca_map50_95": coarse["map50_95"],
@@ -487,12 +510,23 @@ def main() -> None:
             "delta_map50_95": delta_map,
             "delta_ap75": delta_ap75,
             "delta_ap90": delta_ap90,
+            "delta_ap95": delta_ap95,
             "minimum_map_gain": args.minimum_map_gain,
+            "minimum_gain_pass": delta_map >= args.minimum_map_gain,
+            "ap75_pass": delta_ap75 >= 0.0,
+            "ap90_pass": delta_ap90 >= -args.max_ap90_drop,
+            "ap95_pass": delta_ap95 >= -args.max_ap95_drop,
             "matched_delta_iou_mean": val_diagnostics["matched_delta_iou_mean"],
             "matched_improved_ratio": val_diagnostics["matched_improved_ratio"],
             "matched_worsened_ratio": val_diagnostics["matched_worsened_ratio"],
+            "matched_iou_pass": val_diagnostics["matched_delta_iou_mean"] >= 0.0,
+            "matched_ratio_pass": (
+                val_diagnostics["matched_improved_ratio"] >= val_diagnostics["matched_worsened_ratio"]
+            ),
             "short_boundary_ratio": val_diagnostics["short_boundary_ratio"],
             "long_boundary_ratio": val_diagnostics["long_boundary_ratio"],
+            "short_boundary_pass": val_diagnostics["short_boundary_ratio"] <= args.max_boundary_ratio,
+            "long_boundary_pass": val_diagnostics["long_boundary_ratio"] <= args.max_boundary_ratio,
             "residual_non_constant": residual_non_constant,
             "proposal_policy": "all",
             "rerun_nms": False,
@@ -503,25 +537,26 @@ def main() -> None:
                 acceptance["baseline_pass"],
                 acceptance["identity_pass"],
                 acceptance["ca_hash_pass"],
-                delta_map >= args.minimum_map_gain,
-                delta_ap75 >= 0.0,
-                delta_ap90 >= -args.max_ap90_drop,
-                val_diagnostics["matched_delta_iou_mean"] >= 0.0,
-                val_diagnostics["matched_improved_ratio"] >= val_diagnostics["matched_worsened_ratio"],
-                val_diagnostics["short_boundary_ratio"] <= args.max_boundary_ratio,
-                val_diagnostics["long_boundary_ratio"] <= args.max_boundary_ratio,
+                acceptance["minimum_gain_pass"],
+                acceptance["ap75_pass"],
+                acceptance["ap90_pass"],
+                acceptance["ap95_pass"],
+                acceptance["matched_iou_pass"],
+                acceptance["matched_ratio_pass"],
+                acceptance["short_boundary_pass"],
+                acceptance["long_boundary_pass"],
                 residual_non_constant,
             )
         )
         write_json(output_dir / "acceptance.json", acceptance)
         report = [
-            "# Refine V3.1 seed0 训练结果",
+            f"# Refine {args.refiner_version.upper()} seed0 训练结果",
             "",
             f"- 实验：`{args.experiment}`",
             f"- 选中 epoch：{best['epoch']}",
             f"- CA mAP50-95：{coarse['map50_95']:.6f}",
-            f"- V3.1 mAP50-95：{refined['map50_95']:.6f}（Δ={delta_map:+.6f}）",
-            f"- AP75 Δ：{delta_ap75:+.6f}；AP90 Δ：{delta_ap90:+.6f}",
+            f"- {args.refiner_version.upper()} mAP50-95：{refined['map50_95']:.6f}（Δ={delta_map:+.6f}）",
+            f"- AP75 Δ：{delta_ap75:+.6f}；AP90 Δ：{delta_ap90:+.6f}；AP95 Δ：{delta_ap95:+.6f}",
             f"- 匹配 proposal 平均 IoU Δ：{val_diagnostics['matched_delta_iou_mean']:+.6f}",
             f"- 短边/长边边界比例：{val_diagnostics['short_boundary_ratio']:.6f} / "
             f"{val_diagnostics['long_boundary_ratio']:.6f}",
