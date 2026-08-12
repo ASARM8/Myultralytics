@@ -35,6 +35,7 @@ t'_s=-0.40\tanh\left(\frac{-t_s}{0.40}\right),\qquad t_s<0.
 export OMP_NUM_THREADS=1
 
 BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
+BASELINE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt
 DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
 EXPORT=/root/autodl-tmp/paper_exports/refine_v311_seed0
 
@@ -140,3 +141,75 @@ python -m myscripts.V3_1_1.audit_reproductions_v311 \
 - 现有证据已经足以进入小论文写作：coarse/identity 完全恒等，CA 哈希不变，mAP50-95 为 `0.454137→0.562504`，AP75 为 `0.439822→0.558800`，匹配 proposal 平均 IoU 增量为 `+0.046647`。
 - AP95 为 `0.099024→0.097174`，且当前仅有 seed0；论文采用“在当前固定实验设置下取得明确正向改善”的保守表述，不声称统计显著性。
 - 后续只补统一 Baseline、H1/H2、复杂度、定性结果和必要的多种子复验。这些属于证据补全，不再因小幅数值波动触发 Refine 结构迭代。
+
+## 7. IVC 云端证据补全工具（2026-08-16）
+
+固定路径：
+
+```bash
+export OMP_NUM_THREADS=1
+
+BASELINE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt
+BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
+REFINE=/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
+DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
+IVC_EXPORT=/root/autodl-tmp/paper_exports/ivc_evidence
+```
+
+### 7.1 完整 detector + NMS + Refine 性能采集
+
+```bash
+python -m myscripts.V3_1_1.profile_refine_v311 \
+  --checkpoint "$REFINE" \
+  --ca-weights "$BASE" \
+  --data "$DATA" \
+  --imgsz 640 \
+  --batch 1 \
+  --device 0 \
+  --workers 8 \
+  --no-amp \
+  --warmup 20 \
+  --output-dir "$IVC_EXPORT/profile_refine_fp32_batch1"
+```
+
+输出：
+
+- `profile_per_image.csv`：逐图 proposal 数量、数据读取、预处理、CA forward、旋转 NMS、proposal 打包、Refine 和结果回写时延；
+- `profile_summary.json`：各阶段 mean/median/P95、完整计算链 FPS、峰值显存、CA/Refine 参数量与权重哈希；
+- `refiner_profiled_gflops` 只统计 `torch.profiler` 能识别的 Refine 算子。`grid_sample` 和 NMS 可能没有 FLOPs 归因，因此完整计算成本以实测端到端时延为准。
+
+正式口径锁定为 `val`、FP32、batch=1、`imgsz=640`。工具不会训练、修改或保存模型权重，也不执行第二次 NMS。
+
+### 7.2 GT / Baseline / CA / CA+Refine 逐图导出
+
+```bash
+python -m myscripts.V3_1_1.export_qualitative_v311 \
+  --baseline-weights "$BASELINE" \
+  --ca-weights "$BASE" \
+  --checkpoint "$REFINE" \
+  --data "$DATA" \
+  --imgsz 640 \
+  --batch 8 \
+  --device 0 \
+  --workers 8 \
+  --no-amp \
+  --copy-images \
+  --output-dir "$IVC_EXPORT/qualitative_predictions"
+```
+
+输出目录包括 `images/`、`gt/`、`baseline/`、`ca/`、`refined/`、`manifest_all.csv` 和 `export_audit.json`。四套框被统一还原到原图坐标并保存为归一化四顶点 OBB；预测文件末列保留 confidence。导出器固定 Baseline 为 `reg_max=16`、CA 为 `reg_max=32`，并核对：
+
+- Baseline、CA 和 Refine checkpoint 均为固定路径且哈希写入审计；
+- 三种预测使用 checkpoint 中相同的 confidence、NMS IoU 和 `max_det`；
+- Refine 不改变 proposal 数量、类别或分数，不执行第二次 NMS；
+- 零残差回写与 CA proposal 逐坐标完全一致；
+- `split=val`、`test_used=false`。
+
+`manifest_all.csv` 包含完整验证集，不应直接全部绘图。下载完整输出目录后，按预先定义的场景类型选择代表性成功、一般和失败案例，把选中行保存为与 `manifest_all.csv` 同目录的 `fig6_manifest.csv`，填写同一 ROI 和客观 `note`。清单必须留在该目录中，才能继续按相对路径找到 `images/` 和四套标注。随后运行：
+
+```powershell
+python -m myscripts.paper_visuals.generate_fig6_qualitative `
+  --manifest "res/640-811/ivc_evidence/qualitative_predictions/fig6_manifest.csv" `
+  --show-confidence `
+  --output-dir "mydocs/创新点一/投稿版本/IVC_assets"
+```

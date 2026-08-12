@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 from pathlib import Path
 
@@ -11,7 +12,7 @@ from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
 from docx.shared import Pt, RGBColor
 
-from myscripts.paper_submission.build_target_branches import TARGETS
+from myscripts.paper_submission.build_target_branches import REFERENCES, TARGETS
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -222,6 +223,14 @@ def _find_paragraph(doc: Document, prefix: str) -> Paragraph:
     raise ValueError(f"paragraph not found: {prefix}")
 
 
+def _clear_forced_page_break(paragraph: Paragraph) -> None:
+    """Remove a paragraph-level page break inherited from the source DOCX."""
+    p_pr = paragraph._p.get_or_add_pPr()
+    node = p_pr.find(qn("w:pageBreakBefore"))
+    if node is not None:
+        p_pr.remove(node)
+
+
 def build(target_key: str, output_dir: Path) -> Path:
     if not SOURCE.exists():
         raise FileNotFoundError(SOURCE)
@@ -268,9 +277,21 @@ def build(target_key: str, output_dir: Path) -> Path:
     intro_first = _find_paragraph(doc, "电线、拉线和细杆等低空障碍物")
     framing_anchor = _insert_after(intro_first, meta["framing"])
     if target_key == "ivc":
-        _insert_after(
+        uav_anchor = _insert_after(
             framing_anchor,
-            "与近期 Image and Vision Computing 论文相比，Bai 等侧重自注意引导、全局特征融合与小目标分配，Sang 等侧重环境自适应上下文和快速检测，Chaurasia 与 Patro 侧重通道—空间注意及旋转角分类；Rong 等则从方向特征增强切入电线检测。本文不直接横向比较跨数据集 AP，而是把差异限定为算法问题：正样本是否在有限距离分布下几何可表示，以及 post-NMS 旋转候选能否在保持身份与置信度不变的前提下获得局部尺度校正。",
+            "低空无人机目标检测综述已归纳尺度、视角、遮挡与数据差异等问题[14]；已有无人机视觉基准进一步表明，小目标、相机运动和视角变化会持续削弱检测稳定性[22]。对于短边仅由少量像素定义的目标，IoU 对轻微坐标偏移也格外敏感[23]。这些一般性困难在电线场景中叠加出现，使多尺度分配与高 IoU 定位不能只依赖更强的全局语义特征。",
+        )
+        ivc_anchor = _insert_after(
+            uav_anchor,
+            "与近期 Image and Vision Computing 论文相比，Bai 等侧重自注意引导、全局特征融合与小目标分配[15]，Sang 等侧重环境自适应上下文和快速检测[16]，Chaurasia 与 Patro 侧重通道—空间注意及旋转角分类[17]；Rong 等则从方向特征增强切入电线检测[1]。本文不直接横向比较跨数据集 AP，而是把差异限定为算法问题：正样本是否在有限距离分布下几何可表示，以及 post-NMS 旋转候选能否在保持身份与置信度不变的前提下获得局部尺度校正。",
+        )
+        assignment_anchor = _insert_after(
+            ivc_anchor,
+            "FPN 为多尺度检测提供基础层级表示[18]，Mask R-CNN 说明 proposal 特征能够支持第二次几何决策[19]，DOTA 则系统暴露了航拍目标的尺度、方向和形状变化[20]。在正样本分配方面，ATSS 与 OTA 分别从自适应统计和全局最优传输角度说明正负样本定义会直接影响检测器学习[24,25]；在旋转目标定位方面，CSL、KLD、GWD、RoI Transformer、ReDet、Oriented R-CNN 与 R3Det 分别处理角度周期性、旋转框度量、方向对齐 proposal 或迭代精修[21,26-31]。针对大长宽比旋转框的最新研究也表明，该问题仍未完全解决[13]。本文的区别是把有限 DFL 距离支撑显式引入候选可达性判断，并将最终精修严格限制为 post-NMS 候选的短边和长边尺度更新。",
+        )
+        _insert_after(
+            assignment_anchor,
+            "近期电线视觉方法覆盖实例分割、多任务检测、轻量组件检测和形状感知分割等路线：CableNet 保留电缆实例身份[32]，PowerLine-MTYOLO 联合电缆分割与断股检测[33]，LPC-Det 面向无人机电力线组件的轻量检测[34]，SFFPLDN 融合形状感知与多尺度特征[35]。这些工作进一步说明特征、任务和效率设计的重要性，但并未直接回答本文所关注的层级回归可达性与同身份候选尺度校正问题。",
         )
 
     limitation = _find_paragraph(doc, "本文仍存在三方面局限")
@@ -285,6 +306,30 @@ def build(target_key: str, output_dir: Path) -> Path:
             identity_result,
             "无重训练评估路径复核如下：FP32、batch=8 时 coarse/refined 为 0.454137/0.562504，增量 0.108368；FP32、batch=1 时为 0.454151/0.562460，增量 0.108310；AMP、batch=8 时为 0.453562/0.562017，增量 0.108455。三条路径的增量极差仅 0.000146，说明主提升不依赖单一 batch 或数值精度设置。该对照复用同一 checkpoint，只属于评估链稳健性测试，不能视为独立种子或统计显著性证据。",
         )
+
+        # Normalize the existing source references and append the new IVC
+        # bibliography entries. The English citation text is retained so the
+        # Chinese and English review branches share one auditable source list.
+        reference_paragraphs = {
+            int(match.group(1)): paragraph
+            for paragraph in doc.paragraphs
+            if (match := re.match(r"^\[(\d+)\]", paragraph.text.strip()))
+        }
+        for index, reference in enumerate(REFERENCES, start=1):
+            text = f"[{index}] {reference}"
+            paragraph = reference_paragraphs.get(index)
+            if paragraph is None:
+                paragraph = doc.add_paragraph()
+            _replace_paragraph(paragraph, text, cn="Times New Roman", size=8)
+            paragraph.paragraph_format.left_indent = Pt(12)
+            paragraph.paragraph_format.first_line_indent = Pt(-12)
+            paragraph.paragraph_format.space_after = Pt(1.5)
+
+        # The source data draft deliberately separated incomplete tables onto
+        # new pages. In the IVC review branch this created a nearly blank page
+        # before Table 11, so keep the caption with its table but remove the
+        # inherited forced page break.
+        _clear_forced_page_break(_find_paragraph(doc, "表11 模型复杂度"))
 
     props = doc.core_properties
     props.title = meta["title"]
