@@ -1,6 +1,7 @@
-param(
+﻿param(
     [string]$InputPptx = "$PSScriptRoot\..\..\..\mydocs\创新点一\paper_visuals\outputs\ca_refine_architecture_redesign.pptx",
-    [string]$OutputDirectory = "$PSScriptRoot\..\..\..\mydocs\创新点一\paper_visuals\outputs"
+    [string]$OutputDirectory = "$PSScriptRoot\..\..\..\mydocs\创新点一\paper_visuals\outputs",
+    [string]$Stem = "ca_refine_architecture_redesign"
 )
 
 $ErrorActionPreference = "Stop"
@@ -15,8 +16,8 @@ try {
     $powerPoint = New-Object -ComObject PowerPoint.Application
     $presentation = $powerPoint.Presentations.Open($resolvedInput, $true, $true, $false)
 
-    $pngPath = Join-Path $resolvedOutput "ca_refine_architecture_redesign.png"
-    $pdfPath = Join-Path $resolvedOutput "ca_refine_architecture_redesign.pdf"
+    $pngPath = Join-Path $resolvedOutput "$Stem.png"
+    $pdfPath = Join-Path $resolvedOutput "$Stem.pdf"
 
     # 3840x2160 provides a publication-quality raster preview.
     $presentation.Slides.Item(1).Export($pngPath, "PNG", 3840, 2160)

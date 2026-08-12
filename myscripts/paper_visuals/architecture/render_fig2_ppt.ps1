@@ -1,9 +1,11 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$InputPptx,
 
     [Parameter(Mandatory = $true)]
-    [string]$OutputDirectory
+    [string]$OutputDirectory,
+
+    [string]$Stem = "fig2_geometric_reachability"
 )
 
 $ErrorActionPreference = "Stop"
@@ -18,8 +20,8 @@ try {
     $powerPoint = New-Object -ComObject PowerPoint.Application
     $presentation = $powerPoint.Presentations.Open($resolvedInput, $true, $true, $false)
 
-    $pngPath = Join-Path $resolvedOutput "fig2_geometric_reachability.png"
-    $pdfPath = Join-Path $resolvedOutput "fig2_geometric_reachability.pdf"
+    $pngPath = Join-Path $resolvedOutput "$Stem.png"
+    $pdfPath = Join-Path $resolvedOutput "$Stem.pdf"
 
     # The custom 1800x800 slide has an exact 2.25:1 paper-figure aspect ratio.
     $presentation.Slides.Item(1).Export($pngPath, "PNG", 3600, 1600)

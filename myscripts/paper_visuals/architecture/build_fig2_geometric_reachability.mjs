@@ -24,6 +24,11 @@ const { Presentation, PresentationFile } = await loadArtifactTool();
 const CANVAS = { width: 1800, height: 800 };
 const FONT_CN = "Microsoft YaHei";
 const FONT_EN = "Times New Roman";
+let LANGUAGE = "zh";
+
+function tr(zh, en) {
+  return LANGUAGE === "en" ? en : zh;
+}
 
 const C = {
   bg: "#FBF8F1",
@@ -211,6 +216,7 @@ function addDistanceLabel(slide, name, text, position, color) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  LANGUAGE = args.language === "en" ? "en" : "zh";
   const outputDir = path.resolve(args.outputDir ?? ".");
   const qaDir = path.resolve(args.qaDir ?? path.join(outputDir, "qa"));
   await fs.mkdir(outputDir, { recursive: true });
@@ -222,8 +228,8 @@ async function main() {
 
   const leftPanel = { left: 34, top: 28, width: 958, height: 660 };
   const rightPanel = { left: 1014, top: 28, width: 752, height: 660 };
-  addPanel(slide, "geometry", "(a) 旋转框局部坐标与边界距离", leftPanel, C.ca);
-  addPanel(slide, "levels", "(b) 特征层覆盖判定示例", rightPanel, C.refine);
+  addPanel(slide, "geometry", tr("(a) 旋转框局部坐标与边界距离", "(a) Target-local coordinates and boundary distances"), leftPanel, C.ca);
+  addPanel(slide, "levels", tr("(b) 特征层覆盖判定示例", "(b) Feature-level coverage feasibility"), rightPanel, C.refine);
 
   // Panel (a): connectors first, visible nodes and labels afterwards.
   const rectCenter = { x: 520, y: 386 };
@@ -279,7 +285,7 @@ async function main() {
     height: 32,
   }, C.refine, { style: "solid", fill: C.white, width: 2.5 });
 
-  addBox(slide, "offset-candidate-label", "偏心候选  p_i = (x_f, y_f)", {
+  addBox(slide, "offset-candidate-label", tr("偏心候选  p_i = (x_f, y_f)", "Off-center candidate  p_i = (x_f, y_f)"), {
     left: 622,
     top: 112,
     width: 278,
@@ -293,7 +299,7 @@ async function main() {
     color: C.refine,
     bold: true,
   });
-  addBox(slide, "center-candidate-label", "中心候选", {
+  addBox(slide, "center-candidate-label", tr("中心候选", "Center candidate"), {
     left: 420,
     top: 474,
     width: 146,
@@ -327,13 +333,13 @@ async function main() {
     typeface: FONT_EN,
     italic: true,
   });
-  addText(slide, "axis-note", "GT 局部坐标轴", { left: 116, top: 608, width: 220, height: 32 }, {
+  addText(slide, "axis-note", tr("GT 局部坐标轴", "Target-local axes"), { left: 116, top: 608, width: 220, height: 32 }, {
     fontSize: 18,
     color: C.muted,
   });
 
   // Panel (b): a manually-authored editable chart with a dedicated title zone.
-  addText(slide, "chart-subtitle", "同一目标在不同 stride 下的归一化距离需求", {
+  addText(slide, "chart-subtitle", tr("同一目标在不同 stride 下的归一化距离需求", "Normalized distance demand across feature strides"), {
     left: 1054,
     top: 96,
     width: 430,
@@ -407,9 +413,9 @@ async function main() {
   });
 
   const layers = [
-    { level: "P3", stride: 8, value: 45.0, dmax: 248, color: C.refine, light: C.refineLight, status: "不可达" },
-    { level: "P4", stride: 16, value: 22.5, dmax: 496, color: C.success, light: C.successLight, status: "可达" },
-    { level: "P5", stride: 32, value: 11.25, dmax: 992, color: C.success, light: C.successLight, status: "可达" },
+    { level: "P3", stride: 8, value: 45.0, dmax: 248, color: C.refine, light: C.refineLight, status: tr("不可达", "infeasible") },
+    { level: "P4", stride: 16, value: 22.5, dmax: 496, color: C.success, light: C.successLight, status: tr("可达", "feasible") },
+    { level: "P5", stride: 32, value: 11.25, dmax: 992, color: C.success, light: C.successLight, status: tr("可达", "feasible") },
   ];
   const centers = [1230, 1450, 1670];
   const barWidth = 112;
@@ -478,7 +484,7 @@ async function main() {
     width: 580,
     height: 42,
   }, { fontSize: 22, color: C.ink, typeface: FONT_EN, italic: true });
-  addBox(slide, "formula-condition", "可达条件：D_req / stride ≤ reg_max - 1", {
+  addBox(slide, "formula-condition", tr("可达条件：D_req / stride ≤ reg_max - 1", "Feasible if: D_req / stride ≤ reg_max - 1"), {
     left: 660,
     top: 720,
     width: 500,
@@ -499,10 +505,11 @@ async function main() {
     height: 42,
   }, { fontSize: 22, color: C.ink, typeface: FONT_EN, italic: true });
 
-  const pptxPath = path.join(outputDir, "fig2_geometric_reachability.pptx");
-  const previewPath = path.join(qaDir, "fig2_geometric_reachability.artifact-preview.png");
-  const layoutPath = path.join(qaDir, "fig2_geometric_reachability.layout.json");
-  const inspectPath = path.join(qaDir, "fig2_geometric_reachability.inspect.ndjson");
+  const stem = args.stem ?? "fig2_geometric_reachability";
+  const pptxPath = path.join(outputDir, `${stem}.pptx`);
+  const previewPath = path.join(qaDir, `${stem}.artifact-preview.png`);
+  const layoutPath = path.join(qaDir, `${stem}.layout.json`);
+  const inspectPath = path.join(qaDir, `${stem}.inspect.ndjson`);
 
   await writeBlob(previewPath, await presentation.export({ slide, format: "png", scale: 2 }));
   await fs.writeFile(layoutPath, await (await slide.export({ format: "layout" })).text(), "utf8");

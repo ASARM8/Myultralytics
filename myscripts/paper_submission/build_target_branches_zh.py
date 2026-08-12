@@ -20,6 +20,44 @@ DEFAULT_OUTPUT = ROOT / "mydocs" / "创新点一" / "投稿版本"
 
 
 ZH_TARGETS = {
+    "ivc": {
+        "title": "面向无人机图像中电线旋转检测的覆盖能力感知分配与身份保持几何精修",
+        "header": "面向无人机图像的电线旋转检测与几何精修",
+        "abstract": (
+            "低空无人机图像中的电线短轴纹理证据少、长轴跨越范围大且方向连续变化，容易暴露特征金字塔"
+            "旋转检测器中的几何不相容问题：任务对齐分配可能选中语义上合适、但有限分布式回归范围无法"
+            "覆盖目标全部边界的正样本。本文提出 YOLO11-OBB 的覆盖能力感知扩展。该方法在目标局部坐标系"
+            "中计算候选点到边界的最大需求距离，并在任务对齐排序前过滤几何不可达候选；reg_max=32 用于"
+            "为不同金字塔层提供必要的距离表达支撑。为修正剩余的高 IoU 尺度误差，本文进一步围绕 post-NMS"
+            "候选框从 P2/P3 采样旋转对齐区域，仅预测短边和长边的有界对数尺度残差，同时保持中心、角度、"
+            "置信度、候选数量和 NMS 身份不变。在 imgsz=640 的固定 TTPLA 验证协议下，候选框精修将"
+            " mAP50-95 从 0.4541 提升至 0.5625，AP75 从 0.4398 提升至 0.5588；AP90 提高 0.0157，而"
+            " AP95 下降 0.0018。严格恒等对照、三种无重训练评估路径和 proposal 匹配分析表明，收益来自"
+            "学习到的几何校正：匹配候选平均 IoU 提高 0.0466，63.41% 的匹配候选得到改善。该结果支持"
+            "方法对电线旋转定位具有明确但有边界的正向作用；多种子、复杂度和最终测试集证据仍待补充。"
+        ),
+        "keywords": "电线检测；无人机图像；旋转目标检测；正样本分配；分布式回归；候选框精修",
+        "note": (
+            "内部投稿分支说明（投稿前删除）：本稿是 Image and Vision Computing 的后续主稿。方法冻结为"
+            " Coverage-Aware Assignment + reg_max=32 表达支撑 + 身份保持的候选框级几何精修。本轮不训练"
+            "模型，只使用已经审计的结果；统一 Baseline、H1/H2、复杂度、多种子、定性结果和最终测试集数据"
+            "在未实测前保留为空，不用预期值替代。"
+        ),
+        "framing": (
+            "从图像与视觉计算角度看，本文关注的核心不是无人机飞控，而是语义候选排序、有限几何表达与"
+            " proposal 级定位之间的不匹配。低空无人机电线场景使这一问题更突出；本文将其作为可受控验证的"
+            "旋转目标检测问题处理，不把检测结果扩展表述为闭环避障能力。"
+        ),
+        "limitation": (
+            "面向 Image and Vision Computing，当前主要风险是证据完整性和泛化范围。统一原始 Baseline、"
+            "覆盖溢出机制统计、完整计算代价、多种子和冻结测试集仍需补齐；这些属于冻结方法后的证据补全，"
+            "不应据此继续更改当前算法。"
+        ),
+        "conclusion": (
+            "现有证据支持覆盖能力感知分配与身份保持候选框精修对电线旋转定位具有正向作用，但结论应保持"
+            "在单数据集、单正式种子和当前验证协议范围内，直至剩余证据补齐。"
+        ),
+    },
     "unmanned": {
         "title": "面向无人机低空感知的电线障碍物覆盖能力感知检测与候选框级几何精修",
         "header": "面向无人机低空感知的电线障碍物检测",
@@ -228,7 +266,12 @@ def build(target_key: str, output_dir: Path) -> Path:
     _replace_paragraph(english_keywords, f"Key words: {en_meta['keywords']}", cn="Times New Roman", size=9.5)
 
     intro_first = _find_paragraph(doc, "电线、拉线和细杆等低空障碍物")
-    _insert_after(intro_first, meta["framing"])
+    framing_anchor = _insert_after(intro_first, meta["framing"])
+    if target_key == "ivc":
+        _insert_after(
+            framing_anchor,
+            "与近期 Image and Vision Computing 论文相比，Bai 等侧重自注意引导、全局特征融合与小目标分配，Sang 等侧重环境自适应上下文和快速检测，Chaurasia 与 Patro 侧重通道—空间注意及旋转角分类；Rong 等则从方向特征增强切入电线检测。本文不直接横向比较跨数据集 AP，而是把差异限定为算法问题：正样本是否在有限距离分布下几何可表示，以及 post-NMS 旋转候选能否在保持身份与置信度不变的前提下获得局部尺度校正。",
+        )
 
     limitation = _find_paragraph(doc, "本文仍存在三方面局限")
     _insert_after(limitation, meta["limitation"])
@@ -236,12 +279,37 @@ def build(target_key: str, output_dir: Path) -> Path:
     conclusion_last = _find_paragraph(doc, "在固定 FP32、batch=8、imgsz=640")
     _insert_after(conclusion_last, meta["conclusion"])
 
+    if target_key == "ivc":
+        identity_result = _find_paragraph(doc, "表9表明，coarse 与 identity")
+        _insert_after(
+            identity_result,
+            "无重训练评估路径复核如下：FP32、batch=8 时 coarse/refined 为 0.454137/0.562504，增量 0.108368；FP32、batch=1 时为 0.454151/0.562460，增量 0.108310；AMP、batch=8 时为 0.453562/0.562017，增量 0.108455。三条路径的增量极差仅 0.000146，说明主提升不依赖单一 batch 或数值精度设置。该对照复用同一 checkpoint，只属于评估链稳健性测试，不能视为独立种子或统计显著性证据。",
+        )
+
     props = doc.core_properties
     props.title = meta["title"]
     props.subject = f"{en_meta['journal']} 中文投稿审阅分支"
     props.keywords = meta["keywords"]
     props.comments = "内部中文审阅分支；投稿前删除黄色说明并按目标期刊模板处理。"
     doc.save(out)
+    # Remove stale font-table declarations that can make Word report a
+    # non-used Japanese fallback (e.g. MS Gothic) in the font inspector.
+    from lxml import etree
+    from zipfile import ZIP_DEFLATED, ZipFile
+
+    temp = out.with_suffix(".fontfix.docx")
+    with ZipFile(out, "r") as src, ZipFile(temp, "w", ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename == "word/fontTable.xml":
+                root = OxmlElement("w:fonts")
+                for name in ("Times New Roman", "宋体", "黑体", "Cambria Math"):
+                    font = OxmlElement("w:font")
+                    font.set(qn("w:name"), name)
+                    root.append(font)
+                data = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone="yes")
+            dst.writestr(item, data)
+    temp.replace(out)
     return out
 
 

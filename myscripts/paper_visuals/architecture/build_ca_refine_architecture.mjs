@@ -27,6 +27,11 @@ const { Presentation, PresentationFile } = await loadArtifactTool();
 const CANVAS = { width: 1920, height: 1080 };
 const FONT_CN = "Microsoft YaHei";
 const FONT_EN = "Times New Roman";
+let LANGUAGE = "zh";
+
+function tr(zh, en) {
+  return LANGUAGE === "en" ? en : zh;
+}
 
 const C = {
   bg: "#FBF8F1",
@@ -285,6 +290,7 @@ function addLegendItem(slide, name, x, y, color, text) {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  LANGUAGE = args.language === "en" ? "en" : "zh";
   const outputDir = path.resolve(args.outputDir ?? ".");
   const qaDir = path.resolve(args.qaDir ?? path.join(outputDir, "qa"));
   const inputImage = path.resolve(args.inputImage);
@@ -358,13 +364,13 @@ async function main() {
   slide.images.add({
     blob: imageBytes,
     contentType: "image/jpeg",
-    alt: "输电线巡检图像样例",
+    alt: tr("输电线巡检图像样例", "Power-line inspection image example"),
     fit: "cover",
     geometry: "roundRect",
     borderRadius: 12,
     position: { left: 72, top: 224, width: 178, height: 178 },
   });
-  addText(slide, "input-label", "低空巡检图像", { left: 68, top: 432, width: 194, height: 30 }, {
+  addText(slide, "input-label", tr("低空巡检图像", "Low-altitude UAV image"), { left: 68, top: 432, width: 194, height: 30 }, {
     fontSize: 20,
     bold: true,
   });
@@ -373,7 +379,7 @@ async function main() {
     color: C.muted,
     typeface: FONT_EN,
   });
-  addBox(slide, "input-note", "旋转目标保留方向信息", { left: 73, top: 523, width: 194, height: 66 }, {
+  addBox(slide, "input-note", tr("旋转目标保留方向信息", "Oriented boxes retain direction"), { left: 73, top: 523, width: 194, height: 66 }, {
     fill: C.grayLight,
     stroke: C.softBorder,
     fontSize: 16,
@@ -399,7 +405,7 @@ async function main() {
       radius: 12,
     });
   }
-  addText(slide, "backbone-note", "逐级下采样提取层次化语义特征", { left: 354, top: 578, width: 470, height: 32 }, {
+  addText(slide, "backbone-note", tr("逐级下采样提取层次化语义特征", "Hierarchical features through progressive downsampling"), { left: 354, top: 578, width: 470, height: 32 }, {
     fontSize: 17,
     color: C.muted,
   });
@@ -415,8 +421,8 @@ async function main() {
   addPill(slide, "up-2", "↑2 + Concat", { left: 1047, top: 241, width: 120, height: 30 }, C.neck, { fontSize: 14 });
   addPill(slide, "down-1", "↓2 + Concat", { left: 1166, top: 349, width: 124, height: 30 }, C.concat, { color: C.ink, fontSize: 14 });
   addPill(slide, "down-2", "↓2 + Concat", { left: 1284, top: 458, width: 124, height: 30 }, C.concat, { color: C.ink, fontSize: 14 });
-  addPill(slide, "neck-block", "各融合节点：C3k2 × 2", { left: 1033, top: 568, width: 270, height: 34 }, C.backboneDark, { fontSize: 15 });
-  addText(slide, "neck-note", "虚线为 Backbone 横向连接", { left: 1072, top: 608, width: 230, height: 24 }, {
+  addPill(slide, "neck-block", tr("各融合节点：C3k2 × 2", "Fusion block: C3k2 × 2"), { left: 1033, top: 568, width: 270, height: 34 }, C.backboneDark, { fontSize: 15 });
+  addText(slide, "neck-note", tr("虚线为 Backbone 横向连接", "Dashed lines: backbone lateral links"), { left: 1072, top: 608, width: 230, height: 24 }, {
     fontSize: 14,
     color: C.muted,
   });
@@ -430,7 +436,7 @@ async function main() {
   addThreeBranchHead(slide, "head-p3", { left: 1520, top: 224, width: 248, height: 78 }, "P3");
   addThreeBranchHead(slide, "head-p4", { left: 1520, top: 342, width: 248, height: 78 }, "P4");
   addThreeBranchHead(slide, "head-p5", { left: 1520, top: 460, width: 248, height: 78 }, "P5");
-  addText(slide, "head-main-label", "每一尺度采用 Box / Cls / Angle 三分支", {
+  addText(slide, "head-main-label", tr("每一尺度采用 Box / Cls / Angle 三分支", "Box / Cls / Angle branches at each scale"), {
     left: 1514,
     top: 552,
     width: 320,
@@ -439,10 +445,10 @@ async function main() {
   addLegendItem(slide, "leg-box", 1518, 592, C.box, "Box / DFL");
   addLegendItem(slide, "leg-cls", 1642, 592, C.cls, "Cls");
   addLegendItem(slide, "leg-angle", 1730, 592, C.angle, "Angle");
-  addPill(slide, "post-nms-tag", "NMS 后输出 coarse proposal", { left: 1540, top: 621, width: 278, height: 26 }, C.head, { fontSize: 13 });
+  addPill(slide, "post-nms-tag", tr("NMS 后输出 coarse proposal", "Post-NMS coarse proposals"), { left: 1540, top: 621, width: 278, height: 26 }, C.head, { fontSize: 13 });
 
   // Bottom panels.
-  addSection(slide, "ca-detail", "A  Coverage-Aware Assignment（训练阶段）", {
+  addSection(slide, "ca-detail", tr("A  Coverage-Aware Assignment（训练阶段）", "A  Coverage-Aware Assignment (training only)"), {
     left: 46,
     top: 690,
     width: 700,
@@ -486,12 +492,12 @@ async function main() {
     addShape(slide, "ellipse", `ca-point-${i}`, { left: x, top: y, width: 17, height: 17 }, fill,
       { style: "solid", fill, width: 0 });
   }
-  addText(slide, "ca-grid-label", "细长旋转 GT 与候选点", { left: 76, top: 950, width: 228, height: 26 }, {
+  addText(slide, "ca-grid-label", tr("细长旋转 GT 与候选点", "Elongated GT and candidates"), { left: 76, top: 950, width: 228, height: 26 }, {
     fontSize: 15,
     color: C.muted,
   });
 
-  addText(slide, "ca-step-label", "覆盖可达判定", { left: 325, top: 755, width: 172, height: 30 }, {
+  addText(slide, "ca-step-label", tr("覆盖可达判定", "Coverage feasibility"), { left: 325, top: 755, width: 172, height: 30 }, {
     fontSize: 19,
     bold: true,
     color: C.ca,
@@ -509,7 +515,7 @@ async function main() {
     bold: true,
     typeface: FONT_EN,
   });
-  addBox(slide, "ca-fallback", "候选为空时回退到\n传统内部候选集合", {
+  addBox(slide, "ca-fallback", tr("候选为空时回退到\n传统内部候选集合", "Fallback to conventional\ninside-box candidates if empty"), {
     left: 338,
     top: 894,
     width: 206,
@@ -521,7 +527,7 @@ async function main() {
     color: C.muted,
   });
 
-  addText(slide, "ca-route-label", "可覆盖层级", { left: 578, top: 755, width: 136, height: 30 }, {
+  addText(slide, "ca-route-label", tr("可覆盖层级", "Representable levels"), { left: 578, top: 755, width: 136, height: 30 }, {
     fontSize: 19,
     bold: true,
     color: C.ca,
@@ -551,7 +557,7 @@ async function main() {
   connect(slide, R.delta, R.output, { color: C.refine, width: 2.2 });
 
   addFeatureStack(slide, "ref-feature", { left: 810, top: 814, width: 88, height: 76 }, C.neck, "F_k", "P2 / P3", { compact: true });
-  addText(slide, "feature-stop-gradient-label", "冻结特征 · stop-grad", { left: 790, top: 936, width: 148, height: 22 }, {
+  addText(slide, "feature-stop-gradient-label", tr("冻结特征 · stop-grad", "Frozen features · stop-grad"), { left: 790, top: 936, width: 148, height: 22 }, {
     fontSize: 12.5,
     color: C.muted,
     typeface: FONT_CN,
@@ -565,7 +571,7 @@ async function main() {
     bold: true,
     typeface: FONT_EN,
   });
-  addPill(slide, "default-tag", "post-NMS · 全部 proposal", { left: 949, top: 752, width: 194, height: 26 }, C.ink, { fontSize: 12.5 });
+  addPill(slide, "default-tag", tr("post-NMS · 全部 proposal", "post-NMS · all proposals"), { left: 949, top: 752, width: 194, height: 26 }, C.ink, { fontSize: 12.5 });
 
   addBox(slide, "rotated-roi", "Rotated ROI\n5 × 24", { left: 1180, top: 790, width: 178, height: 86 }, {
     fill: C.neckLight,
@@ -579,19 +585,19 @@ async function main() {
     addShape(slide, "line", `roi-grid-v-${i}`, { left: 1195 + i * 24, top: 840, width: 0, height: 25 }, "none",
       { style: "solid", fill: C.softBorder, width: 0.7 });
   }
-  addText(slide, "roi-note", "沿候选方向对齐采样", { left: 1174, top: 886, width: 190, height: 24 }, {
+  addText(slide, "roi-note", tr("沿候选方向对齐采样", "Proposal-aligned sampling"), { left: 1174, top: 886, width: 190, height: 24 }, {
     fontSize: 13,
     color: C.muted,
   });
 
-  addBox(slide, "fusion-box", "P2/P3 融合\nConv + MLP", { left: 1390, top: 800, width: 148, height: 66 }, {
+  addBox(slide, "fusion-box", tr("P2/P3 融合\nConv + MLP", "P2/P3 fusion\nConv + MLP"), { left: 1390, top: 800, width: 148, height: 66 }, {
     fill: C.caLight,
     stroke: C.ca,
     strokeWidth: 1.5,
     fontSize: 15,
     bold: true,
   });
-  addBox(slide, "delta-box", "几何残差\nΔs, Δl", { left: 1572, top: 790, width: 146, height: 86 }, {
+  addBox(slide, "delta-box", tr("几何残差\nΔs, Δl", "Scale residuals\nΔs, Δl"), { left: 1572, top: 790, width: 146, height: 86 }, {
     fill: C.refineLight,
     stroke: C.refine,
     strokeWidth: 1.6,
@@ -599,7 +605,7 @@ async function main() {
     bold: true,
     typeface: FONT_EN,
   });
-  addBox(slide, "ref-output", "Refined OBB\n\nx, y, θ 不变\ns′=s·exp(Δs)\nl′=l·exp(Δl)", { left: 1728, top: 785, width: 122, height: 104 }, {
+  addBox(slide, "ref-output", tr("Refined OBB\n\nx, y, θ 不变\ns′=s·exp(Δs)\nl′=l·exp(Δl)", "Refined OBB\n\nx, y, θ fixed\ns′=s·exp(Δs)\nl′=l·exp(Δl)"), { left: 1728, top: 785, width: 122, height: 104 }, {
     fill: C.headLight,
     stroke: C.head,
     strokeWidth: 1.7,
@@ -607,23 +613,24 @@ async function main() {
     bold: true,
     typeface: FONT_EN,
   });
-  addPill(slide, "ref-policy", "中心 / 角度 / 置信度保持不变 · 不二次 NMS", {
+  addPill(slide, "ref-policy", tr("中心 / 角度 / 置信度保持不变 · 不二次 NMS", "Center / angle / confidence unchanged · no second NMS"), {
     left: 1115,
     top: 934,
     width: 486,
     height: 29,
   }, C.head, { fontSize: 13.5 });
-  addText(slide, "ref-loss-note", "训练：仅更新 Refine；目标采用分符号 tanh 平滑压缩并保留 20% 输出余量", {
+  addText(slide, "ref-loss-note", tr("训练：仅更新 Refine；目标采用分符号 tanh 平滑压缩并保留 20% 输出余量", "Training: update Refine only; sign-aware tanh target compression retains a 20% output margin"), {
     left: 1042,
     top: 983,
     width: 790,
     height: 25,
   }, { fontSize: 14, color: C.refine, alignment: "right" });
 
-  const pngPath = path.join(outputDir, "ca_refine_architecture_redesign.png");
-  const pptxPath = path.join(outputDir, "ca_refine_architecture_redesign.pptx");
-  const layoutPath = path.join(qaDir, "ca_refine_architecture_redesign.layout.json");
-  const inspectPath = path.join(qaDir, "ca_refine_architecture_redesign.inspect.ndjson");
+  const stem = args.stem ?? "ca_refine_architecture_redesign";
+  const pngPath = path.join(outputDir, `${stem}.png`);
+  const pptxPath = path.join(outputDir, `${stem}.pptx`);
+  const layoutPath = path.join(qaDir, `${stem}.layout.json`);
+  const inspectPath = path.join(qaDir, `${stem}.inspect.ndjson`);
 
   await writeBlob(pngPath, await presentation.export({ slide, format: "png", scale: 2 }));
   await fs.writeFile(layoutPath, await (await slide.export({ format: "layout" })).text(), "utf8");

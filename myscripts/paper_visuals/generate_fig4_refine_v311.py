@@ -1,4 +1,4 @@
-"""Generate the paper's Refine V3.1.1 quantitative figure from audited CSV files.
+"""Generate the paper's proposal-refinement figure from audited CSV files.
 
 The left panel visualizes checkpoint selection on the training holdout subset.  The
 right panel reports the independent FP32/batch=8 validation comparison used in the
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--stem", default="fig4_refine_v311_curve")
     parser.add_argument("--dpi", type=int, default=400)
+    parser.add_argument("--language", choices=("zh", "en"), default="zh")
     return parser.parse_args()
 
 
@@ -87,6 +88,17 @@ def main() -> None:
         raise ValueError("validation CSV must contain coarse and refined rows")
 
     configure_style()
+    en = args.language == "en"
+    text = {
+        "coarse": "CA (coarse)",
+        "refined": "CA + Refine",
+        "selected": f"Selected epoch {args.selected_epoch}" if en else f"选定 epoch {args.selected_epoch}",
+        "panel_a": "(a) Checkpoint selection on the training holdout" if en else "(a) Holdout 上的检查点选择",
+        "epoch": "Epoch" if en else "训练轮次 / epoch",
+        "panel_b": "(b) Independent validation (FP32, batch=8)" if en else "(b) 独立验证集定位指标（FP32，batch=8）",
+        "metric": "Metric value" if en else "指标值",
+        "title": "Checkpoint selection and independent validation of proposal-level refinement" if en else "候选框级几何精修的训练选择与独立验证结果",
+    }
     colors = {"coarse": "#5B6770", "refined": "#2F80ED", "accent": "#F2994A"}
     fig, axes = plt.subplots(1, 2, figsize=(12.4, 4.65), gridspec_kw={"width_ratios": [1.08, 1]})
 
@@ -94,20 +106,20 @@ def main() -> None:
     ax = axes[0]
     y_coarse = [coarse_holdout[e] for e in epochs]
     y_refined = [refined_holdout[e] for e in epochs]
-    ax.plot(epochs, y_coarse, color=colors["coarse"], lw=1.8, ls="--", label="CA（coarse）")
-    ax.plot(epochs, y_refined, color=colors["refined"], lw=2.2, marker="o", ms=4.2, label="CA + Refine")
+    ax.plot(epochs, y_coarse, color=colors["coarse"], lw=1.8, ls="--", label=text["coarse"])
+    ax.plot(epochs, y_refined, color=colors["refined"], lw=2.2, marker="o", ms=4.2, label=text["refined"])
     selected_y = refined_holdout[args.selected_epoch]
     ax.scatter([args.selected_epoch], [selected_y], s=90, zorder=5, color=colors["accent"], edgecolor="white", linewidth=1.4)
     ax.annotate(
-        f"选定 epoch {args.selected_epoch}\n{selected_y:.4f}",
+        f"{text['selected']}\n{selected_y:.4f}",
         xy=(args.selected_epoch, selected_y),
         xytext=(args.selected_epoch + 1.0, selected_y + 0.012),
         arrowprops={"arrowstyle": "->", "color": colors["accent"], "lw": 1.2},
         color="#A44F12",
         fontsize=9.5,
     )
-    ax.set_title("(a) Holdout 上的检查点选择")
-    ax.set_xlabel("训练轮次 / epoch")
+    ax.set_title(text["panel_a"])
+    ax.set_xlabel(text["epoch"])
     ax.set_ylabel("mAP@0.50:0.95")
     ax.set_xticks(epochs)
     ax.set_ylim(min(y_coarse) - 0.015, max(y_refined) + 0.035)
@@ -120,10 +132,10 @@ def main() -> None:
     width = 0.34
     coarse_values = np.array([float(val_by_variant["coarse"][key]) for key, _ in METRICS])
     refined_values = np.array([float(val_by_variant["refined"][key]) for key, _ in METRICS])
-    bars_c = ax.bar(x - width / 2, coarse_values, width, color=colors["coarse"], label="CA（coarse）", zorder=3)
-    bars_r = ax.bar(x + width / 2, refined_values, width, color=colors["refined"], label="CA + Refine", zorder=3)
-    ax.set_title("(b) 独立验证集定位指标（FP32，batch=8）")
-    ax.set_ylabel("指标值")
+    bars_c = ax.bar(x - width / 2, coarse_values, width, color=colors["coarse"], label=text["coarse"], zorder=3)
+    bars_r = ax.bar(x + width / 2, refined_values, width, color=colors["refined"], label=text["refined"], zorder=3)
+    ax.set_title(text["panel_b"])
+    ax.set_ylabel(text["metric"])
     ax.set_xticks(x, [label for _, label in METRICS])
     ax.set_ylim(0.0, 0.66)
     ax.grid(axis="y", color="#DCE3E8", lw=0.7, alpha=0.9, zorder=0)
@@ -142,7 +154,7 @@ def main() -> None:
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-    fig.suptitle("候选框级几何精修的训练选择与独立验证结果", fontsize=15, fontweight="bold", y=1.01)
+    fig.suptitle(text["title"], fontsize=15, fontweight="bold", y=1.01)
     fig.tight_layout(w_pad=2.6)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

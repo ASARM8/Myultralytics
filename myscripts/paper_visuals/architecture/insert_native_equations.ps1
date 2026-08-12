@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$InputPptx,
 
@@ -7,7 +7,10 @@ param(
 
     [Parameter(Mandatory = $true)]
     [ValidateSet(1, 2)]
-    [int]$Figure
+    [int]$Figure,
+
+    [ValidateSet('zh', 'en')]
+    [string]$Language = 'zh'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -363,7 +366,7 @@ function Apply-Figure1Equations {
 }
 
 function Apply-Figure2Equations {
-    param($Slide, $Word, $Document)
+    param($Slide, $Word, $Document, [string]$Language = 'zh')
 
     $ink = '#24313D'
     $line = '#77838F'
@@ -372,10 +375,18 @@ function Apply-Figure2Equations {
     $white = '#FFFFFF'
 
     $candidate = Get-ShapeByName -Slide $Slide -Name 'offset-candidate-label'
-    Set-ShapeText -Shape $candidate -Text '偏心候选' -FontSize 12 -FontName 'Microsoft YaHei' -Color $refine `
-        -Bold $true -Alignment 'left' -MarginLeft 10 -MarginRight 145
+    $candidateText = '偏心候选'
+    $candidateMarginRight = 145
+    $candidateEquationLeft = 78
+    if ($Language -eq 'en') {
+        $candidateText = 'Off-center candidate'
+        $candidateMarginRight = 102
+        $candidateEquationLeft = 142
+    }
+    Set-ShapeText -Shape $candidate -Text $candidateText -FontSize 12 -FontName 'Microsoft YaHei' -Color $refine `
+        -Bold $true -Alignment 'left' -MarginLeft 10 -MarginRight $candidateMarginRight
     Add-NativeSubscript -Slide $Slide -Word $Word -Document $Document -Name 'eq-offset-p-i' `
-        -Base 'p' -Subscript 'i' -Left ($candidate.Left + 78) -Top ($candidate.Top + 8) `
+        -Base 'p' -Subscript 'i' -Left ($candidate.Left + $candidateEquationLeft) -Top ($candidate.Top + 8) `
         -Width 23 -Height 22 -FontSize 4.65 -Color $refine | Out-Null
 
     foreach ($distance in @(
@@ -443,10 +454,16 @@ function Apply-Figure2Equations {
         -Width 30 -Height ($required.Height - 2) -FontSize 3.35 -Color $ink | Out-Null
 
     $condition = Get-ShapeByName -Slide $Slide -Name 'formula-condition'
-    Set-ShapeText -Shape $condition -Text '可达条件：' -FontSize 15 -FontName 'Microsoft YaHei' -Color $ca `
-        -Bold $true -Alignment 'left' -MarginLeft 16 -MarginRight 310
+    $conditionText = '可达条件：'
+    $conditionEquationLeft = 96
+    if ($Language -eq 'en') {
+        $conditionText = 'If:'
+        $conditionEquationLeft = 116
+    }
+    Set-ShapeText -Shape $condition -Text $conditionText -FontSize 15 -FontName 'Microsoft YaHei' -Color $ca `
+        -Bold $true -Alignment 'left' -MarginLeft 16 -MarginRight 290
     Add-NativeSubscript -Slide $Slide -Word $Word -Document $Document -Name 'eq-condition-d-req' `
-        -Base 'D' -Subscript 'req' -Left ($condition.Left + 96) -Top ($condition.Top + 1) `
+        -Base 'D' -Subscript 'req' -Left ($condition.Left + $conditionEquationLeft) -Top ($condition.Top + 1) `
         -Width 30 -Height ($condition.Height - 2) -FontSize 3.45 -Color $ca -Bold $true | Out-Null
 
     $capacity = Get-ShapeByName -Slide $Slide -Name 'formula-capacity'
@@ -480,7 +497,7 @@ try {
         Apply-Figure1Equations -Slide $slide -Word $word -Document $document
     }
     else {
-        Apply-Figure2Equations -Slide $slide -Word $word -Document $document
+        Apply-Figure2Equations -Slide $slide -Word $word -Document $document -Language $Language
     }
 
     $presentation.SaveAs($resolvedOutput, 24)

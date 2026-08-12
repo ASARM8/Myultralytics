@@ -248,7 +248,7 @@ def rename_equation(alternate: ET._Element, name: str, description: str) -> None
         props.set("descr", description)
 
 
-def formula_specs(figure: int, shapes: dict[str, ET._Element]) -> tuple[FormulaSpec, ...]:
+def formula_specs(figure: int, shapes: dict[str, ET._Element], language: str = "zh") -> tuple[FormulaSpec, ...]:
     """Return full-expression formulas for one figure."""
     ink = "24313D"
     muted = "66717E"
@@ -285,7 +285,7 @@ def formula_specs(figure: int, shapes: dict[str, ET._Element]) -> tuple[FormulaS
         )
 
     return (
-        place("eq-offset-p-i", "offset-candidate-label", (("sub", "p", "i"), ("op", "="), ("op", "("), ("sub", "x", "f"), ("op", ","), ("sub", "y", "f"), ("op", ")")), 11.0, refine, 78, 8, 122, 22),
+        place("eq-offset-p-i", "offset-candidate-label", (("sub", "p", "i"), ("op", "="), ("op", "("), ("sub", "x", "f"), ("op", ","), ("sub", "y", "f"), ("op", ")")), 11.0, refine, 142 if language == "en" else 78, 8, 122, 22),
         place("eq-distance-left", "distance-left", (("id", "w"), ("op", "∕2+"), ("sub", "x", "f")), 9.5, refine, 4, 3, -8, -6),
         place("eq-distance-right", "distance-right", (("id", "w"), ("op", "∕2−"), ("sub", "x", "f")), 9.5, "77838F", 4, 3, -8, -6),
         place("eq-distance-top", "distance-top", (("id", "h"), ("op", "∕2−"), ("sub", "y", "f")), 9.5, "77838F", 4, 3, -8, -6),
@@ -299,7 +299,7 @@ def formula_specs(figure: int, shapes: dict[str, ET._Element]) -> tuple[FormulaS
         place("eq-bar-dmax-P4", "bar-dmax-P4", (("sub", "D", "max"), ("op", "="), ("op", "496"), ("text", " px")), 7.4, white, 2, -6, -4, 6, True),
         place("eq-bar-dmax-P5", "bar-dmax-P5", (("sub", "D", "max"), ("op", "="), ("op", "992"), ("text", " px")), 7.4, white, 2, -6, -4, 6, True),
         place("eq-required-d-req", "formula-required", (("sub", "D", "req"), ("op", "="), ("text", "max"), ("op", "("), ("id", "w"), ("op", "∕2+|"), ("sub", "x", "f"), ("op", "|,"), ("id", "h"), ("op", "∕2+|"), ("sub", "y", "f"), ("op", "|)")), 10.0, ink, 10, 1, -20, -2),
-        place("eq-condition-d-req", "formula-condition", (("sub", "D", "req"), ("op", "∕"), ("text", "stride"), ("op", "≤"), ("sub", "reg", "max"), ("op", "−1")), 10.0, ca, 88, 1, 220, -2, True),
+        place("eq-condition-d-req", "formula-condition", (("sub", "D", "req"), ("op", "∕"), ("text", "stride"), ("op", "≤"), ("sub", "reg", "max"), ("op", "−1")), 10.0, ca, 54 if language == "en" else 88, 1, 282 if language == "en" else 220, -2, True),
         place("eq-capacity-d-max", "formula-capacity", (("sub", "D", "max"), ("op", "="), ("text", "stride"), ("op", "×("), ("sub", "reg", "max"), ("op", "−1)")), 10.0, ink, 10, 1, -20, -2),
     )
 
@@ -336,7 +336,7 @@ def remove_named_objects(root: ET._Element, names: set[str]) -> None:
             tree.remove(child)
 
 
-def reflow(input_path: Path, output_path: Path, figure: int) -> None:
+def reflow(input_path: Path, output_path: Path, figure: int, language: str = "zh") -> None:
     """Apply formula merging and save a new PPTX."""
     with zipfile.ZipFile(input_path, "r") as source:
         infos = source.infolist()
@@ -347,7 +347,7 @@ def reflow(input_path: Path, output_path: Path, figure: int) -> None:
     shapes = direct_shapes(root)
     equations = equation_objects(root)
     configure_anchor_aliases(figure, shapes, equations)
-    specs = formula_specs(figure, shapes)
+    specs = formula_specs(figure, shapes, language)
 
     keep_names = {spec.keep for spec in specs}
     missing = keep_names - equations.keys()
@@ -483,8 +483,9 @@ def main() -> None:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--figure", type=int, choices=(1, 2), required=True)
+    parser.add_argument("--language", choices=("zh", "en"), default="zh")
     args = parser.parse_args()
-    reflow(args.input.resolve(), args.output.resolve(), args.figure)
+    reflow(args.input.resolve(), args.output.resolve(), args.figure, args.language)
 
 
 if __name__ == "__main__":
