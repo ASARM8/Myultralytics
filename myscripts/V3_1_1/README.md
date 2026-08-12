@@ -125,3 +125,18 @@ python -m myscripts.V3_1_1.audit_reproductions_v311 \
 ```text
 /root/autodl-tmp/paper_exports/refine_v311_seed0
 ```
+
+## 5. 内部范围锚点（不得写入论文）
+
+- 记录日期：2026-08-07。
+- 当前阶段将既有数据集及其划分视为固定且有效的实验前提，不把数据集问题纳入 Refine 结果判断、模型优化或后续实验决策。
+- 论文正文、图表、实验分析和局限性部分均不引入数据集划分相关表述。
+- 本条仅作为内部工作边界记录；除非用户后续明确重新开启该议题，否则不再主动分析或扩展。
+
+## 6. 论文方法冻结锚点（2026-08-07）
+
+- 当前方法结构冻结为 `Coverage-Aware Assignment + reg_max=32 + proposal-level geometry refine`。
+- 正式论文结果固定采用独立验证的 FP32、batch=8、`imgsz=640` 口径；CA 权重固定为 `/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt`。
+- 现有证据已经足以进入小论文写作：coarse/identity 完全恒等，CA 哈希不变，mAP50-95 为 `0.454137→0.562504`，AP75 为 `0.439822→0.558800`，匹配 proposal 平均 IoU 增量为 `+0.046647`。
+- AP95 为 `0.099024→0.097174`，且当前仅有 seed0；论文采用“在当前固定实验设置下取得明确正向改善”的保守表述，不声称统计显著性。
+- 后续只补统一 Baseline、H1/H2、复杂度、定性结果和必要的多种子复验。这些属于证据补全，不再因小幅数值波动触发 Refine 结构迭代。

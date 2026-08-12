@@ -315,13 +315,13 @@ function Apply-Figure1Equations {
     $subtitleLeft = [double]$subtitle.Left
     $subtitleTop = [double]$subtitle.Top
     $subtitle.Delete()
-    Add-PlainTextBox -Slide $Slide -Name 'figure-subtitle-left' -Text 'Coverage-Aware Assignment  ·' `
+    Add-PlainTextBox -Slide $Slide -Name 'figure-subtitle-left' -Text 'Coverage-Aware Assignment  |' `
         -Left $subtitleLeft -Top $subtitleTop -Width 205 -Height 22.5 -FontSize 13.5 -Color $muted | Out-Null
     Add-NativeSubscript -Slide $Slide -Word $Word -Document $Document -Name 'eq-figure-subtitle-regmax' `
         -Base 'reg' -Subscript 'max' -Left ($subtitleLeft + 202) -Top ($subtitleTop + 1) -Width 48 -Height 18 `
         -FontSize 5.2 -Color $muted | Out-Null
-    Add-PlainTextBox -Slide $Slide -Name 'figure-subtitle-right' -Text '·  Fully-decoupled Refine' `
-        -Left ($subtitleLeft + 264) -Top $subtitleTop -Width 220 -Height 22.5 -FontSize 13.5 -Color $muted | Out-Null
+    Add-PlainTextBox -Slide $Slide -Name 'figure-subtitle-right' -Text '|  Proposal-level Geometry Refine' `
+        -Left ($subtitleLeft + 264) -Top $subtitleTop -Width 270 -Height 22.5 -FontSize 13.5 -Color $muted | Out-Null
 
     $formulaBox = Get-ShapeByName -Slide $Slide -Name 'ca-formula'
     Set-ShapeText -Shape $formulaBox -Text ' ' -FontSize 1 -FontName 'Times New Roman' -Color $ink

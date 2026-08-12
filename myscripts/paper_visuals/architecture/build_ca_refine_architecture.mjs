@@ -244,7 +244,7 @@ function addFeatureStack(slide, name, position, color, label, detail, {
   }, { fontSize: compact ? 13 : 15, color: C.muted });
 }
 
-function addFourBranchHead(slide, name, position, scaleText) {
+function addThreeBranchHead(slide, name, position, scaleText) {
   addBox(slide, `${name}-frame`, null, position, {
     fill: C.headLight,
     stroke: C.head,
@@ -261,9 +261,9 @@ function addFourBranchHead(slide, name, position, scaleText) {
   const y = position.top + 8;
   const w = position.width - 72;
   const h = 9;
-  const gap = 5;
-  const colors = [C.box, C.cls, C.angle, C.refine];
-  for (let i = 0; i < 4; i += 1) {
+  const gap = 8;
+  const colors = [C.box, C.cls, C.angle];
+  for (let i = 0; i < 3; i += 1) {
     addShape(slide, "roundRect", `${name}-branch-${i}`, {
       left: x,
       top: y + i * (h + gap),
@@ -302,21 +302,19 @@ async function main() {
     width: 660,
     height: 52,
   }, { fontSize: 38, bold: true, alignment: "left", color: C.ink });
-  addText(slide, "figure-subtitle", "Coverage-Aware Assignment  ·  reg_max = 32  ·  Fully-decoupled Refine", {
+  addText(slide, "figure-subtitle", "Coverage-Aware Assignment  ·  reg_max = 32  ·  Proposal-level Geometry Refine", {
     left: 58,
     top: 68,
     width: 980,
     height: 30,
   }, { fontSize: 18, alignment: "left", color: C.muted, typeface: FONT_EN });
 
-  addPill(slide, "tag-main", "推理主干", { left: 1590, top: 30, width: 118, height: 34 }, C.ink, { fontSize: 16 });
-  addPill(slide, "tag-train", "训练增强", { left: 1720, top: 30, width: 118, height: 34 }, C.ca, { fontSize: 16 });
 
   // Major regions.
   addSection(slide, "input", "Input", { left: 46, top: 112, width: 248, height: 548 }, C.ink);
   addSection(slide, "backbone", "Backbone", { left: 316, top: 112, width: 548, height: 548 }, C.backbone);
   addSection(slide, "neck", "PAN–FPN Neck", { left: 886, top: 112, width: 564, height: 548 }, C.neck);
-  addSection(slide, "head", "OBBRefine Head", { left: 1472, top: 112, width: 402, height: 548 }, C.head);
+  addSection(slide, "head", "OBB Detect Head", { left: 1472, top: 112, width: 402, height: 548 }, C.head);
 
   // Invisible anchors are created before connectors so all edges stay behind nodes.
   const A = {};
@@ -428,11 +426,11 @@ async function main() {
     typeface: FONT_EN,
   });
 
-  // Multi-scale OBBRefine heads.
-  addFourBranchHead(slide, "head-p3", { left: 1520, top: 224, width: 248, height: 78 }, "P3");
-  addFourBranchHead(slide, "head-p4", { left: 1520, top: 342, width: 248, height: 78 }, "P4");
-  addFourBranchHead(slide, "head-p5", { left: 1520, top: 460, width: 248, height: 78 }, "P5");
-  addText(slide, "head-main-label", "每一尺度均采用四分支解耦预测", {
+  // Multi-scale OBB detection heads. Refine is deliberately kept outside the dense head.
+  addThreeBranchHead(slide, "head-p3", { left: 1520, top: 224, width: 248, height: 78 }, "P3");
+  addThreeBranchHead(slide, "head-p4", { left: 1520, top: 342, width: 248, height: 78 }, "P4");
+  addThreeBranchHead(slide, "head-p5", { left: 1520, top: 460, width: 248, height: 78 }, "P5");
+  addText(slide, "head-main-label", "每一尺度采用 Box / Cls / Angle 三分支", {
     left: 1514,
     top: 552,
     width: 320,
@@ -441,7 +439,7 @@ async function main() {
   addLegendItem(slide, "leg-box", 1518, 592, C.box, "Box / DFL");
   addLegendItem(slide, "leg-cls", 1642, 592, C.cls, "Cls");
   addLegendItem(slide, "leg-angle", 1730, 592, C.angle, "Angle");
-  addLegendItem(slide, "leg-refine", 1518, 620, C.refine, "Refine Δw, Δh");
+  addPill(slide, "post-nms-tag", "NMS 后输出 coarse proposal", { left: 1540, top: 621, width: 278, height: 26 }, C.head, { fontSize: 13 });
 
   // Bottom panels.
   addSection(slide, "ca-detail", "A  Coverage-Aware Assignment（训练阶段）", {
@@ -450,7 +448,7 @@ async function main() {
     width: 700,
     height: 340,
   }, C.ca, C.paper);
-  addSection(slide, "ref-detail", "B  Fully-decoupled Refine Head", {
+  addSection(slide, "ref-detail", "B  Proposal-level Local Geometry Refine", {
     left: 766,
     top: 690,
     width: 1108,
@@ -538,89 +536,87 @@ async function main() {
     fill: C.concatLight, stroke: C.concat, fontSize: 14, bold: true,
   });
 
-  // Refine detail anchors and connectors first.
+  // Proposal-level refine anchors and connectors first.
   const R = {};
-  R.f = addAnchor(slide, "a-ref-feature", { left: 798, top: 812, width: 126, height: 96 });
-  R.box = addAnchor(slide, "a-ref-box", { left: 994, top: 752, width: 190, height: 48 });
-  R.cls = addAnchor(slide, "a-ref-cls", { left: 994, top: 812, width: 190, height: 48 });
-  R.ang = addAnchor(slide, "a-ref-angle", { left: 994, top: 872, width: 190, height: 48 });
-  R.ref = addAnchor(slide, "a-ref-refine", { left: 994, top: 932, width: 190, height: 48 });
-  R.coarse = addAnchor(slide, "a-ref-coarse", { left: 1242, top: 785, width: 222, height: 92 });
-  R.delta = addAnchor(slide, "a-ref-delta", { left: 1242, top: 915, width: 222, height: 70 });
-  R.gate = addAnchor(slide, "a-ref-gate", { left: 1502, top: 895, width: 166, height: 66 });
-  R.output = addAnchor(slide, "a-ref-output", { left: 1700, top: 808, width: 142, height: 116 });
-  connect(slide, R.f, R.box, { color: C.box, width: 2 });
-  connect(slide, R.f, R.cls, { color: C.cls, width: 2 });
-  connect(slide, R.f, R.ang, { color: C.angle, width: 2 });
-  connect(slide, R.f, R.ref, { color: C.refine, width: 2, dashed: true });
-  connect(slide, R.box, R.coarse, { color: C.box, width: 2 });
-  connect(slide, R.ang, R.coarse, { color: C.angle, width: 2 });
-  connect(slide, R.coarse, R.output, { color: C.ink, width: 2.4 });
-  connect(slide, R.coarse, R.delta, {
-    fromSide: "bottom",
-    toSide: "top",
-    color: C.refine,
-    width: 1.7,
-    dashed: true,
-  });
-  connect(slide, R.ref, R.delta, { color: C.refine, width: 2.2 });
-  connect(slide, R.delta, R.gate, { color: C.refine, width: 2.2 });
-  connect(slide, R.gate, R.output, { color: C.refine, width: 2.2 });
+  R.f = addAnchor(slide, "a-ref-feature", { left: 798, top: 808, width: 126, height: 96 });
+  R.coarse = addAnchor(slide, "a-ref-coarse", { left: 944, top: 785, width: 204, height: 92 });
+  R.roi = addAnchor(slide, "a-ref-roi", { left: 1180, top: 790, width: 178, height: 86 });
+  R.fusion = addAnchor(slide, "a-ref-fusion", { left: 1390, top: 800, width: 148, height: 66 });
+  R.delta = addAnchor(slide, "a-ref-delta", { left: 1572, top: 790, width: 146, height: 86 });
+  R.output = addAnchor(slide, "a-ref-output", { left: 1728, top: 785, width: 122, height: 104 });
+  connect(slide, R.f, R.roi, { color: C.neck, width: 2.2 });
+  connect(slide, R.coarse, R.roi, { color: C.ink, width: 2.2 });
+  connect(slide, R.roi, R.fusion, { color: C.neck, width: 2.2 });
+  connect(slide, R.fusion, R.delta, { color: C.refine, width: 2.2 });
+  connect(slide, R.delta, R.output, { color: C.refine, width: 2.2 });
 
-  addFeatureStack(slide, "ref-feature", { left: 810, top: 818, width: 88, height: 76 }, C.neck, "F_k", "P3 / P4 / P5", { compact: true });
-  addPill(slide, "ref-box-branch", "Box / DFL · 4×32", { left: 994, top: 752, width: 190, height: 48 }, C.box, { fontSize: 16 });
-  addPill(slide, "ref-cls-branch", "Classification · nc", { left: 994, top: 812, width: 190, height: 48 }, C.cls, { fontSize: 16 });
-  addPill(slide, "ref-angle-branch", "Angle · θ", { left: 994, top: 872, width: 190, height: 48 }, C.angle, { color: C.ink, fontSize: 16 });
-  addPill(slide, "ref-refine-branch", "Refine · Δw, Δh", { left: 994, top: 932, width: 190, height: 48 }, C.refine, { fontSize: 16 });
-  addText(slide, "feature-stop-gradient-label", "stop-grad", { left: 924, top: 939, width: 78, height: 22 }, {
-    fontSize: 12,
-    color: C.refine,
-    typeface: FONT_EN,
-    alignment: "right",
-    insets: { top: 0, right: 2, bottom: 0, left: 0 },
+  addFeatureStack(slide, "ref-feature", { left: 810, top: 814, width: 88, height: 76 }, C.neck, "F_k", "P2 / P3", { compact: true });
+  addText(slide, "feature-stop-gradient-label", "冻结特征 · stop-grad", { left: 790, top: 936, width: 148, height: 22 }, {
+    fontSize: 12.5,
+    color: C.muted,
+    typeface: FONT_CN,
   });
 
-  addBox(slide, "coarse-box", "Coarse OBB\nB_c = (x, y, w, h, θ)", { left: 1242, top: 785, width: 222, height: 92 }, {
+  addBox(slide, "coarse-box", "Coarse OBB\nB_c = (x, y, w, h, θ)", { left: 944, top: 785, width: 204, height: 92 }, {
     fill: C.backboneLight,
     stroke: C.box,
     strokeWidth: 1.6,
-    fontSize: 18,
+    fontSize: 17,
     bold: true,
     typeface: FONT_EN,
   });
-  addPill(slide, "default-tag", "coarse-only（默认评估）", { left: 1248, top: 753, width: 210, height: 26 }, C.ink, { fontSize: 13 });
-  addBox(slide, "delta-box", "连续宽高残差\nΔw, Δh", { left: 1242, top: 915, width: 222, height: 70 }, {
+  addPill(slide, "default-tag", "post-NMS · 全部 proposal", { left: 949, top: 752, width: 194, height: 26 }, C.ink, { fontSize: 12.5 });
+
+  addBox(slide, "rotated-roi", "Rotated ROI\n5 × 24", { left: 1180, top: 790, width: 178, height: 86 }, {
+    fill: C.neckLight,
+    stroke: C.neck,
+    strokeWidth: 1.6,
+    fontSize: 17,
+    bold: true,
+    typeface: FONT_EN,
+  });
+  for (let i = 1; i < 6; i += 1) {
+    addShape(slide, "line", `roi-grid-v-${i}`, { left: 1195 + i * 24, top: 840, width: 0, height: 25 }, "none",
+      { style: "solid", fill: C.softBorder, width: 0.7 });
+  }
+  addText(slide, "roi-note", "沿候选方向对齐采样", { left: 1174, top: 886, width: 190, height: 24 }, {
+    fontSize: 13,
+    color: C.muted,
+  });
+
+  addBox(slide, "fusion-box", "P2/P3 融合\nConv + MLP", { left: 1390, top: 800, width: 148, height: 66 }, {
+    fill: C.caLight,
+    stroke: C.ca,
+    strokeWidth: 1.5,
+    fontSize: 15,
+    bold: true,
+  });
+  addBox(slide, "delta-box", "几何残差\nΔs, Δl", { left: 1572, top: 790, width: 146, height: 86 }, {
     fill: C.refineLight,
     stroke: C.refine,
     strokeWidth: 1.6,
-    fontSize: 18,
-    bold: true,
-  });
-  addText(slide, "coarse-stop-gradient-label", "stop-grad（训练）", { left: 1358, top: 881, width: 102, height: 24 }, {
-    fontSize: 11.5,
-    color: C.refine,
-    alignment: "left",
-    insets: { top: 0, right: 0, bottom: 0, left: 2 },
-  });
-  addBox(slide, "geometry-gate", "Geometry gate\nAR>30  or  short<16 px", { left: 1502, top: 895, width: 166, height: 66 }, {
-    fill: C.concatLight,
-    stroke: C.concat,
-    fontSize: 13,
+    fontSize: 17,
     bold: true,
     typeface: FONT_EN,
   });
-  addBox(slide, "ref-output", "Output\n\nx, y, θ 不变\nw′ = w·exp(Δw)\nh′ = h·exp(Δh)", { left: 1700, top: 808, width: 142, height: 116 }, {
+  addBox(slide, "ref-output", "Refined OBB\n\nx, y, θ 不变\ns′=s·exp(Δs)\nl′=l·exp(Δl)", { left: 1728, top: 785, width: 122, height: 104 }, {
     fill: C.headLight,
     stroke: C.head,
     strokeWidth: 1.7,
-    fontSize: 14,
+    fontSize: 12.5,
     bold: true,
     typeface: FONT_EN,
   });
-  addText(slide, "ref-loss-note", "训练：Refine 输入特征与基准粗框均停止梯度；辅助损失仅更新 Refine 分支", {
-    left: 1230,
-    top: 997,
-    width: 620,
+  addPill(slide, "ref-policy", "中心 / 角度 / 置信度保持不变 · 不二次 NMS", {
+    left: 1115,
+    top: 934,
+    width: 486,
+    height: 29,
+  }, C.head, { fontSize: 13.5 });
+  addText(slide, "ref-loss-note", "训练：仅更新 Refine；目标采用分符号 tanh 平滑压缩并保留 20% 输出余量", {
+    left: 1042,
+    top: 983,
+    width: 790,
     height: 25,
   }, { fontSize: 14, color: C.refine, alignment: "right" });
 

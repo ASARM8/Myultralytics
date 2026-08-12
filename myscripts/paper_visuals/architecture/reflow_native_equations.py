@@ -352,7 +352,36 @@ def reflow(input_path: Path, output_path: Path, figure: int) -> None:
     keep_names = {spec.keep for spec in specs}
     missing = keep_names - equations.keys()
     if missing:
-        raise ValueError(f"Required seed equation objects are missing: {sorted(missing)}")
+        # Office may occasionally paste one copied OMath object as ordinary text
+        # while the other equations remain native. Rebuild only those missing
+        # containers from a verified native seed; the complete OMML payload and
+        # final geometry are replaced below, so the cloned seed carries no
+        # semantic content into the finished equation.
+        if not equations:
+            raise ValueError(f"Required seed equation objects are missing and no native seed is available: {sorted(missing)}")
+        prototype = next(iter(equations.values()))
+        tree = root.find(".//p:spTree", NS)
+        if tree is None:
+            raise ValueError("Slide shape tree was not found")
+        max_shape_id = max(
+            (int(node.get("id")) for node in root.findall(".//p:cNvPr", NS) if (node.get("id") or "").isdigit()),
+            default=1,
+        )
+        for missing_name in sorted(missing):
+            remove_named_objects(root, {missing_name})
+            clone = copy.deepcopy(prototype)
+            max_shape_id += 1
+            for props in clone.findall("mc:Choice/p:sp/p:nvSpPr/p:cNvPr", NS) + clone.findall(
+                "mc:Fallback/p:sp/p:nvSpPr/p:cNvPr", NS
+            ):
+                props.set("id", str(max_shape_id))
+            rename_equation(clone, missing_name, "Office Math reconstructed seed")
+            tree.append(clone)
+        shapes = direct_shapes(root)
+        equations = equation_objects(root)
+        missing = keep_names - equations.keys()
+        if missing:
+            raise ValueError(f"Required seed equation objects are missing after reconstruction: {sorted(missing)}")
 
     fragment_names = {name for name in equations if name.startswith("eq-")} - keep_names
     if figure == 1:
@@ -391,9 +420,10 @@ def reflow(input_path: Path, output_path: Path, figure: int) -> None:
     configure_anchor_aliases(figure, shapes, equations)
 
     if figure == 1:
-        set_shape_text(shapes["figure-subtitle-right"], "·  Fully-decoupled Refine")
+        set_shape_text(shapes["figure-subtitle-left"], "Coverage-Aware Assignment  |")
+        set_shape_text(shapes["figure-subtitle-right"], "|  Proposal-level Geometry Refine")
         right_left, right_top, _, right_height = shape_geometry(shapes["figure-subtitle-right"])
-        set_shape_geometry(shapes["figure-subtitle-right"], right_left + pt(27), right_top, pt(220), right_height)
+        set_shape_geometry(shapes["figure-subtitle-right"], right_left + pt(27), right_top, pt(270), right_height)
     else:
         for name in (
             "distance-left",
