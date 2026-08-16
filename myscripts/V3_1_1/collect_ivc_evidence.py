@@ -2,8 +2,9 @@
 
 This entry point calls the existing, individually audited collectors.  It does
 not train Baseline, CA, or Refine models.  H1/H2 uses a frozen, single-split,
-assigner-only pass with zero optimization steps.  Latency is additionally
-measured for Baseline, CA, and CA+Refine through one synchronized runtime.
+assigner-only pass with zero optimization steps.  Latency and peak allocated
+memory are additionally measured for Baseline, CA, and CA+Refine through three
+balanced rounds of isolated synchronized workers.
 
 The workflow is intentionally fixed to the validation split, ``imgsz=640``,
 the canonical Baseline/CA checkpoints, and the selected Refine checkpoint.
@@ -40,6 +41,7 @@ CANONICAL_REFINE = (
 )
 CANONICAL_TRAINING_DIR = "/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only"
 DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/paper_exports"
+EVIDENCE_PROTOCOL_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -150,7 +152,12 @@ def expected_are_complete(paths: Iterable[Path]) -> bool:
 
 def build_run_identity(args: argparse.Namespace) -> dict[str, object]:
     """Fields that must not change when an interrupted evidence run resumes."""
+    git_code, git_commit = capture(["git", "rev-parse", "HEAD"])
+    if git_code != 0 or not git_commit:
+        raise RuntimeError("无法确定当前 Git commit，拒绝创建不可追溯的正式证据包")
     return {
+        "evidence_protocol_version": EVIDENCE_PROTOCOL_VERSION,
+        "git_commit": git_commit,
         "data": str(Path(args.data)),
         "baseline_weights": str(Path(args.baseline_weights)),
         "ca_weights": str(Path(args.ca_weights)),
@@ -187,11 +194,12 @@ class EvidenceCollector:
                 "created_at": iso_now(),
                 "output_dir": str(output_dir),
                 "protocol": {
+                    "version": EVIDENCE_PROTOCOL_VERSION,
                     "split": "val",
                     "test_used": False,
                     "imgsz": 640,
                     "official_validation": "FP32, batch=8",
-                    "official_latency": "FP32, batch=1, synchronized complete chain",
+                    "official_latency": "FP32, batch=1, 3x3 Latin-square order, isolated synchronized workers",
                 },
                 "stages": {},
             }
@@ -219,7 +227,15 @@ class EvidenceCollector:
         if not self.resume:
             return False
         status = self.state.get("stages", {}).get(name, {}).get("status")
-        return status in {"completed", "threshold_not_met"} and expected_are_complete(expected)
+        if status not in {"completed", "threshold_not_met"} or not expected_are_complete(expected):
+            return False
+        if name == "profile_refine_fp32_batch1":
+            summary_path = self.output_dir / "profile_refine_fp32_batch1" / "profile_summary.json"
+            return read_json(summary_path).get("protocol_version") == 2
+        if name == "profile_comparative_fp32_batch1":
+            summary_path = self.output_dir / "profile_comparative_fp32_batch1" / "comparative_profile.json"
+            return read_json(summary_path).get("protocol_version") == 2
+        return True
 
     def run_action(
         self,
@@ -356,6 +372,18 @@ def require_inputs(args: argparse.Namespace) -> None:
     missing = [f"{label}: {path}" for label, path in required.items() if not path.exists()]
     if missing:
         raise FileNotFoundError("必要输入不存在:\n" + "\n".join(missing))
+
+
+def require_clean_repository() -> None:
+    """Formal evidence must be attributable to one immutable source commit."""
+    git_code, _git_commit = capture(["git", "rev-parse", "HEAD"])
+    status_code, git_status = capture(["git", "status", "--short"])
+    if git_code != 0 or status_code != 0:
+        raise RuntimeError("无法读取 Git 状态，拒绝创建不可追溯的正式证据包")
+    if git_status:
+        raise RuntimeError(
+            "正式证据采集要求干净的 Git 工作区；请先提交或清理以下改动:\n" + git_status
+        )
 
 
 def capture(command: list[str]) -> tuple[int, str]:
@@ -657,7 +685,7 @@ def build_command_stages(args: argparse.Namespace, output_dir: Path) -> list[Com
     stages.append(
         CommandStage(
             "profile_comparative_fp32_batch1",
-            "以同一同步链路比较 Baseline、CA 与 CA+Refine 性能",
+            "以三轮平衡顺序和独立进程比较 Baseline、CA 与 CA+Refine 性能",
             py_module(
                 "myscripts.V3_1_1.profile_comparative_v311",
                 "--baseline-weights",
@@ -679,6 +707,8 @@ def build_command_stages(args: argparse.Namespace, output_dir: Path) -> list[Com
                 "--no-amp",
                 "--warmup",
                 20,
+                "--repeats",
+                3,
                 "--output-dir",
                 comparative_dir,
             ),
@@ -686,6 +716,7 @@ def build_command_stages(args: argparse.Namespace, output_dir: Path) -> list[Com
                 comparative_dir / "comparative_latency.csv",
                 comparative_dir / "comparative_profile.json",
                 comparative_dir / "comparative_per_image.csv",
+                comparative_dir / "comparative_repeat_summary.csv",
             ),
         )
     )
@@ -849,6 +880,7 @@ def audit_protocol_outputs(args: argparse.Namespace, output_dir: Path) -> list[s
     if not (
         profile.get("split") == "val"
         and profile.get("test_used") is False
+        and profile.get("protocol_version") == 2
         and profile.get("imgsz") == 640
         and profile.get("batch") == 1
         and profile.get("amp") is False
@@ -864,13 +896,25 @@ def audit_protocol_outputs(args: argparse.Namespace, output_dir: Path) -> list[s
         and comparative.get("imgsz") == 640
         and comparative.get("batch") == 1
         and comparative.get("amp") is False
+        and comparative.get("protocol_version") == 2
+        and comparative.get("repeat_count") == 3
         and comparative.get("same_images_and_shapes") is True
         and comparative.get("same_image_order") is True
         and comparative.get("ca_proposals_match_refine_profile") is True
+        and comparative.get("external_refine_paths_match") is True
+        and comparative.get("external_refine_proposals_match") is True
+        and comparative.get("worker_process_isolation") is True
         and comparative.get("baseline", {}).get("weights_unchanged") is True
         and comparative.get("ca", {}).get("weights_unchanged") is True
+        and comparative.get("refine", {}).get("weights_unchanged") is True
     ):
         raise RuntimeError("统一 Baseline/CA/CA+Refine 性能文件不符合锁定协议")
+    if comparative.get("latency_stability_pass") is not True:
+        warnings.append("三轮平衡顺序延迟的轮间波动超过预声明5%阈值，效率结果暂不进入论文。")
+    if comparative.get("memory_stability_pass") is not True:
+        warnings.append("独立进程峰值显存的轮间波动超过预声明2%阈值，显存结果暂不进入论文。")
+    if comparative.get("ca_refine_coarse_consistency_pass") is not True:
+        warnings.append("独立CA与Refine链内部coarse耗时差超过预声明5%阈值，Refine开销暂不进入论文。")
     qualitative = read_json(output_dir / "qualitative_predictions" / "export_audit.json")
     if not (
         qualitative.get("split") == "val"
@@ -950,6 +994,7 @@ def main(argv: list[str] | None = None) -> None:
     validate_args(parser, args)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["PYTHONHASHSEED"] = "0"
+    require_clean_repository()
     output_dir = determine_output_dir(args)
     if output_dir.exists() and not args.resume:
         parser.error(f"输出目录已存在，避免混入旧结果: {output_dir}；继续时请增加 --resume")
@@ -1015,7 +1060,7 @@ def main(argv: list[str] | None = None) -> None:
             "notes": [
                 "三条复核路径复用同一个 Refine checkpoint，不是三个随机种子。",
                 "H1/H2 是固定checkpoint、单一val split、零优化步骤的只读统计。",
-                "Baseline、CA和CA+Refine延迟另以同一同步链路输出，避免混用validator计时。",
+                "Baseline、CA和CA+Refine以三轮拉丁方顺序、独立进程和同一同步链路输出延迟与显存。",
                 "主验证CSV和Refine验证CSV均包含AP50至AP95的完整5点阈值序列。",
                 "正式论文主结果取 reproduction_fp32_batch8。",
             ],

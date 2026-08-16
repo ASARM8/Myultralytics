@@ -175,10 +175,29 @@ python -m myscripts.V3_1_1.profile_refine_v311 \
 输出：
 
 - `profile_per_image.csv`：逐图 proposal 数量、数据读取、预处理、CA forward、旋转 NMS、proposal 打包、Refine 和结果回写时延；
-- `profile_summary.json`：各阶段 mean/median/P95、完整计算链 FPS、峰值显存、CA/Refine 参数量与权重哈希；
+- `profile_summary.json`：各阶段 mean/median/P95、完整计算链 FPS、峰值显存、CA/Refine 参数量与权重哈希；正式延迟和显存窗口先于 THOP/`torch.profiler`，复杂度统计不会污染性能峰值；
 - `refiner_profiled_gflops` 只统计 `torch.profiler` 能识别的 Refine 算子。`grid_sample` 和 NMS 可能没有 FLOPs 归因，因此完整计算成本以实测端到端时延为准。
 
 正式口径锁定为 `val`、FP32、batch=1、`imgsz=640`。工具不会训练、修改或保存模型权重，也不执行第二次 NMS。
+
+横向效率比较必须继续运行三轮平衡顺序工具：
+
+```bash
+python -m myscripts.V3_1_1.profile_comparative_v311 \
+  --baseline-weights "$BASELINE" \
+  --ca-weights "$BASE" \
+  --refine-profile-summary "$IVC_EXPORT/profile_refine_fp32_batch1/profile_summary.json" \
+  --data "$DATA" \
+  --imgsz 640 --batch 1 --device 0 --workers 8 --no-amp \
+  --warmup 20 --repeats 3 \
+  --output-dir "$IVC_EXPORT/profile_comparative_fp32_batch1"
+```
+
+它按三阶拉丁方顺序启动9个独立子进程，消除模型间显存继承并平衡运行位置。除
+`comparative_latency.csv`、`comparative_per_image.csv` 和审计 JSON 外，还输出
+`comparative_repeat_summary.csv`。只有三轮延迟相对极差不超过5%、隔离峰值显存
+相对极差不超过2%，且独立 CA 与 Refine 内部 coarse 的均值差不超过5%时，
+`reportable_efficiency_pass` 才为 true。
 
 ### 7.2 GT / Baseline / CA / CA+Refine 逐图导出
 
@@ -220,6 +239,9 @@ python -m myscripts.paper_visuals.generate_fig6_qualitative `
 证据复制、Baseline/CA 主结果、Refine 三协议复核、复现审计、复杂度、完整链
 性能、四路定性导出以及 H1/H2 统计，最后生成逐文件 SHA256 和 `tar.gz`：
 
+正式入口要求 Git 工作区干净，并把当前 commit 写入不可变运行身份；请先提交代码
+再在云端采集。这样旧 commit 的结果不能通过 `--resume` 混入新证据包。
+
 ```bash
 cd /root/Myultralytics
 export OMP_NUM_THREADS=1
@@ -248,7 +270,9 @@ python -m myscripts.V3_1_1.collect_ivc_evidence \
 ```
 
 续跑会锁定首次运行的数据、三个 checkpoint、训练证据目录、设备、workers 和
-H1/H2 只读 passes；其中任何一项变化都会拒绝继续，防止新旧结果被混装。
+H1/H2 只读 passes 以及证据协议版本；其中任何一项变化都会拒绝继续，防止新旧
+结果被混装。效率协议V2不能在旧协议证据目录上使用 `--resume`，必须创建新的
+时间戳目录；V2目录自身中断后仍可正常续跑。
 
 按需关闭耗时或重复步骤：
 
@@ -269,7 +293,7 @@ python -m myscripts.V3_1_1.collect_ivc_evidence --no-archive
 `H1/H2` 子脚本固定 checkpoint，在单一 `val` split 上执行 assigner 只读统计，
 不计算梯度、不创建优化器、不执行训练/验证回调，也不保存 checkpoint；运行清单
 会记录模型 state 前后哈希。综合入口还会生成 `profile_comparative_fp32_batch1/`
-目录，使用同一同步链路比较 Baseline、CA 与 CA+Refine；主验证与 Refine 验证 CSV
+目录，使用三轮平衡顺序、独立进程和同一同步链路比较 Baseline、CA 与 CA+Refine；主验证与 Refine 验证 CSV
 均输出 AP50、AP55、…、AP95。复现审计若仅因预声明的 `5e-4` 严格阈值返回非零，而
 `reproduction_audit.json` 已完整写出且 `overall_pass=false`，综合入口会将该
 阶段记为 `threshold_not_met` 并继续，不会把阈值未满足误报为采集器崩溃。

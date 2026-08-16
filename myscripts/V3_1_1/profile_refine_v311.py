@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import statistics
 import time
 from pathlib import Path
@@ -286,26 +287,11 @@ def main(argv: list[str] | None = None) -> None:
                 sample, _ = _run_pipeline(bundle, warmup_batch, timed=False)
         _sync(torch, bundle.device)
 
-        if int(sample["valid"].sum().item()) == 0:
-            for candidate_batch in loader:
-                with torch.inference_mode():
-                    candidate, _ = _run_pipeline(bundle, candidate_batch, timed=False)
-                if int(candidate["valid"].sum().item()) > 0:
-                    sample = candidate
-                    break
-            else:
-                raise RuntimeError("no post-NMS proposal is available for Refine FLOP profiling")
-
-        detector_gflops = _detector_gflops_without_evidence_hooks(bundle, args.imgsz)
-        if detector_gflops <= 0:
-            raise RuntimeError(
-                "detector FLOPs could not be calculated; install/repair ultralytics-thop in the cloud environment"
-            )
-        refiner_gflops, flop_proposals = _profile_refiner_flops(bundle, sample)
         del sample, warmup_batch
 
         if bundle.device.type == "cuda":
             _sync(torch, bundle.device)
+            bundle.extractor.cache.clear()
             torch.cuda.empty_cache()
             torch.cuda.reset_peak_memory_stats(bundle.device)
             baseline_memory = torch.cuda.memory_allocated(bundle.device)
@@ -356,6 +342,29 @@ def main(argv: list[str] | None = None) -> None:
         else:
             peak_memory = 0
 
+        # Complexity profiling is intentionally delayed until after the latency
+        # and peak-memory window.  THOP and torch.profiler launch additional CUDA
+        # kernels and allocate temporary buffers; running them before the official
+        # measurements made the Refine process systematically hotter than the two
+        # detector-only processes.
+        if int(sample["valid"].sum().item()) == 0:
+            if hasattr(loader, "reset"):
+                loader.reset()
+            for candidate_batch in loader:
+                with torch.inference_mode():
+                    candidate, _ = _run_pipeline(bundle, candidate_batch, timed=False)
+                if int(candidate["valid"].sum().item()) > 0:
+                    sample = candidate
+                    break
+            else:
+                raise RuntimeError("no post-NMS proposal is available for Refine FLOP profiling")
+        detector_gflops = _detector_gflops_without_evidence_hooks(bundle, args.imgsz)
+        if detector_gflops <= 0:
+            raise RuntimeError(
+                "detector FLOPs could not be calculated; install/repair ultralytics-thop in the cloud environment"
+            )
+        refiner_gflops, flop_proposals = _profile_refiner_flops(bundle, sample)
+
         detector_parameters = sum(parameter.numel() for parameter in bundle.ca_model.parameters())
         refiner_parameters = sum(parameter.numel() for parameter in bundle.refiner.parameters())
         from myscripts.V3.runtime import sha256_file
@@ -380,6 +389,10 @@ def main(argv: list[str] | None = None) -> None:
         mean_coarse = timing["coarse_compute_ms"]["mean"]
         summary = {
             "tool": "profile_refine_v311",
+            "protocol_version": 2,
+            "process_id": os.getpid(),
+            "isolated_process": True,
+            "measurement_order": "warmup -> latency/peak memory -> complexity",
             "latency_method": "synchronized wall clock at every declared stage",
             "latency_scope": (
                 "preprocess + CA detector/P2-P3 capture + decode/rotated NMS + proposal packing + "
@@ -430,6 +443,7 @@ def main(argv: list[str] | None = None) -> None:
                 "baseline_allocated_gb": baseline_memory / 1024**3,
                 "peak_allocated_gb": peak_memory / 1024**3,
                 "incremental_peak_gb": max(peak_memory - baseline_memory, 0) / 1024**3,
+                "scope": "absolute allocated memory in this standalone process; peak window excludes complexity profiling",
             },
         }
         write_csv(output_dir / "profile_per_image.csv", rows)
