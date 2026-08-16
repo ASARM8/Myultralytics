@@ -407,16 +407,20 @@ def update_metric(metric: OBBMetrics, prediction: dict[str, torch.Tensor], batch
 def metric_summary(metric: OBBMetrics, variant: str) -> dict[str, Any]:
     values = metric.results_dict
     all_ap = metric.box.all_ap
-    return {
+    row = {
         "variant": variant,
         "precision": float(values["metrics/precision(B)"]),
         "recall": float(values["metrics/recall(B)"]),
         "map50": float(values["metrics/mAP50(B)"]),
         "map50_95": float(values["metrics/mAP50-95(B)"]),
-        "ap75": float(metric.box.map75),
-        "ap90": float(all_ap[:, 8].mean()) if len(all_ap) else math.nan,
-        "ap95": float(all_ap[:, 9].mean()) if len(all_ap) else math.nan,
     }
+    row.update(
+        {
+            f"ap{threshold}": float(all_ap[:, index].mean()) if len(all_ap) else math.nan
+            for index, threshold in enumerate(range(50, 100, 5))
+        }
+    )
+    return row
 
 
 def evaluate_refiner(

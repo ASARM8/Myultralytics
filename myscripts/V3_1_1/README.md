@@ -213,3 +213,63 @@ python -m myscripts.paper_visuals.generate_fig6_qualitative `
   --show-confidence `
   --output-dir "mydocs/创新点一/投稿版本/IVC_assets"
 ```
+
+### 7.3 IVC 全证据一键采集
+
+综合入口会依次调用现有子脚本，完成环境与权重哈希记录、既有 holdout
+证据复制、Baseline/CA 主结果、Refine 三协议复核、复现审计、复杂度、完整链
+性能、四路定性导出以及 H1/H2 统计，最后生成逐文件 SHA256 和 `tar.gz`：
+
+```bash
+cd /root/Myultralytics
+export OMP_NUM_THREADS=1
+
+python -m myscripts.V3_1_1.collect_ivc_evidence
+```
+
+默认固定使用：
+
+```text
+Baseline: /root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt
+CA:       /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
+Refine:   /root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
+Data:     /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
+```
+
+未传 `--output-dir` 时会创建
+`/root/autodl-tmp/paper_exports/ivc_evidence_YYYYMMDD_HHMMSS`。每个子任务的
+标准输出单独写入 `logs/`，`run_state.json` 保存命令、用时、返回码和阶段状态。
+若任务中断，使用控制台最后打印的目录继续：
+
+```bash
+python -m myscripts.V3_1_1.collect_ivc_evidence \
+  --output-dir /root/autodl-tmp/paper_exports/ivc_evidence_YYYYMMDD_HHMMSS \
+  --resume
+```
+
+续跑会锁定首次运行的数据、三个 checkpoint、训练证据目录、设备、workers 和
+H1/H2 只读 passes；其中任何一项变化都会拒绝继续，防止新旧结果被混装。
+
+按需关闭耗时或重复步骤：
+
+```bash
+# 已经有 H1/H2 时不再运行两组统计循环
+python -m myscripts.V3_1_1.collect_ivc_evidence --no-h1h2
+
+# 跳过小样本 smoke，但仍执行两项正式完整采集
+python -m myscripts.V3_1_1.collect_ivc_evidence --no-smoke
+
+# 服务器没有 pytest 时跳过协议单元测试
+python -m myscripts.V3_1_1.collect_ivc_evidence --no-tests
+
+# 暂不压缩完整定性图片目录
+python -m myscripts.V3_1_1.collect_ivc_evidence --no-archive
+```
+
+`H1/H2` 子脚本固定 checkpoint，在单一 `val` split 上执行 assigner 只读统计，
+不计算梯度、不创建优化器、不执行训练/验证回调，也不保存 checkpoint；运行清单
+会记录模型 state 前后哈希。综合入口还会生成 `profile_comparative_fp32_batch1/`
+目录，使用同一同步链路比较 Baseline、CA 与 CA+Refine；主验证与 Refine 验证 CSV
+均输出 AP50、AP55、…、AP95。复现审计若仅因预声明的 `5e-4` 严格阈值返回非零，而
+`reproduction_audit.json` 已完整写出且 `overall_pass=false`，综合入口会将该
+阶段记为 `threshold_not_met` 并继续，不会把阈值未满足误报为采集器崩溃。

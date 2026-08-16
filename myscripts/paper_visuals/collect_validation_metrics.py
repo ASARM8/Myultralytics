@@ -43,13 +43,20 @@ def set_refine_mode(model, mode: str | None) -> int:
     return changed
 
 
+def iou_ap_columns(all_ap) -> dict[str, float]:
+    """Return mean AP at every COCO IoU threshold from 0.50 through 0.95."""
+    return {
+        f"ap{threshold}": float(all_ap[:, index].mean()) if len(all_ap) else float("nan")
+        for index, threshold in enumerate(range(50, 100, 5))
+    }
+
+
 def metrics_row(label: str, weights: Path, mode: str | None, results) -> dict:
-    """Extract standard metrics plus AP75/AP90 from the full IoU-threshold array."""
+    """Extract standard metrics and the complete AP50:5:95 threshold curve."""
     values = results.results_dict
     metric = results.box
     all_ap = metric.all_ap
-    ap90 = float(all_ap[:, 8].mean()) if len(all_ap) else float("nan")
-    return {
+    row = {
         "method": label,
         "weights": str(weights),
         "refine_mode": mode or "not_applicable",
@@ -57,12 +64,12 @@ def metrics_row(label: str, weights: Path, mode: str | None, results) -> dict:
         "recall": float(values["metrics/recall(B)"]),
         "map50": float(values["metrics/mAP50(B)"]),
         "map50_95": float(values["metrics/mAP50-95(B)"]),
-        "ap75": float(metric.map75),
-        "ap90": ap90,
         "preprocess_ms_per_image": float(results.speed.get("preprocess", float("nan"))),
         "inference_ms_per_image": float(results.speed.get("inference", float("nan"))),
         "postprocess_ms_per_image": float(results.speed.get("postprocess", float("nan"))),
     }
+    row.update(iou_ap_columns(all_ap))
+    return row
 
 
 def main() -> None:
@@ -107,7 +114,7 @@ def main() -> None:
         pd.DataFrame(rows).to_csv(args.output_csv, index=False, encoding="utf-8-sig")
         print(
             f"{label}: mAP50-95={row['map50_95']:.5f}, AP75={row['ap75']:.5f}, "
-            f"AP90={row['ap90']:.5f}"
+            f"AP90={row['ap90']:.5f}, AP95={row['ap95']:.5f}"
         )
     print(args.output_csv)
 

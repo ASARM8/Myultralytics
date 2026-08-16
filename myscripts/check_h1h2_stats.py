@@ -1,7 +1,7 @@
 """
 DFL 回归截断 & 正样本层级分配 验证统计脚本 (H1 + H2)
 
-根据 mydocs/check.md 的验证方案，在训练过程中收集以下统计信息：
+根据 mydocs/check.md 的验证方案，在固定 checkpoint 的只读前向过程中收集：
   H1: 每个正样本的所需回归距离 D_req 是否超出 DFL 理论上限 D_max = stride × (reg_max - 1)
   H2: 不同长边长度的 GT 框，其正样本被分配到了 FPN 的哪一层 (P3/P4/P5)
 
@@ -13,27 +13,28 @@ DFL 回归截断 & 正样本层级分配 验证统计脚本 (H1 + H2)
 
 原始模型、CA和CA-Refine必须分别使用自己的checkpoint运行，不能把一种结构的
 YAML与另一种结构的权重做参数交集后作为正式统计结果。
-只需跑 1~3 个 Epoch 即可收集足够的统计学证据。
+正式统计固定使用一个声明的数据 split；可重复若干 pass，但不会执行反向传播、
+优化器更新、验证回调或 checkpoint 保存。
 
 原理:
-  - 通过 monkey-patch v8OBBLoss.loss()，在每个 batch 的损失计算前
-    额外调用一次 assigner 以获取 target_gt_idx（原始代码将其丢弃），
-    然后对所有正样本计算无截断的旋转回归距离 (l,t,r,b)，统计溢出情况。
-  - 统计完成后正常执行原始 loss，不影响训练过程。
+  - 模型始终保持 eval/frozen，只利用检测头返回的原始多尺度预测；
+  - 复用 v8OBBLoss 的预处理、解码器和 assigner，但不计算 loss、不更新权重；
+  - 对正样本计算未截断的旋转回归距离 (l,t,r,b)，统计溢出与层级分配。
 """
 
 import argparse
 import datetime
+import hashlib
 import json
 import math
 import os
-import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 
-# 必须在导入 NumPy/PyTorch 之前设置，避免数值后端提前初始化线程池。
-os.environ["OMP_NUM_THREADS"] = "8"
+# 必须在导入 NumPy/PyTorch 之前修正，避免非法值触发libgomp警告；尊重用户的合法设置。
+_omp_threads = os.environ.get("OMP_NUM_THREADS", "")
+if not _omp_threads.isdigit() or int(_omp_threads) <= 0:
+    os.environ["OMP_NUM_THREADS"] = "1"
 
 import numpy as np
 import torch
@@ -45,8 +46,8 @@ from ultralytics.utils.torch_utils import unwrap_model
 
 # ========================== 配置 ==========================
 CONFIG = {
-    # ---------- 训练参数（仅用于统计，跑 1~3 个 epoch 即可） ----------
-    "epochs": 3,
+    # ---------- 纯统计参数 ----------
+    "passes": 1,
     "batch": 8,
     "imgsz": 640,
     "device": 0,
@@ -55,30 +56,6 @@ CONFIG = {
     # ---------- 输出 ----------
     "project": "runs/h1h2",
     "exist_ok": False,
-
-    # ---------- 节省资源：关闭不需要的功能 ----------
-    "save": False,
-    "val": True,
-    "plots": False,
-    "pretrained": False,
-    "amp": True,
-    "cache": "disk",
-    "verbose": True,
-    "optimizer": "AdamW",
-    "lr0": 0.001,
-    "lrf": 0.01,
-    "warmup_epochs": 1.0,
-    "cos_lr": True,
-
-    # ---------- 必须关闭的空间与拼接增强 ----------
-    "mosaic": 0.0,      # 必须关闭！防止目标被拼接截断
-    "scale": 0.0,       # 必须关闭！防止目标物理长度被缩放
-    "degrees": 0.0,     # 关闭旋转，防止 OBB 角度和长宽由于旋转发生变异
-    "translate": 0.0,   # 关闭平移，防止长目标被移出图片边缘导致截断
-    "shear": 0.0,       # 关闭错切
-    "perspective": 0.0, # 关闭透视变换
-    "mixup": 0.0,       # 关闭 Mixup
-    "copy_paste": 0.0,  # 关闭复制粘贴
 
     # ---------- 统计参数 ----------
     # 长边分桶边界（像素），可根据数据集实际分布调整
@@ -113,6 +90,7 @@ class H1H2Collector:
         self.h2_counts = defaultdict(lambda: defaultdict(int))
 
         self.batch_count = 0
+        self.image_count = 0
 
     def _get_bin(self, long_edge_px):
         """根据长边像素值返回分桶索引。"""
@@ -166,6 +144,7 @@ class H1H2Collector:
         """
         self.batch_count += 1
         bs = gt_bboxes.shape[0]
+        self.image_count += int(bs)
         d_max_grid = float(reg_max - 1)  # DFL 理论上限（grid 单位）
 
         for b in range(bs):
@@ -213,7 +192,7 @@ class H1H2Collector:
                 # H2
                 self.h2_counts[bin_idx][int(s)] += 1
 
-    def report(self, reg_max, strides, save_dir=None):
+    def report(self, reg_max, strides, save_dir=None, protocol=None):
         """生成并打印统计报告，可选保存到文件。"""
         d_max_grid = reg_max - 1
         all_strides = sorted(set(s for counts in self.h2_counts.values() for s in counts))
@@ -275,7 +254,13 @@ class H1H2Collector:
         # ---------- Markdown 报告 ----------
         md = []
         md.append("# H1 & H2 验证统计报告\n")
+        if protocol:
+            md.append(f"- **统计模式**: {protocol['mode']}")
+            md.append(f"- **数据划分**: `{protocol['split']}`")
+            md.append(f"- **只读遍历次数**: {protocol['passes']}")
+            md.append(f"- **优化器更新次数**: {protocol['optimization_steps']}")
         md.append(f"- **统计批次数**: {self.batch_count}")
+        md.append(f"- **处理图像数（含重复 pass）**: {self.image_count}")
         md.append(f"- **生成时间**: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         md.append("## H1: DFL 回归截断统计\n")
@@ -360,7 +345,9 @@ class H1H2Collector:
                 "bins": [b for b in self.bins if b != float("inf")] + ["inf"],
                 "labels": self.labels,
                 "batch_count": self.batch_count,
+                "image_count": self.image_count,
             },
+            "protocol": protocol or {},
             "h1": {},
             "h2": {},
         }
@@ -439,53 +426,9 @@ class H1H2Collector:
         print(f"H2 堆叠柱状图已保存至: {fig_path}")
 
 
-# ========================== Monkey-Patch ==========================
-# 全局收集器实例（在 main 中初始化）
+# ========================== 只读统计 ==========================
+# 全局收集器实例（由主函数初始化）
 _collector: H1H2Collector | None = None
-_original_obb_loss = None
-_strict_stats = True
-
-
-def _install_loss_hook():
-    """
-    对 v8OBBLoss.loss() 进行 monkey-patch。
-
-    在每个 batch 的 loss 计算前，额外调用一次 assigner 以获取
-    target_gt_idx（原始代码将其丢弃），并收集 H1/H2 统计数据。
-    然后正常执行原始 loss 函数。
-    """
-    from ultralytics.utils.loss import v8OBBLoss
-
-    global _original_obb_loss
-    if _original_obb_loss is not None:
-        raise RuntimeError("v8OBBLoss统计hook已经安装，不能重复安装。")
-    _original_obb_loss = v8OBBLoss.loss
-
-    def _hooked_loss(self, preds, batch):
-        """带统计收集的 OBB 损失函数。"""
-        global _collector
-        if _collector is not None:
-            try:
-                _collect_stats(self, preds, batch)
-            except Exception as e:
-                if _strict_stats:
-                    raise RuntimeError(f"H1/H2统计收集失败: {e}") from e
-                print(f"[H1H2 统计] 收集异常（已跳过）: {e}")
-
-        return _original_obb_loss(self, preds, batch)
-
-    v8OBBLoss.loss = _hooked_loss
-
-
-def _restore_loss_hook():
-    """恢复原始OBB损失，避免同一解释器中的后续任务继续使用统计hook。"""
-    from ultralytics.utils.loss import v8OBBLoss
-
-    global _original_obb_loss
-    if _original_obb_loss is not None:
-        v8OBBLoss.loss = _original_obb_loss
-        _original_obb_loss = None
-        print("\n[*] 已恢复原始 v8OBBLoss.loss()")
 
 
 @torch.no_grad()
@@ -529,7 +472,7 @@ def _collect_stats(loss_self, preds, batch):
     bboxes_for_assigner[..., :4] *= stride_tensor
 
     # 调用 assigner —— 关键：获取 target_gt_idx。
-    # hook发生在原始loss之前，因此必须先写入当前stride，确保首个batch也启用CA覆盖掩码。
+    # 纯统计路径不会调用原始loss，因此先写入当前stride，确保首个batch也启用CA覆盖掩码。
     loss_self.assigner._stride_tensor = stride_tensor
     _, target_bboxes, _, fg_mask, target_gt_idx = loss_self.assigner(
         pred_scores.detach().sigmoid(),
@@ -553,6 +496,41 @@ def _collect_stats(loss_self, preds, batch):
     )
 
 
+def _raw_predictions(outputs):
+    """Extract the raw training-style prediction dictionary from an eval forward."""
+    if isinstance(outputs, dict):
+        return outputs.get("one2many", outputs)
+    if isinstance(outputs, (tuple, list)):
+        for item in reversed(outputs):
+            if isinstance(item, dict):
+                return item.get("one2many", item)
+    raise TypeError(f"模型前向没有返回原始预测字典，实际类型为 {type(outputs)}")
+
+
+def _state_tensor_sha256(torch_model) -> str:
+    """Hash every in-memory parameter and buffer to prove the frozen pass is side-effect free."""
+    digest = hashlib.sha256()
+    for name, tensor in sorted(unwrap_model(torch_model).state_dict().items()):
+        value = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(value.dtype).encode("ascii"))
+        digest.update(str(tuple(value.shape)).encode("ascii"))
+        digest.update(value.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _file_sha256(path: str | Path) -> str | None:
+    """Hash a checkpoint file; YAML scratch diagnostics do not have a checkpoint hash."""
+    source = Path(path)
+    if source.suffix.lower() != ".pt":
+        return None
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 # ========================== 模型与命令行校验 ==========================
 def parse_args():
     """解析正式H1/H2统计参数。"""
@@ -572,7 +550,19 @@ def parse_args():
         help="正式统计应传对应方法的完整.pt checkpoint；YAML仅允许随机初始化诊断。",
     )
     parser.add_argument("--data", required=True, help="TTPLA-640-811数据集YAML。")
-    parser.add_argument("--epochs", type=int, default=CONFIG["epochs"])
+    parser.add_argument(
+        "--split",
+        choices=("train", "val"),
+        default="val",
+        help="只统计一个明确的数据划分；正式证据默认使用val。",
+    )
+    parser.add_argument("--passes", type=int, default=CONFIG["passes"], help="只读遍历指定split的次数。")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--batch", type=int, default=CONFIG["batch"])
     parser.add_argument("--imgsz", type=int, default=CONFIG["imgsz"])
     parser.add_argument("--device", default=str(CONFIG["device"]))
@@ -594,8 +584,13 @@ def parse_args():
 
     if args.imgsz != 640:
         parser.error("本论文H1/H2统计固定使用imgsz=640，拒绝非640输入。")
-    if args.epochs < 1:
-        parser.error("--epochs必须大于等于1。")
+    if args.epochs is not None:
+        if args.passes != CONFIG["passes"]:
+            parser.error("--epochs是旧版兼容参数，不能与--passes同时使用。")
+        args.passes = args.epochs
+        print("[兼容提示] --epochs现仅表示只读passes，不会启动训练。建议改用--passes。")
+    if args.passes < 1:
+        parser.error("--passes必须大于等于1。")
     if args.batch < 1:
         parser.error("--batch必须大于等于1。")
 
@@ -640,7 +635,7 @@ def model_head_metadata(torch_model) -> dict:
 
 
 def validate_model_identity(torch_model, method: str, *, expected_nc: int | None = None, stage: str) -> dict:
-    """校验checkpoint、方法标签和训练器实际模型是否一致。"""
+    """校验checkpoint、方法标签和实际冻结模型是否一致。"""
     metadata = model_head_metadata(torch_model)
     expected = METHOD_EXPECTATIONS[method]
     errors = []
@@ -669,69 +664,18 @@ def validate_model_identity(torch_model, method: str, *, expected_nc: int | None
     return metadata
 
 
-def model_state_schema(torch_model) -> dict:
-    """提取state-dict的键名、形状和dtype，不复制参数数据。"""
-    base_model = unwrap_model(torch_model)
-    return {
-        key: (tuple(value.shape), str(value.dtype))
-        for key, value in base_model.state_dict().items()
-    }
-
-
-def validate_state_schema(expected_schema: dict, torch_model, *, stage: str) -> int:
-    """确认训练器重建模型与checkpoint模型具有完全一致的参数结构。"""
-    actual_schema = model_state_schema(torch_model)
-    expected_keys = set(expected_schema)
-    actual_keys = set(actual_schema)
-    missing = sorted(expected_keys - actual_keys)
-    unexpected = sorted(actual_keys - expected_keys)
-    incompatible = sorted(
-        key
-        for key in expected_keys & actual_keys
-        if expected_schema[key] != actual_schema[key]
-    )
-    if missing or unexpected or incompatible:
-        details = []
-        if missing:
-            details.append(f"缺失键{len(missing)}个，例如{missing[:5]}")
-        if unexpected:
-            details.append(f"额外键{len(unexpected)}个，例如{unexpected[:5]}")
-        if incompatible:
-            examples = [
-                f"{key}: checkpoint={expected_schema[key]}, trainer={actual_schema[key]}"
-                for key in incompatible[:5]
-            ]
-            details.append(f"形状或dtype不一致{len(incompatible)}个，例如{examples}")
-        raise RuntimeError(f"{stage}参数结构校验失败: " + "；".join(details))
-
-    print(f"  [{stage}] state-dict结构完全一致: {len(actual_schema)}/{len(expected_schema)}项")
-    return len(actual_schema)
-
-
-def build_train_config(args) -> dict:
-    """生成传给Ultralytics trainer的参数，避免把模型来源再次作为model参数覆盖。"""
-    cli_keys = {"epochs", "batch", "imgsz", "device", "workers", "project", "exist_ok"}
-    statistical_keys = {"long_edge_bins", "long_edge_labels"}
-    train_config = {
-        key: value for key, value in CONFIG.items() if key not in cli_keys | statistical_keys
-    }
-    train_config.update(
-        {
-            "data": args.data,
-            "epochs": args.epochs,
-            "batch": args.batch,
-            "imgsz": args.imgsz,
-            "device": args.device,
-            "workers": args.workers,
-            "project": args.project,
-            "name": args.name,
-            "exist_ok": args.exist_ok,
-        }
-    )
-    return train_config
-
-
-def write_run_manifest(save_dir: str | Path, args, metadata: dict, dataset_nc: int) -> Path:
+def write_run_manifest(
+    save_dir: str | Path,
+    args,
+    metadata: dict,
+    dataset_nc: int,
+    *,
+    dataset_images: int,
+    model_state_sha256_before: str,
+    model_state_sha256_after: str,
+    checkpoint_sha256_before: str | None,
+    checkpoint_sha256_after: str | None,
+) -> Path:
     """保存可复现的模型身份与统计配置。"""
     path = Path(save_dir) / "h1h2_run_config.json"
     payload = {
@@ -739,16 +683,35 @@ def write_run_manifest(save_dir: str | Path, args, metadata: dict, dataset_nc: i
         "method": args.method,
         "model": str(Path(args.model).resolve()),
         "data": str(Path(args.data).resolve()),
+        "split": args.split,
         "imgsz": args.imgsz,
-        "epochs": args.epochs,
+        "passes": args.passes,
         "batch": args.batch,
         "device": args.device,
         "workers": args.workers,
         "dataset_nc": int(dataset_nc),
+        "dataset_images": int(dataset_images),
         "model_metadata": metadata,
         "long_edge_bins": CONFIG["long_edge_bins"],
         "long_edge_labels": CONFIG["long_edge_labels"],
         "strict_stats": not args.allow_stat_skip,
+        "mode": "frozen_eval_assigner_statistics",
+        "model_training": False,
+        "gradient_enabled": False,
+        "optimization_steps": 0,
+        "checkpoint_saving": False,
+        "validation_callback": False,
+        "augmentation": False,
+        "model_state_sha256_before": model_state_sha256_before,
+        "model_state_sha256_after": model_state_sha256_after,
+        "model_state_unchanged": model_state_sha256_before == model_state_sha256_after,
+        "checkpoint_sha256_before": checkpoint_sha256_before,
+        "checkpoint_sha256_after": checkpoint_sha256_after,
+        "checkpoint_file_unchanged": (
+            checkpoint_sha256_before == checkpoint_sha256_after
+            if checkpoint_sha256_before is not None
+            else None
+        ),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[*] 运行配置已保存至: {path}")
@@ -757,12 +720,11 @@ def write_run_manifest(save_dir: str | Path, args, metadata: dict, dataset_nc: i
 
 # ========================== 主函数 ==========================
 def main():
-    global _collector, _strict_stats
+    global _collector
     args = parse_args()
-    _strict_stats = not args.allow_stat_skip
 
     print("=" * 80)
-    print("  H1 & H2 验证统计脚本")
+    print("  H1 & H2 固定权重只读统计脚本")
     print("  H1: DFL 回归截断分析 (D_req vs D_max)")
     print("  H2: 正样本层级分配分析 (长边分桶 vs FPN 层)")
     print("=" * 80)
@@ -774,72 +736,107 @@ def main():
 
     # checkpoint模式会恢复精确的检测头、类别数和所有分支；YAML只用于显式scratch诊断。
     model = YOLO(args.model)
-    validate_model_identity(model.model, args.method, stage="载入模型")
-    checkpoint_schema = model_state_schema(model.model) if Path(args.model).suffix.lower() == ".pt" else None
-    train_config = build_train_config(args)
+    from ultralytics.utils.files import increment_path
+    from ultralytics.utils.torch_utils import select_device
+
+    from myscripts.V3.runtime import build_dataset, full_loader
+
+    device = select_device(args.device)
+    core_model = model.model.to(device).float().eval()
+    for parameter in core_model.parameters():
+        parameter.requires_grad_(False)
+    dataset, data = build_dataset(
+        args.data,
+        args.split,
+        args.imgsz,
+        args.batch,
+        args.workers,
+        rect=True,
+    )
+    metadata = validate_model_identity(
+        core_model,
+        args.method,
+        expected_nc=int(data["nc"]),
+        stage="冻结模型",
+    )
+    loader = full_loader(dataset, args.batch, args.workers, shuffle=False)
+    criterion = core_model.init_criterion()
+    save_dir = increment_path(Path(args.project) / args.name, exist_ok=args.exist_ok, mkdir=True)
+    state_before = _state_tensor_sha256(core_model)
+    checkpoint_before = _file_sha256(args.model)
 
     print(f"\n  方法: {args.method}")
     print(f"  模型: {args.model}")
     print(f"  数据集: {args.data}")
+    print(f"  数据划分: {args.split} ({len(dataset)} images)")
     print(f"  输入尺寸: {args.imgsz}")
-    print(f"  统计轮数: {args.epochs} epochs")
+    print(f"  只读遍历: {args.passes} passes")
+    print("  训练/反传/优化器/checkpoint: 全部禁用")
     print(f"  长边分桶: {CONFIG['long_edge_labels']}")
+    print(f"  输出目录: {save_dir}")
     print("=" * 80)
 
-    report_save_dir = [None]
-    active_metadata = {}
+    with torch.inference_mode():
+        for pass_index in range(args.passes):
+            if hasattr(loader, "reset"):
+                loader.reset()
+            for batch_index, batch in enumerate(loader, start=1):
+                try:
+                    images = batch["img"].to(device, non_blocking=True).float().div_(255.0)
+                    outputs = core_model(images)
+                    _collect_stats(criterion, _raw_predictions(outputs), batch)
+                except Exception as error:
+                    if not args.allow_stat_skip:
+                        raise RuntimeError(
+                            f"H1/H2统计失败: pass={pass_index + 1}, batch={batch_index}: {error}"
+                        ) from error
+                    print(f"[H1/H2 统计] 已跳过 pass={pass_index + 1}, batch={batch_index}: {error}")
+            print(f"[*] 完成只读 pass {pass_index + 1}/{args.passes}")
 
-    def on_train_start(trainer):
-        report_save_dir[0] = str(trainer.save_dir)
-        print(f"[*] 统计报告将保存至: {report_save_dir[0]}")
-        dataset_nc = int(trainer.data["nc"])
-        metadata = validate_model_identity(
-            trainer.model,
-            args.method,
-            expected_nc=dataset_nc,
-            stage="训练器实际模型",
-        )
-        if checkpoint_schema is not None:
-            metadata["state_items"] = validate_state_schema(
-                checkpoint_schema,
-                trainer.model,
-                stage="checkpoint→训练器",
-            )
-        else:
-            metadata["state_items"] = len(model_state_schema(trainer.model))
-            print("  [checkpoint→训练器] YAML scratch模式，不执行checkpoint参数结构对比")
-        active_metadata.update(metadata)
-        write_run_manifest(report_save_dir[0], args, metadata, dataset_nc)
+    if _collector.batch_count == 0:
+        raise RuntimeError("没有成功收集任何batch，拒绝生成空的H1/H2报告。")
+    state_after = _state_tensor_sha256(core_model)
+    checkpoint_after = _file_sha256(args.model)
+    if state_after != state_before:
+        raise RuntimeError("冻结统计前后模型参数或buffer发生变化，拒绝输出证据。")
+    if checkpoint_after != checkpoint_before:
+        raise RuntimeError("统计前后输入checkpoint文件发生变化，拒绝输出证据。")
 
-    model.add_callback("on_train_start", on_train_start)
+    strides = metadata["strides"]
+    if not strides or any(float(value) <= 0 for value in strides):
+        raise RuntimeError(f"无法获取有效stride: {strides}")
+    protocol = {
+        "mode": "frozen_eval_assigner_statistics",
+        "split": args.split,
+        "passes": args.passes,
+        "dataset_images": len(dataset),
+        "model_training": False,
+        "gradient_enabled": False,
+        "optimization_steps": 0,
+        "checkpoint_saving": False,
+        "validation_callback": False,
+        "augmentation": False,
+        "model_state_unchanged": True,
+    }
+    write_run_manifest(
+        save_dir,
+        args,
+        metadata,
+        int(data["nc"]),
+        dataset_images=len(dataset),
+        model_state_sha256_before=state_before,
+        model_state_sha256_after=state_after,
+        checkpoint_sha256_before=checkpoint_before,
+        checkpoint_sha256_after=checkpoint_after,
+    )
+    _collector.report(
+        reg_max=metadata["reg_max"],
+        strides=strides,
+        save_dir=save_dir,
+        protocol=protocol,
+    )
 
-    _install_loss_hook()
-    print("[*] 已安装 v8OBBLoss 统计 hook")
-
-    try:
-        model.train(**train_config)
-
-        if _collector.batch_count == 0:
-            raise RuntimeError("没有成功收集任何batch，拒绝生成空的H1/H2报告。")
-        if not active_metadata:
-            raise RuntimeError("训练开始回调未执行，无法确认实际模型身份。")
-
-        print("\n" + "=" * 80)
-        print("  训练完成，正在生成 H1 & H2 统计报告...")
-        print("=" * 80)
-
-        strides = active_metadata["strides"]
-        if not strides or any(float(value) <= 0 for value in strides):
-            raise RuntimeError(f"无法获取有效stride: {strides}")
-        _collector.report(
-            reg_max=active_metadata["reg_max"],
-            strides=strides,
-            save_dir=report_save_dir[0],
-        )
-    finally:
-        _restore_loss_hook()
-
-    print("\n统计完成！")
+    print("\n固定权重只读统计完成！")
 
 
 if __name__ == "__main__":
