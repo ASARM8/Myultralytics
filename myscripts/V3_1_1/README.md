@@ -168,15 +168,15 @@ python -m myscripts.V3_1_1.profile_refine_v311 \
   --device 0 \
   --workers 8 \
   --no-amp \
-  --warmup 20 \
+  --warmup 500 \
   --output-dir "$IVC_EXPORT/profile_refine_fp32_batch1"
 ```
 
 输出：
 
 - `profile_per_image.csv`：逐图 proposal 数量、数据读取、预处理、CA forward、旋转 NMS、proposal 打包、Refine 和结果回写时延；
-- `profile_summary.json`：各阶段 mean/median/P95、完整计算链 FPS、峰值显存、CA/Refine 参数量与权重哈希；正式延迟和显存窗口先于 THOP/`torch.profiler`，复杂度统计不会污染性能峰值；
-- `refiner_profiled_gflops` 只统计 `torch.profiler` 能识别的 Refine 算子。`grid_sample` 和 NMS 可能没有 FLOPs 归因，因此完整计算成本以实测端到端时延为准。
+- `profile_summary.json`：各阶段 mean/median/P95、完整计算链 FPS、峰值显存、CA/Refine 参数量与权重哈希；正式延迟和显存窗口先于 THOP/`torch.profiler`，复杂度统计不会污染性能峰值；显存字段统一使用 `GiB`（`2^30` bytes）。
+- `refiner_profiled_gflops` 只统计 `torch.profiler` 能识别的 Refine 算子。结果同时记录 `refiner_flop_profile_proposals`，并与完整验证集 proposal 数量的 mean/median/P95/max 一起解释；该 GFLOPs 是 proposal 数量相关的下界，`grid_sample` 和 NMS 可能没有 FLOPs 归因，因此完整计算成本以实测端到端时延为准。
 
 正式口径锁定为 `val`、FP32、batch=1、`imgsz=640`。工具不会训练、修改或保存模型权重，也不执行第二次 NMS。
 
@@ -189,13 +189,13 @@ python -m myscripts.V3_1_1.profile_comparative_v311 \
   --refine-profile-summary "$IVC_EXPORT/profile_refine_fp32_batch1/profile_summary.json" \
   --data "$DATA" \
   --imgsz 640 --batch 1 --device 0 --workers 8 --no-amp \
-  --warmup 20 --repeats 3 \
+  --warmup 500 --repeats 3 \
   --output-dir "$IVC_EXPORT/profile_comparative_fp32_batch1"
 ```
 
-它按三阶拉丁方顺序启动9个独立子进程，消除模型间显存继承并平衡运行位置。除
+性能协议 V3 在每个正式独立进程中先执行 500 次固定输入预热，再开始完整验证集计时。它按三阶拉丁方顺序启动9个独立子进程，消除模型间显存继承并平衡运行位置。除
 `comparative_latency.csv`、`comparative_per_image.csv` 和审计 JSON 外，还输出
-`comparative_repeat_summary.csv`。只有三轮延迟相对极差不超过5%、隔离峰值显存
+`comparative_repeat_summary.csv`。横向 CSV 包含 proposal 数量分布、Refine FLOPs 采样时的 proposal 数量以及 GiB 峰值显存。只有三轮延迟相对极差不超过5%、隔离峰值显存
 相对极差不超过2%，且独立 CA 与 Refine 内部 coarse 的均值差不超过5%时，
 `reportable_efficiency_pass` 才为 true。
 

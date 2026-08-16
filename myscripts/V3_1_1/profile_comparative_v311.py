@@ -27,7 +27,15 @@ from myscripts.V3_1_1.evidence_runtime import (
     load_obb_detector,
     require_canonical_path,
 )
-from myscripts.V3_1_1.profile_refine_v311 import _format_nms, _sync, _timed, summarize_timings
+from myscripts.V3_1_1.profile_refine_v311 import (
+    OFFICIAL_WARMUP_PASSES,
+    PROFILE_PROTOCOL_VERSION,
+    _format_nms,
+    _percentile,
+    _sync,
+    _timed,
+    summarize_timings,
+)
 
 
 METHODS = ("Baseline", "CA", "CA+Refine")
@@ -45,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=OFFICIAL_WARMUP_PASSES)
     parser.add_argument("--repeats", type=int, default=3, choices=(3,))
     parser.add_argument(
         "--stability-relative-tolerance",
@@ -263,10 +271,13 @@ def _profile_detector(
             "timing_ms_per_image": timing,
             "fps_from_mean_compute": 1000.0 / mean_total,
             "gpu_memory": {
-                "baseline_allocated_gb": baseline_memory / 1024**3,
-                "peak_allocated_gb": peak_memory / 1024**3,
-                "incremental_peak_gb": max(peak_memory - baseline_memory, 0) / 1024**3,
-                "scope": "absolute allocated memory in this standalone process; peak window excludes complexity profiling",
+                "baseline_allocated_gib": baseline_memory / 1024**3,
+                "peak_allocated_gib": peak_memory / 1024**3,
+                "incremental_peak_gib": max(peak_memory - baseline_memory, 0) / 1024**3,
+                "scope": (
+                    "GiB (2^30 bytes) of absolute allocated memory in this standalone process; "
+                    "peak window excludes complexity profiling"
+                ),
             },
         }
         return summary, rows
@@ -396,8 +407,8 @@ def _repeat_row(record: dict[str, Any]) -> dict[str, Any]:
         "latency_median_ms": total["median"],
         "latency_p95_ms": total["p95"],
         "coarse_mean_ms": coarse["mean"] if coarse else "",
-        "peak_gpu_memory_gb": summary["gpu_memory"]["peak_allocated_gb"],
-        "incremental_peak_gpu_memory_gb": summary["gpu_memory"].get("incremental_peak_gb", 0.0),
+        "peak_gpu_memory_gib": summary["gpu_memory"]["peak_allocated_gib"],
+        "incremental_peak_gpu_memory_gib": summary["gpu_memory"].get("incremental_peak_gib", 0.0),
         "run_dir": record["run_dir"],
     }
 
@@ -414,14 +425,38 @@ def _aggregate_method(
     summaries = [record["summary"] for record in records]
     rows = [row for record in records for row in record["rows"]]
     repeat_means = [float(summary["timing_ms_per_image"]["total_compute_ms"]["mean"]) for summary in summaries]
-    peaks = [float(summary["gpu_memory"]["peak_allocated_gb"]) for summary in summaries]
-    increments = [float(summary["gpu_memory"].get("incremental_peak_gb", 0.0)) for summary in summaries]
+    peaks = [float(summary["gpu_memory"]["peak_allocated_gib"]) for summary in summaries]
+    increments = [float(summary["gpu_memory"].get("incremental_peak_gib", 0.0)) for summary in summaries]
     pooled_timing = summarize_timings(rows, "total_compute_ms")
     first = summaries[0]
+    proposal_sequences = [
+        [int(row["proposal_count"]) for row in record["rows"]]
+        for record in records
+    ]
+    if any(sequence != proposal_sequences[0] for sequence in proposal_sequences[1:]):
+        raise RuntimeError(f"{method} proposal counts changed across repeats")
+    proposal_values = proposal_sequences[0]
+    proposal_count = {
+        "mean": statistics.fmean(proposal_values),
+        "median": statistics.median(proposal_values),
+        "p95": _percentile([float(value) for value in proposal_values], 0.95),
+        "max": max(proposal_values),
+    }
+    flop_profile_proposals: int | None = None
     if method == "CA+Refine":
         parameters = int(first["total_parameters"])
         gflops = float(first["detector_gflops"]) + float(first["refiner_profiled_gflops"])
-        gflops_scope = "lower bound: detector + profiler-attributed Refine operators"
+        flop_profile_proposal_values = [
+            int(summary["refiner_flop_profile_proposals"])
+            for summary in summaries
+        ]
+        if len(set(flop_profile_proposal_values)) != 1:
+            raise RuntimeError("CA+Refine FLOP-profile proposal count changed across repeats")
+        flop_profile_proposals = flop_profile_proposal_values[0]
+        gflops_scope = (
+            "proposal-dependent lower bound: detector + profiler-attributed Refine operators "
+            f"at {flop_profile_proposals} proposals"
+        )
         identity = {
             "ca_weights": first["ca_weights"],
             "ca_sha256": first["ca_sha256"],
@@ -464,6 +499,8 @@ def _aggregate_method(
         "parameters": parameters,
         "gflops": gflops,
         "gflops_scope": gflops_scope,
+        "flop_profile_proposals": flop_profile_proposals,
+        "proposal_count": proposal_count,
         "repeat_latency_means_ms": repeat_means,
         "timing_ms_per_image": pooled_timing,
         "latency_mean_of_repeat_means_ms": mean_latency,
@@ -471,7 +508,7 @@ def _aggregate_method(
         "latency_relative_spread": latency_spread,
         "latency_stability_pass": latency_spread <= latency_tolerance,
         "fps_from_mean_compute": 1000.0 / mean_latency,
-        "isolated_peak_gpu_memory_gb": {
+        "isolated_peak_gpu_memory_gib": {
             "values": peaks,
             "median": statistics.median(peaks),
             "min": min(peaks),
@@ -479,7 +516,7 @@ def _aggregate_method(
             "relative_spread": memory_spread,
             "stability_pass": memory_spread <= memory_tolerance,
         },
-        "isolated_incremental_peak_gpu_memory_gb": {
+        "isolated_incremental_peak_gpu_memory_gib": {
             "values": increments,
             "median": statistics.median(increments),
         },
@@ -488,22 +525,28 @@ def _aggregate_method(
 
 def _comparison_row(summary: dict[str, Any]) -> dict[str, Any]:
     timing = summary["timing_ms_per_image"]
-    memory = summary["isolated_peak_gpu_memory_gb"]
+    memory = summary["isolated_peak_gpu_memory_gib"]
+    proposal_count = summary["proposal_count"]
     return {
         "method": summary["method"],
         "parameters_m": summary["parameters"] / 1e6,
         "gflops": summary["gflops"],
         "gflops_scope": summary["gflops_scope"],
+        "flop_profile_proposals": summary["flop_profile_proposals"] or "",
+        "proposal_count_mean": proposal_count["mean"],
+        "proposal_count_median": proposal_count["median"],
+        "proposal_count_p95": proposal_count["p95"],
+        "proposal_count_max": proposal_count["max"],
         "latency_mean_ms": summary["latency_mean_of_repeat_means_ms"],
         "latency_between_repeat_std_ms": summary["latency_between_repeat_std_ms"],
         "latency_median_ms": timing["median"],
         "latency_p95_ms": timing["p95"],
         "latency_relative_spread": summary["latency_relative_spread"],
         "fps_from_mean_compute": summary["fps_from_mean_compute"],
-        "peak_gpu_memory_gb": memory["median"],
-        "peak_gpu_memory_min_gb": memory["min"],
-        "peak_gpu_memory_max_gb": memory["max"],
-        "incremental_peak_gpu_memory_gb": summary["isolated_incremental_peak_gpu_memory_gb"]["median"],
+        "peak_gpu_memory_gib": memory["median"],
+        "peak_gpu_memory_min_gib": memory["min"],
+        "peak_gpu_memory_max_gib": memory["max"],
+        "incremental_peak_gpu_memory_gib": summary["isolated_incremental_peak_gpu_memory_gib"]["median"],
         "repeat_count": summary["repeat_count"],
         "measured_images_per_repeat": summary["measured_images_per_repeat"],
         "input_shape_counts": json.dumps(summary["input_shape_counts"], sort_keys=True),
@@ -523,6 +566,7 @@ def main(argv: list[str] | None = None) -> None:
         raise FileNotFoundError(f"Refine per-image profile not found: {refine_reference_rows_path}")
     refine_reference_rows = _read_csv(refine_reference_rows_path)
     expected_refine = {
+        "protocol_version": PROFILE_PROTOCOL_VERSION,
         "split": args.split,
         "test_used": False,
         "imgsz": args.imgsz,
@@ -616,7 +660,7 @@ def main(argv: list[str] | None = None) -> None:
     ca_refine_coarse_consistency = abs(ca_refine_coarse_relative_delta) <= args.stability_relative_tolerance
     latency_stability = all(summary["latency_stability_pass"] for summary in aggregates.values())
     memory_stability = all(
-        summary["isolated_peak_gpu_memory_gb"]["stability_pass"] for summary in aggregates.values()
+        summary["isolated_peak_gpu_memory_gib"]["stability_pass"] for summary in aggregates.values()
     )
     worker_isolation = all(
         record["summary"].get("isolated_process") is True
@@ -641,7 +685,7 @@ def main(argv: list[str] | None = None) -> None:
     new_refine_mean = aggregates["CA+Refine"]["latency_mean_of_repeat_means_ms"]
     audit = {
         "tool": "profile_comparative_v311",
-        "protocol_version": 2,
+        "protocol_version": PROFILE_PROTOCOL_VERSION,
         "latency_method": "three full-split synchronized repeats with a 3x3 Latin-square process order",
         "latency_scope": "preprocess + unfused detector/P2-P3 evidence hooks + decode/rotated NMS; Refine adds proposal packing, rotated ROI refinement, and geometry write-back",
         "memory_method": "one method per fresh worker process; absolute peak allocated memory excludes THOP/torch.profiler",
@@ -701,7 +745,11 @@ def main(argv: list[str] | None = None) -> None:
             for record in records
         ],
         "comparison": comparison,
-        "gflops_note": "CA+Refine FLOPs are a lower bound because torch.profiler may not attribute grid_sample/NMS FLOPs; synchronized full-chain latency is authoritative.",
+        "gflops_note": (
+            "CA+Refine FLOPs are a proposal-count-dependent lower bound. The Refine sampling proposal count "
+            "and full-validation proposal mean/median/P95/max are recorded with each method; torch.profiler "
+            "may not attribute grid_sample/NMS FLOPs, so synchronized full-chain latency is authoritative."
+        ),
     }
     write_csv(output_dir / "comparative_per_image.csv", per_image_rows)
     write_csv(output_dir / "comparative_repeat_summary.csv", repeat_rows)

@@ -32,6 +32,7 @@ def test_profile_protocol_is_fp32_batch1_imgsz640():
     assert args.batch == 1
     assert args.amp is False
     assert args.split == "val"
+    assert args.warmup == 500
 
 
 def test_comparative_profile_uses_balanced_three_position_order():
@@ -60,16 +61,57 @@ def test_comparative_aggregate_reports_repeat_and_memory_stability():
                     "measured_images": 2,
                     "input_shape_counts": {"672x672": 2},
                     "timing_ms_per_image": {"total_compute_ms": {"mean": mean}},
-                    "gpu_memory": {"peak_allocated_gb": 1.0, "incremental_peak_gb": 0.25},
+                    "gpu_memory": {"peak_allocated_gib": 1.0, "incremental_peak_gib": 0.25},
                 },
-                "rows": [{"total_compute_ms": mean - 0.1}, {"total_compute_ms": mean + 0.1}],
+                "rows": [
+                    {"total_compute_ms": mean - 0.1, "proposal_count": 2},
+                    {"total_compute_ms": mean + 0.1, "proposal_count": 4},
+                ],
             }
         )
     summary = _aggregate_method("CA", records, latency_tolerance=0.05, memory_tolerance=0.02)
     assert summary["repeat_count"] == 3
     assert summary["latency_stability_pass"] is True
-    assert summary["isolated_peak_gpu_memory_gb"]["stability_pass"] is True
+    assert summary["isolated_peak_gpu_memory_gib"]["stability_pass"] is True
+    assert summary["proposal_count"] == {"mean": 3.0, "median": 3.0, "p95": 3.9, "max": 4}
+    assert summary["flop_profile_proposals"] is None
     assert abs(summary["latency_mean_of_repeat_means_ms"] - 10.0) < 1e-12
+
+
+def test_refine_aggregate_declares_proposal_dependent_flops():
+    records = []
+    for repeat in range(1, 4):
+        records.append(
+            {
+                "method": "CA+Refine",
+                "repeat": repeat,
+                "order_position": repeat,
+                "summary": {
+                    "ca_weights": CANONICAL_CA_WEIGHTS,
+                    "ca_sha256": "a" * 64,
+                    "refine_checkpoint": "/tmp/refine.pt",
+                    "refine_sha256": "b" * 64,
+                    "weights_unchanged": True,
+                    "total_parameters": 120,
+                    "detector_gflops": 20.0,
+                    "refiner_profiled_gflops": 0.5,
+                    "refiner_flop_profile_proposals": 2,
+                    "measured_images": 2,
+                    "input_shape_counts": {"672x672": 2},
+                    "timing_ms_per_image": {"total_compute_ms": {"mean": 12.0}},
+                    "gpu_memory": {"peak_allocated_gib": 1.2, "incremental_peak_gib": 0.3},
+                },
+                "rows": [
+                    {"total_compute_ms": 11.9, "proposal_count": 2},
+                    {"total_compute_ms": 12.1, "proposal_count": 4},
+                ],
+            }
+        )
+    summary = _aggregate_method("CA+Refine", records, latency_tolerance=0.05, memory_tolerance=0.02)
+    assert summary["gflops"] == 20.5
+    assert summary["flop_profile_proposals"] == 2
+    assert "at 2 proposals" in summary["gflops_scope"]
+    assert summary["proposal_count"]["p95"] == 3.9
 
 
 def test_detector_worker_locks_checkpoint_to_method():
@@ -96,6 +138,7 @@ def test_detector_worker_locks_checkpoint_to_method():
     assert args.batch == 1
     assert args.imgsz == 640
     assert args.split == "val"
+    assert args.warmup == 500
 
 
 def test_export_protocol_uses_fixed_baseline_and_ca_paths():
@@ -160,6 +203,7 @@ def test_comparative_profile_locks_common_fp32_protocol(tmp_path):
     assert args.batch == 1
     assert args.amp is False
     assert args.repeats == 3
+    assert args.warmup == 500
 
 
 def test_complete_iou_threshold_columns_are_exported():
@@ -206,7 +250,7 @@ def test_collection_defaults_lock_current_ivc_protocol():
     assert args.smoke is True
     assert args.h1h2 is True
     assert args.archive is True
-    assert build_run_identity(args)["evidence_protocol_version"] == EVIDENCE_PROTOCOL_VERSION == 2
+    assert build_run_identity(args)["evidence_protocol_version"] == EVIDENCE_PROTOCOL_VERSION == 3
 
 
 def test_collection_plan_calls_evidence_tools_but_not_training(tmp_path):
@@ -235,6 +279,10 @@ def test_collection_plan_calls_evidence_tools_but_not_training(tmp_path):
     assert "--repeats 3" in commands
     assert "--split val --passes 1" in commands
     assert "--epochs" not in commands
+    formal_profile = next(stage for stage in stages if stage.name == "profile_refine_fp32_batch1")
+    comparative_profile = next(stage for stage in stages if stage.name == "profile_comparative_fp32_batch1")
+    assert "--warmup 500" in " ".join(formal_profile.command)
+    assert "--warmup 500" in " ".join(comparative_profile.command)
 
 
 def test_collection_can_skip_smoke_and_h1h2(tmp_path):
@@ -259,9 +307,13 @@ def test_resume_reprofiles_legacy_efficiency_protocol(tmp_path):
     collector.state["stages"]["profile_refine_fp32_batch1"] = {"status": "completed"}
     summary = tmp_path / "profile_refine_fp32_batch1" / "profile_summary.json"
     summary.parent.mkdir(parents=True)
-    summary.write_text('{"protocol_version": 1}\n', encoding="utf-8")
+    summary.write_text('{"protocol_version": 1, "warmup_passes": 500}\n', encoding="utf-8")
     assert collector._can_skip("profile_refine_fp32_batch1", (summary,)) is False
-    summary.write_text('{"protocol_version": 2}\n', encoding="utf-8")
+    summary.write_text('{"protocol_version": 2, "warmup_passes": 500}\n', encoding="utf-8")
+    assert collector._can_skip("profile_refine_fp32_batch1", (summary,)) is False
+    summary.write_text('{"protocol_version": 3, "warmup_passes": 20}\n', encoding="utf-8")
+    assert collector._can_skip("profile_refine_fp32_batch1", (summary,)) is False
+    summary.write_text('{"protocol_version": 3, "warmup_passes": 500}\n', encoding="utf-8")
     assert collector._can_skip("profile_refine_fp32_batch1", (summary,)) is True
 
 

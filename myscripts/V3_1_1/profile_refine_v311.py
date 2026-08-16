@@ -32,6 +32,8 @@ STAGES = (
     "refiner_ms",
     "writeback_ms",
 )
+PROFILE_PROTOCOL_VERSION = 3
+OFFICIAL_WARMUP_PASSES = 500
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +47,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--warmup", type=int, default=20, help="Warmup passes on the first validation image")
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=OFFICIAL_WARMUP_PASSES,
+        help="Warmup passes on the first validation image",
+    )
     parser.add_argument("--max-images", type=int, default=0, help="0 profiles the entire validation split")
     parser.add_argument("--output-dir", required=True)
     return parser
@@ -389,7 +396,7 @@ def main(argv: list[str] | None = None) -> None:
         mean_coarse = timing["coarse_compute_ms"]["mean"]
         summary = {
             "tool": "profile_refine_v311",
-            "protocol_version": 2,
+            "protocol_version": PROFILE_PROTOCOL_VERSION,
             "process_id": os.getpid(),
             "isolated_process": True,
             "measurement_order": "warmup -> latency/peak memory -> complexity",
@@ -427,8 +434,9 @@ def main(argv: list[str] | None = None) -> None:
             "refiner_profiled_gflops": refiner_gflops,
             "refiner_flop_profile_proposals": flop_proposals,
             "flop_scope_note": (
-                "Refiner FLOPs are torch.profiler-supported operators on one real image; grid_sample and NMS "
-                "may not be assigned FLOPs, so latency is the authoritative complete-chain cost."
+                "Refiner FLOPs are torch.profiler-supported operators on one real image with "
+                f"{flop_proposals} post-NMS proposals; the value is proposal-count dependent, and grid_sample "
+                "and NMS may not be assigned FLOPs, so latency is the authoritative complete-chain cost."
             ),
             "proposal_count": {
                 "mean": statistics.fmean(float(row["proposal_count"]) for row in rows),
@@ -440,10 +448,13 @@ def main(argv: list[str] | None = None) -> None:
             "coarse_fps_from_mean_compute": 1000.0 / mean_coarse,
             "refined_fps_from_mean_compute": 1000.0 / mean_total,
             "gpu_memory": {
-                "baseline_allocated_gb": baseline_memory / 1024**3,
-                "peak_allocated_gb": peak_memory / 1024**3,
-                "incremental_peak_gb": max(peak_memory - baseline_memory, 0) / 1024**3,
-                "scope": "absolute allocated memory in this standalone process; peak window excludes complexity profiling",
+                "baseline_allocated_gib": baseline_memory / 1024**3,
+                "peak_allocated_gib": peak_memory / 1024**3,
+                "incremental_peak_gib": max(peak_memory - baseline_memory, 0) / 1024**3,
+                "scope": (
+                    "GiB (2^30 bytes) of absolute allocated memory in this standalone process; "
+                    "peak window excludes complexity profiling"
+                ),
             },
         }
         write_csv(output_dir / "profile_per_image.csv", rows)

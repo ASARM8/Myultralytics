@@ -20,6 +20,7 @@ from myscripts.V3_1_1.evidence_runtime import (
     ensure_omp_threads,
     require_canonical_path,
 )
+from myscripts.V3_1_1.profile_refine_v311 import OFFICIAL_WARMUP_PASSES, PROFILE_PROTOCOL_VERSION
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,7 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--batch", type=int, default=1, choices=(1,))
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=8)
-    parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--warmup", type=int, default=OFFICIAL_WARMUP_PASSES)
     parser.add_argument("--max-images", type=int, default=0)
     parser.add_argument("--conf", type=float, required=True)
     parser.add_argument("--nms-iou", type=float, required=True)
@@ -85,7 +86,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     summary.update(
         tool="profile_detector_worker_v311",
-        protocol_version=2,
+        protocol_version=PROFILE_PROTOCOL_VERSION,
         process_id=os.getpid(),
         isolated_process=True,
         measurement_order="warmup -> latency/peak memory -> complexity",

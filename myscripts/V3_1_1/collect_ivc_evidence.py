@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from myscripts.V3_1_1.evidence_runtime import CANONICAL_BASELINE_WEIGHTS, CANONICAL_CA_WEIGHTS
+from myscripts.V3_1_1.profile_refine_v311 import OFFICIAL_WARMUP_PASSES, PROFILE_PROTOCOL_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -41,7 +42,7 @@ CANONICAL_REFINE = (
 )
 CANONICAL_TRAINING_DIR = "/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only"
 DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/paper_exports"
-EVIDENCE_PROTOCOL_VERSION = 2
+EVIDENCE_PROTOCOL_VERSION = PROFILE_PROTOCOL_VERSION
 
 
 @dataclass(frozen=True)
@@ -199,7 +200,10 @@ class EvidenceCollector:
                     "test_used": False,
                     "imgsz": 640,
                     "official_validation": "FP32, batch=8",
-                    "official_latency": "FP32, batch=1, 3x3 Latin-square order, isolated synchronized workers",
+                    "official_latency": (
+                        "FP32, batch=1, 500 warmup passes, 3x3 Latin-square order, "
+                        "isolated synchronized workers"
+                    ),
                 },
                 "stages": {},
             }
@@ -231,10 +235,18 @@ class EvidenceCollector:
             return False
         if name == "profile_refine_fp32_batch1":
             summary_path = self.output_dir / "profile_refine_fp32_batch1" / "profile_summary.json"
-            return read_json(summary_path).get("protocol_version") == 2
+            summary = read_json(summary_path)
+            return (
+                summary.get("protocol_version") == EVIDENCE_PROTOCOL_VERSION
+                and summary.get("warmup_passes") == OFFICIAL_WARMUP_PASSES
+            )
         if name == "profile_comparative_fp32_batch1":
             summary_path = self.output_dir / "profile_comparative_fp32_batch1" / "comparative_profile.json"
-            return read_json(summary_path).get("protocol_version") == 2
+            summary = read_json(summary_path)
+            return (
+                summary.get("protocol_version") == EVIDENCE_PROTOCOL_VERSION
+                and summary.get("warmup_passes") == OFFICIAL_WARMUP_PASSES
+            )
         return True
 
     def run_action(
@@ -673,7 +685,7 @@ def build_command_stages(args: argparse.Namespace, output_dir: Path) -> list[Com
                 args.workers,
                 "--no-amp",
                 "--warmup",
-                20,
+                OFFICIAL_WARMUP_PASSES,
                 "--output-dir",
                 profile_dir,
             ),
@@ -706,7 +718,7 @@ def build_command_stages(args: argparse.Namespace, output_dir: Path) -> list[Com
                 args.workers,
                 "--no-amp",
                 "--warmup",
-                20,
+                OFFICIAL_WARMUP_PASSES,
                 "--repeats",
                 3,
                 "--output-dir",
@@ -880,11 +892,14 @@ def audit_protocol_outputs(args: argparse.Namespace, output_dir: Path) -> list[s
     if not (
         profile.get("split") == "val"
         and profile.get("test_used") is False
-        and profile.get("protocol_version") == 2
+        and profile.get("protocol_version") == EVIDENCE_PROTOCOL_VERSION
         and profile.get("imgsz") == 640
         and profile.get("batch") == 1
         and profile.get("amp") is False
+        and profile.get("warmup_passes") == OFFICIAL_WARMUP_PASSES
         and profile.get("weights_unchanged") is True
+        and profile.get("refiner_flop_profile_proposals") is not None
+        and "peak_allocated_gib" in profile.get("gpu_memory", {})
     ):
         raise RuntimeError("完整链性能文件不符合 val/FP32/batch1/imgsz640/权重不变协议")
     comparative = read_json(
@@ -896,8 +911,9 @@ def audit_protocol_outputs(args: argparse.Namespace, output_dir: Path) -> list[s
         and comparative.get("imgsz") == 640
         and comparative.get("batch") == 1
         and comparative.get("amp") is False
-        and comparative.get("protocol_version") == 2
+        and comparative.get("protocol_version") == EVIDENCE_PROTOCOL_VERSION
         and comparative.get("repeat_count") == 3
+        and comparative.get("warmup_passes") == OFFICIAL_WARMUP_PASSES
         and comparative.get("same_images_and_shapes") is True
         and comparative.get("same_image_order") is True
         and comparative.get("ca_proposals_match_refine_profile") is True
@@ -907,6 +923,9 @@ def audit_protocol_outputs(args: argparse.Namespace, output_dir: Path) -> list[s
         and comparative.get("baseline", {}).get("weights_unchanged") is True
         and comparative.get("ca", {}).get("weights_unchanged") is True
         and comparative.get("refine", {}).get("weights_unchanged") is True
+        and comparative.get("refine", {}).get("flop_profile_proposals") is not None
+        and "proposal_count" in comparative.get("refine", {})
+        and "isolated_peak_gpu_memory_gib" in comparative.get("refine", {})
     ):
         raise RuntimeError("统一 Baseline/CA/CA+Refine 性能文件不符合锁定协议")
     if comparative.get("latency_stability_pass") is not True:
