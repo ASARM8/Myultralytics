@@ -14,29 +14,7 @@ from typing import Any
 
 from myscripts.V3_1_1.evidence_runtime import CANONICAL_CA_WEIGHTS, load_refine_bundle, require_canonical_path
 from myscripts.V3_1_1_low_gain.config import DEFAULT_RESIDUAL_SCALE, TARGET_MAP_GAIN
-
-
-class ResidualScaledRefiner:
-    """Read-only adapter that scales V3.1.1 residual output at inference."""
-
-    def __init__(self, refiner: Any, residual_scale: float) -> None:
-        self._refiner = refiner
-        self.residual_scale = float(residual_scale)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._refiner, name)
-
-    def eval(self) -> "ResidualScaledRefiner":
-        self._refiner.eval()
-        return self
-
-    def __call__(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
-        output = self._refiner(*args, **kwargs)
-        if not isinstance(output, dict) or "residual" not in output:
-            raise TypeError("V3.1.1 refiner did not return a residual dictionary")
-        scaled = dict(output)
-        scaled["residual"] = output["residual"] * self.residual_scale
-        return scaled
+from myscripts.V3_1_1_low_gain.runtime import ResidualScaledRefiner, require_scale
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--residual-scale",
         type=float,
         default=DEFAULT_RESIDUAL_SCALE,
-        help="Geometry-residual multiplier in [0, 1]; default is the conservative initial estimate.",
+        help="Geometry-residual multiplier in [0, 1]; default is the frozen conservative setting.",
     )
     parser.add_argument("--target-gain", type=float, default=TARGET_MAP_GAIN)
     parser.add_argument("--output-dir", required=True)
@@ -64,8 +42,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     require_canonical_path(parser, args.ca_weights, CANONICAL_CA_WEIGHTS, "CA checkpoint")
     if args.batch <= 0 or args.workers < 0:
         parser.error("batch must be positive and workers must be non-negative")
-    if not 0.0 <= args.residual_scale <= 1.0:
-        parser.error("residual-scale must be within [0, 1]")
+    require_scale(parser, args.residual_scale)
     if not 0.0 < args.target_gain < 1.0:
         parser.error("target-gain must be within (0, 1)")
 

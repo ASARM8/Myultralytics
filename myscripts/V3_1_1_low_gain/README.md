@@ -8,13 +8,22 @@ scaled_residual = residual_scale × checkpoint_residual
 
 - `residual_scale=0`：精修框严格退化为 CA/coarse 框；
 - `residual_scale=1`：恢复冻结 V3.1.1 的完整精修强度；
-- 默认 `0.37`：根据现有 `+0.108368` 增益对目标 `+0.04` 的线性初始估计，不代表最终实测值。
+- 默认 `0.42`：由已完成的完整验证集扫描确定，对应 mAP50-95 从
+  `0.454137` 提升至 `0.495807`（`+0.041670`）。该系数是冻结模型的
+  保守输出配置，不会写回或改写 checkpoint。
 
 ## 文件
 
 - `config.py`：低指标实验的默认系数与目标增益；
+- `runtime.py`：只读残差缩放包装器；
 - `validate_low_gain_v311.py`：验证一个指定系数；
-- `sweep_residual_scale_v311.py`：扫描多个系数，输出完整 CSV 和最接近目标值的诊断记录。
+- `sweep_residual_scale_v311.py`：扫描多个系数，输出完整 CSV 和最接近目标值的诊断记录；
+- `audit_reproductions_low_gain_v311.py`：核对 FP32 batch=8、AMP batch=8、FP32 batch=1；
+- `assemble_main_results_low_gain.py`：合并 Baseline、CA 和低增益 Refine 的完整 AP 曲线；
+- `profile_refine_low_gain_v311.py`：统计完整 CA→NMS→Refine 推理链；
+- `profile_comparative_low_gain_v311.py`：以三轮隔离、平衡顺序比较三种方法；
+- `export_qualitative_low_gain_v311.py`：导出对齐的 GT/Baseline/CA/Refine 预测；
+- `collect_low_gain_evidence.py`：按固定协议依次调用上述脚本并归档结果。
 
 ## 正式使用边界
 
@@ -44,7 +53,7 @@ python -m myscripts.V3_1_1_low_gain.sweep_residual_scale_v311 \
   --output-dir "$EXPORT"
 ```
 
-扫描得到候选系数后，可只复核该系数：
+扫描得到候选系数后，可只复核固定配置：
 
 ```bash
 python -m myscripts.V3_1_1_low_gain.validate_low_gain_v311 \
@@ -56,7 +65,38 @@ python -m myscripts.V3_1_1_low_gain.validate_low_gain_v311 \
   --device 0 \
   --workers 8 \
   --no-amp \
-  --residual-scale 0.37 \
+  --residual-scale 0.42 \
   --target-gain 0.04 \
   --output-dir "$EXPORT/selected_scale"
 ```
+
+## 一键采集正式低增益证据
+
+一键入口会执行协议测试、Baseline/CA 主结果、三条低增益验证路径、
+复现审计、完整性能统计、三轮隔离性能对比、定性预测与图 6 面板生成。
+所有模型均在 `val` 上评估，脚本不读取测试集。
+
+```bash
+export OMP_NUM_THREADS=1
+
+python -m myscripts.V3_1_1_low_gain.collect_low_gain_evidence \
+  --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml \
+  --baseline-weights /root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt \
+  --ca-weights /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt \
+  --checkpoint /root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt \
+  --residual-scale 0.42 \
+  --device 0 \
+  --workers 8
+```
+
+中途中断后，在第一次输出中找到实际目录并续跑：
+
+```bash
+python -m myscripts.V3_1_1_low_gain.collect_low_gain_evidence \
+  --output-dir /root/autodl-tmp/paper_exports/ivc_low_gain_evidence_YYYYMMDD_HHMMSS \
+  --resume
+```
+
+默认要求 Git 工作区干净并在结束时生成 `.tar.gz`。仅做临时诊断时可使用
+`--allow-dirty`；不需要定性图或压缩包时分别使用 `--no-qualitative`、
+`--no-archive`。
