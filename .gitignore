@@ -152,6 +152,8 @@ dmypy.json
 runs/
 wandb/
 .DS_Store
+.mplconfig/
+/_qa_ivc/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/

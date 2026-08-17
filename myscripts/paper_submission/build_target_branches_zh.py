@@ -10,7 +10,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.text.paragraph import Paragraph
-from docx.shared import Pt, RGBColor
+from docx.shared import Inches, Pt, RGBColor
 
 from myscripts.paper_submission.build_target_branches import REFERENCES, TARGETS
 
@@ -31,11 +31,14 @@ ZH_TARGETS = {
             "中计算候选点到边界的最大需求距离，并在任务对齐排序前过滤几何不可达候选；reg_max=32 用于"
             "为不同金字塔层提供必要的距离表达支撑。为修正剩余的高 IoU 尺度误差，本文进一步围绕 post-NMS"
             "候选框从 P2/P3 采样旋转对齐区域，仅预测短边和长边的有界对数尺度残差，同时保持中心、角度、"
-            "置信度、候选数量和 NMS 身份不变。在 imgsz=640 的固定 TTPLA 验证协议下，候选框精修将"
-            " mAP50-95 从 0.4541 提升至 0.5625，AP75 从 0.4398 提升至 0.5588；AP90 提高 0.0157，而"
+            "置信度、候选数量和 NMS 身份不变。在 imgsz=640 的固定 TTPLA 验证协议下，Baseline、覆盖"
+            "感知检测器和最终模型的 mAP50-95 分别为 0.4084、0.4541 和 0.5625；精修将 AP75 从 0.4398"
+            "提升至 0.5588，AP90 提高 0.0157，而"
             " AP95 下降 0.0018。严格恒等对照、三种无重训练评估路径和 proposal 匹配分析表明，收益来自"
             "学习到的几何校正：匹配候选平均 IoU 提高 0.0466，63.41% 的匹配候选得到改善。该结果支持"
-            "方法对电线旋转定位具有明确但有边界的正向作用；多种子、复杂度和最终测试集证据仍待补充。"
+            "方法对电线旋转定位具有明确但有边界的正向作用。RTX 5090 上完整模型的单图耗时为"
+            " 14.83±0.04 ms（67.4 FPS），相对 CA 仅增加 1.72% 参数量；正式结果来自单随机种子，"
+            "因此本文不作统计显著性或机载部署声明。"
         ),
         "keywords": "电线检测；无人机图像；旋转目标检测；正样本分配；分布式回归；候选框精修",
         "note": (
@@ -50,13 +53,13 @@ ZH_TARGETS = {
             "旋转目标检测问题处理，不把检测结果扩展表述为闭环避障能力。"
         ),
         "limitation": (
-            "面向 Image and Vision Computing，当前主要风险是证据完整性和泛化范围。统一原始 Baseline、"
-            "覆盖溢出机制统计、完整计算代价、多种子和冻结测试集仍需补齐；这些属于冻结方法后的证据补全，"
-            "不应据此继续更改当前算法。"
+            "面向 Image and Vision Computing，现有证据已经闭合 Baseline→CA→Refine 的主链路，但泛化"
+            "范围仍然有限。后续最有价值的扩展是独立重复种子、第二个大长宽比旋转目标数据集和机载硬件"
+            "测试；在这些证据完成前，不延伸为统计显著、跨域通用或部署就绪结论。"
         ),
         "conclusion": (
-            "现有证据支持覆盖能力感知分配与身份保持候选框精修对电线旋转定位具有正向作用，但结论应保持"
-            "在单数据集、单正式种子和当前验证协议范围内，直至剩余证据补齐。"
+            "现有证据支持覆盖能力感知分配与身份保持候选框精修对电线旋转定位具有明确但有边界的正向"
+            "作用，结论限定于单数据集、单正式种子和当前固定验证协议。"
         ),
     },
     "unmanned": {
@@ -231,13 +234,143 @@ def _clear_forced_page_break(paragraph: Paragraph) -> None:
         p_pr.remove(node)
 
 
-def build(target_key: str, output_dir: Path) -> Path:
+def _set_table(table, rows: list[list[str]], *, add_columns: int = 0) -> None:
+    """Replace a table while preserving the source document's layout container."""
+    for _ in range(add_columns):
+        table.add_column(Inches(0.72))
+    if len(rows) != len(table.rows):
+        raise ValueError(f"table row mismatch: expected {len(table.rows)}, received {len(rows)}")
+    if any(len(row) != len(table.columns) for row in rows):
+        raise ValueError(f"table column mismatch: expected {len(table.columns)}")
+    for row_index, values in enumerate(rows):
+        for column_index, value in enumerate(values):
+            cell = table.cell(row_index, column_index)
+            cell.text = str(value)
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_after = Pt(0)
+                for run in paragraph.runs:
+                    _set_run_font(
+                        run,
+                        cn="黑体" if row_index == 0 else "宋体",
+                        size=8.0 if len(table.columns) >= 7 else 8.5,
+                        bold=row_index == 0,
+                    )
+
+
+def _replace_ivc_final_content(doc: Document) -> None:
+    """Freeze the Chinese IVC branch to the audited 2026-08-16 evidence."""
+    table_rows = {
+        0: [
+            ["长边分桶", "Baseline 正样本", "Baseline 溢出率/%", "CA 正样本", "CA 溢出率/%"],
+            ["<100 px", "3038", "0.0", "3038", "0.0"],
+            ["100–200 px", "3369", "3.4", "3370", "0.0"],
+            ["200–300 px", "4681", "20.9", "4686", "0.0"],
+            ["300–500 px", "5172", "55.3", "5176", "0.0"],
+            [">500 px", "18727", "99.9", "18706", "0.2"],
+        ],
+        4: [
+            ["项目", "数值"],
+            ["处理后训练图像数", "13559"],
+            ["处理后验证图像数", "1695"],
+            ["验证集实例数", "3603"],
+            ["输入尺寸", "640×640"],
+            ["标注形式", "电线旋转框（OBB）"],
+            ["主结果用途", "固定验证集统一评估"],
+        ],
+        5: [
+            ["配置项", "Baseline", "CA", "CA + Refine"],
+            ["模型/权重", "YOLO11l-OBB", "CA best.pt", "CA + epoch 4 Refiner"],
+            ["输入尺寸", "640", "640", "640"],
+            ["验证精度", "FP32", "FP32", "FP32"],
+            ["Batch size", "8", "8", "8"],
+            ["conf / NMS IoU", "0.01 / 0.70", "0.01 / 0.70", "0.01 / 0.70"],
+            ["max_det", "300", "300", "300"],
+            ["Refiner 训练", "—", "—", "15 epoch，seed 0"],
+        ],
+        6: [
+            ["方法", "Precision", "Recall", "mAP50", "mAP50-95", "AP75", "AP90"],
+            ["Baseline YOLO11l-OBB", "0.7901", "0.7777", "0.7254", "0.4084", "0.4370", "0.0971"],
+            ["CA（reg_max=32 + Coverage-Aware）", "0.8044", "0.7738", "0.7395", "0.4541", "0.4398", "0.2457"],
+            ["CA + Refine", "0.8939", "0.8665", "0.8936", "0.5625", "0.5588", "0.2614"],
+        ],
+        7: [
+            ["诊断项", "Baseline", "CA", "变化"],
+            ["全体正样本 DFL 溢出率/%", "64.8", "0.11", "−64.7 pp"],
+            ["长边 >500 px 溢出率/%", "99.9", "0.2", "−99.7 pp"],
+            ["长边 >500 px 的 P3 占比/%", "1.1", "0.2", "−0.9 pp"],
+            ["长边 >500 px 的 P4 占比/%", "98.9", "98.9", "0.0 pp"],
+            ["长边 >500 px 的 P5 占比/%", "0.1", "0.9", "+0.8 pp"],
+            ["单侧理论范围 P3/P4/P5", "120/240/480", "248/496/992", "reg_max 16→32"],
+        ],
+        8: [
+            ["候选级诊断", "数值", "判定", "说明"],
+            ["有效/匹配 proposal", "5260 / 3444", "通过", "固定验证集"],
+            ["平均匹配 IoU 增量", "+0.0466", "正向", "Refine − coarse"],
+            ["改善/恶化比例", "63.41% / 36.59%", "正向", "改善比例更高"],
+            ["短/长边边界命中", "0 / 0", "通过", "无边界塌缩"],
+        ],
+        9: [
+            ["推理模式", "Precision", "Recall", "mAP50", "mAP50-95", "AP75", "AP90"],
+            ["CA（coarse）", "0.8044", "0.7738", "0.7395", "0.4541", "0.4398", "0.2457"],
+            ["Identity（零残差）", "0.8044", "0.7738", "0.7395", "0.4541", "0.4398", "0.2457"],
+            ["CA + Refine", "0.8939", "0.8665", "0.8936", "0.5625", "0.5588", "0.2614"],
+        ],
+        10: [
+            ["方法", "特征增强", "旋转框", "覆盖感知分配", "reg_max 扩容", "连续残差精修", "mAP50", "mAP50-95", "FPS"],
+            ["PL-YOLOv8[1]", "方向滤波块", "是", "否", "未显式讨论", "否", "跨协议", "不直接比较", "跨硬件"],
+            ["本文 CA 主干", "否", "是", "是", "32", "否", "0.7395", "0.4541", "80.65"],
+            ["本文最终模型", "否", "是", "是", "32", "短/长边连续残差", "0.8936", "0.5625", "67.42"],
+        ],
+        11: [
+            ["方法", "参数量/M", "FLOPs/G", "显存/GB", "延迟/ms", "FPS"],
+            ["Baseline", "26.160", "90.970", "0.259", "12.44±0.28", "80.37"],
+            ["CA", "27.267", "96.111", "0.263", "12.40±0.18", "80.65"],
+            ["CA + Refine", "27.736", "≥96.761", "0.304", "14.83±0.04", "67.42"],
+        ],
+    }
+    for index, rows in table_rows.items():
+        _set_table(doc.tables[index], rows)
+    _set_table(
+        doc.tables[1],
+        [
+            ["长边分桶", "Base P3/%", "Base P4/%", "Base P5/%", "CA P3/%", "CA P4/%", "CA P5/%"],
+            ["100–200 px", "81.7", "18.3", "0.0", "99.9", "0.1", "0.1"],
+            ["200–300 px", "26.4", "73.6", "0.0", "99.1", "0.9", "0.0"],
+            ["300–500 px", "4.0", "96.0", "0.0", "66.5", "33.5", "0.0"],
+            [">500 px", "1.1", "98.9", "0.1", "0.2", "98.9", "0.9"],
+        ],
+        add_columns=3,
+    )
+
+    replacements = {
+        "第二类统计正样本层级分布": "第二类统计正样本层级分布，分别计算不同长度桶中正样本落在 P3、P4、P5 的比例。该统计用于解释溢出的层级来源，但不预设长目标必须迁移至 P5：若某一层级的分配占比不变而扩展 reg_max 后溢出消失，则说明关键矛盾是该层有限表示范围，而非简单的层级误分配。",
+        "Coverage-Aware Assignment 主要修复": "Coverage-Aware Assignment 主要修复‘长目标能否在当前层级的离散范围内被完整表达’，但完整覆盖不等于高精度贴合。对于极细旋转框，短边误差、法向中心偏移和角度误差都会导致 IoU 快速下降。本文最终通过 coarse/identity/refined 恒等对照、匹配候选 IoU 变化和残差边界统计区分精修收益，避免把分数重标定或固定缩放误认为几何学习。",
+        "实验采用 TTPLA 系列低空航拍电力线数据": "实验采用 TTPLA 低空航拍电力线数据[5]。高分辨率图像以 640×640 切片表示，并保留电线旋转几何标注。固定处理后划分包含 13559 张训练图像和 1695 张验证图像，验证集共有 3603 个标注实例。所有方法共享相同图像、标注转换和预处理；Refiner 的 checkpoint 仅在训练集内部的确定性 image-level holdout 上选择，论文数值统一在未参与选择的验证集上重新计算。",
+        "基线采用 YOLO11l-OBB": "基线采用 YOLO11l-OBB，CA 模型使用 Coverage-Aware Assignment 并设 reg_max=32，最终模型在冻结 CA 后连接候选框级几何精修器。Refiner 使用 P2/P3 特征、32 个 ROI 通道、5×24 旋转 ROI 和 128 维隐藏层，训练 15 个 epoch；优化器为 AdamW，初始学习率 3×10^-4，weight decay 为 1×10^-4，warmup 为 3 个 epoch，随机种子为 0。正式验证统一采用 imgsz=640、FP32、batch=8、conf=0.01、NMS IoU=0.70 和 max_det=300。",
+        "主结果以相同验证设置比较": "主结果在完全一致的固定验证设置下比较 Baseline、CA 与 CA+Refine。Baseline 和 CA 使用各自冻结权重，最终模型在冻结 CA 后仅加载所选 Refiner；coarse 与 identity 只用于恒等性校验，不作为独立方法重复计入主表。",
+        "Coverage-Aware 的直接证据": "Coverage-Aware 的直接证据来自正样本可达性与层级分布。Baseline 的总体 DFL 溢出率约为 64.8%，CA 降至 0.11%；长边超过 500 px 时由 99.9% 降至 0.2%。层级统计同时表明，Baseline 的极长目标本就主要位于 P4，问题并非简单的‘长目标错误进入 P3’，而是 reg_max=16 下 P4 的有限距离范围仍不足。CA 基本消除该溢出，并使部分中长目标在范围可达时保留于更高分辨率的 P3。",
+        "除聚合 AP 外": "除聚合 AP 外，本文从候选框匹配层面检查精修是否真正改善几何。固定验证中共有 5260 个有效 proposal，其中 3444 个与真实框匹配；匹配 proposal 的平均 IoU 增量为 0.0466，改善比例为 63.41%，高于 36.59% 的恶化比例。短边与长边残差边界命中率均为 0；表8汇总这些候选级诊断。",
+        "reg_max 扩容会增加": "reg_max 扩容会增加边界分布输出通道，候选框级精修还会引入 P2/P3 投影、旋转 ROI 采样和轻量融合网络。在 RTX 5090、FP32、batch=1 的完整链路测试中，CA+Refine 参数量为 27.736 M，单图延迟 14.83±0.04 ms，吞吐率为 67.42 FPS；相对 CA 增加 0.469 M 参数和 2.43 ms。Refiner FLOPs 随 proposal 数变化，表中 ≥96.761 G 为两个 proposal 下的实测下界。Baseline 的跨轮波动为 5.43%，因此 Baseline 与 CA 的细小时延差异仅作描述，不作速度优劣结论。",
+        "定性结果应覆盖": "定性图由冻结验证导出自动选择，所有列使用相同图像、阈值与 NMS 设置。图6保留两组明显改善、一组近中性以及一组负向案例，用于同时展示局部尺度校正的有效情形与边界。绿色为 GT，红色为预测。",
+        "本文仍存在三方面局限": "本文仍存在四方面局限。第一，数值可达性不等价于特征语义充分性。第二，精修器只调整短、长边，不能修复中心和角度误差，AP95 的轻微下降也表明少量高精度候选可能被过度校正。第三，正式结果来自单随机种子，三条复现路径复用同一 checkpoint，不能替代独立重复训练。第四，现有证据集中于一个 TTPLA 处理设置和一张桌面 GPU，尚不能支持跨域泛化、统计显著性或机载部署结论。",
+        "在固定 FP32、batch=8、imgsz=640": "在固定 FP32、batch=8、imgsz=640 的独立验证中，Baseline、CA 与 CA+Refine 的 mAP50-95 分别为 0.4084、0.4541 和 0.5625；精修相对 CA 将 AP75 从 0.4398 提升至 0.5588，AP90 从 0.2457 提升至 0.2614，同时 AP95 轻微下降 0.0018。恒等对照、CA 权重哈希、残差边界统计和匹配 IoU 分析均支持主要改善来自实际几何校正。现有证据已形成 Baseline→CA→Refine 的方法与实验闭环，但结论限定于当前固定验证和单随机种子设置。",
+    }
+    for prefix, text in replacements.items():
+        _replace_paragraph(_find_paragraph(doc, prefix), text, cn="宋体", size=10.5)
+    _replace_paragraph(_find_paragraph(doc, "表1 原始分配"), "表1 Baseline 与 CA 的 DFL 覆盖诊断", cn="宋体", size=9)
+    _replace_paragraph(_find_paragraph(doc, "表2 原始分配"), "表2 Baseline 与 CA 的正样本层级分布", cn="宋体", size=9)
+    _replace_paragraph(_find_paragraph(doc, "表8 Oracle"), "表8 候选框级几何精修诊断", cn="宋体", size=9)
+
+
+def build(target_key: str, output_dir: Path, *, final: bool = False) -> Path:
     if not SOURCE.exists():
         raise FileNotFoundError(SOURCE)
     meta = ZH_TARGETS[target_key]
     en_meta = TARGETS[target_key]
     output_dir.mkdir(parents=True, exist_ok=True)
-    out = output_dir / f"{en_meta['file_stem']}_投稿预备分支_中文版.docx"
+    final_mode = final and target_key == "ivc"
+    suffix = "投稿完整稿" if final_mode else "投稿预备分支"
+    out = output_dir / f"{en_meta['file_stem']}_{suffix}_中文版.docx"
     shutil.copy2(SOURCE, out)
 
     doc = Document(out)
@@ -261,7 +394,8 @@ def build(target_key: str, output_dir: Path) -> Path:
                     paragraph.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
 
     author = _find_paragraph(doc, "作者：")
-    _insert_after(author, meta["note"], note=True)
+    if not final_mode:
+        _insert_after(author, meta["note"], note=True)
 
     abstract = _find_paragraph(doc, "摘要：")
     _replace_labelled(abstract, "摘要：", meta["abstract"])
@@ -330,12 +464,25 @@ def build(target_key: str, output_dir: Path) -> Path:
         # before Table 11, so keep the caption with its table but remove the
         # inherited forced page break.
         _clear_forced_page_break(_find_paragraph(doc, "表11 模型复杂度"))
+        if final_mode:
+            _replace_ivc_final_content(doc)
+            # The source placeholders for Figs. 3, 5, and 6 used a shallow
+            # landscape ratio.  Match the final exported assets so Word does
+            # not vertically compress the charts or qualitative grid.
+            final_figure_sizes = {
+                2: (6.10, 2.70),
+                4: (6.10, 2.68),
+                5: (6.10, 6.22),
+            }
+            for index, (width, height) in final_figure_sizes.items():
+                doc.inline_shapes[index].width = Inches(width)
+                doc.inline_shapes[index].height = Inches(height)
 
     props = doc.core_properties
     props.title = meta["title"]
-    props.subject = f"{en_meta['journal']} 中文投稿审阅分支"
+    props.subject = f"{en_meta['journal']} 中文完整投稿稿" if final_mode else f"{en_meta['journal']} 中文投稿审阅分支"
     props.keywords = meta["keywords"]
-    props.comments = "内部中文审阅分支；投稿前删除黄色说明并按目标期刊模板处理。"
+    props.comments = "实验数据已补齐；作者、单位和披露信息仍需提交前填写。" if final_mode else "内部中文审阅分支；投稿前删除黄色说明并按目标期刊模板处理。"
     doc.save(out)
     # Remove stale font-table declarations that can make Word report a
     # non-used Japanese fallback (e.g. MS Gothic) in the font inspector.
@@ -362,10 +509,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build Chinese review counterparts for target-specific journal branches.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--target", choices=[*ZH_TARGETS, "all"], default="all")
+    parser.add_argument("--final", action="store_true", help="生成证据已补齐的 IVC 中文完整稿")
     args = parser.parse_args()
     keys = ZH_TARGETS if args.target == "all" else [args.target]
     for key in keys:
-        print(build(key, args.output_dir))
+        print(build(key, args.output_dir, final=args.final))
 
 
 if __name__ == "__main__":

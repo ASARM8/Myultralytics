@@ -140,7 +140,7 @@ def draw_annotations(ax, annotations, *, color, linestyle, show_confidence, line
             )
 
 
-def build_figure(frame: pd.DataFrame, manifest_path: Path, show_confidence: bool):
+def build_figure(frame: pd.DataFrame, manifest_path: Path, show_confidence: bool, *, english: bool = False):
     """Build a row-per-scene, column-per-method comparison grid."""
     base = manifest_path.parent
     rows = []
@@ -211,7 +211,11 @@ def build_figure(frame: pd.DataFrame, manifest_path: Path, show_confidence: bool
     fig.text(
         0.995,
         0.008,
-        "绿色：GT（对比列为虚线）；红色实线：预测",
+        (
+            "Green: GT (dashed in comparison columns); red: prediction"
+            if english
+            else "绿色：GT（对比列为虚线）；红色实线：预测"
+        ),
         ha="right",
         va="bottom",
         fontsize=6.8,
@@ -225,13 +229,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--show-confidence", action="store_true")
+    parser.add_argument("--english", action="store_true", help="Use an English legend")
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
     frame = pd.read_csv(args.manifest)
     require_nonempty(frame, args.manifest)
     require_columns(frame, MANIFEST_COLUMNS, args.manifest)
-    fig = build_figure(frame, args.manifest.resolve(), args.show_confidence)
+    fig = build_figure(frame, args.manifest.resolve(), args.show_confidence, english=args.english)
     paths = save_figure(fig, ensure_output_dir(args.output_dir), "fig6_qualitative_comparison", dpi=600)
     plt.close(fig)
     for path in paths:

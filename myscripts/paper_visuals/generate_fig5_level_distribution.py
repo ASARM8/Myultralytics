@@ -49,7 +49,7 @@ def load_frame(args) -> pd.DataFrame:
     return frame
 
 
-def build_figure(frame: pd.DataFrame):
+def build_figure(frame: pd.DataFrame, *, english: bool = False):
     """Build matched 100% stacked-bar panels with identical bin ordering."""
     methods = list(dict.fromkeys(frame["method"].astype(str)))
     if len(methods) != 2:
@@ -91,13 +91,13 @@ def build_figure(frame: pd.DataFrame):
             bottom += values
 
         ax.set_xticks(x, bins, rotation=20, ha="right")
-        ax.set_xlabel("GT 长边分桶 / px")
+        ax.set_xlabel("GT long-side bin / px" if english else "GT 长边分桶 / px")
         ax.set_ylim(0, 100)
         ax.grid(axis="y", color=COLORS["light_gray"], lw=0.65)
         ax.set_axisbelow(True)
         ax.spines[["top", "right"]].set_visible(False)
         ax.set_title(f"({'ab'[panel]}) {method}", loc="left", fontsize=9.2)
-    axes[0].set_ylabel("正样本层级占比 / %")
+    axes[0].set_ylabel("Positive assignment share / %" if english else "正样本层级占比 / %")
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, frameon=False, ncol=3, loc="upper center", bbox_to_anchor=(0.53, 1.02))
     fig.subplots_adjust(left=0.085, right=0.995, top=0.86, bottom=0.22, wspace=0.12)
@@ -113,11 +113,12 @@ def main():
     parser.add_argument("--baseline-label", default="Baseline")
     parser.add_argument("--ca-label", default="CA")
     parser.add_argument("--exclude-under-100", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--english", action="store_true", help="Use English axis labels")
     parser.add_argument("--output-dir", default=None)
     args = parser.parse_args()
 
     frame = load_frame(args)
-    fig = build_figure(frame)
+    fig = build_figure(frame, english=args.english)
     paths = save_figure(fig, ensure_output_dir(args.output_dir), "fig5_positive_level_distribution")
     plt.close(fig)
     for path in paths:
