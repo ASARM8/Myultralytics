@@ -34,10 +34,10 @@ t'_s=-0.40\tanh\left(\frac{-t_s}{0.40}\right),\qquad t_s<0.
 ```bash
 export OMP_NUM_THREADS=1
 
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-BASELINE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-EXPORT=/root/autodl-tmp/paper_exports/refine_v311_seed0
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+BASELINE=/workspace/workdir/yolo11_obb_640_811_baseline/weights/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+EXPORT=/workspace/workdir/paper_exports/refine_v311_seed0
 
 python -m pytest -q tests/V3 tests/V3_1 tests/V3_1_1
 
@@ -124,7 +124,7 @@ python -m myscripts.V3_1_1.audit_reproductions_v311 \
 完成后下载整个目录：
 
 ```text
-/root/autodl-tmp/paper_exports/refine_v311_seed0
+/workspace/workdir/paper_exports/refine_v311_seed0
 ```
 
 ## 5. 内部范围锚点（不得写入论文）
@@ -137,7 +137,7 @@ python -m myscripts.V3_1_1.audit_reproductions_v311 \
 ## 6. 论文方法冻结锚点（2026-08-07）
 
 - 当前方法结构冻结为 `Coverage-Aware Assignment + reg_max=32 + proposal-level geometry refine`。
-- 正式论文结果固定采用独立验证的 FP32、batch=8、`imgsz=640` 口径；CA 权重固定为 `/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt`。
+- 正式论文结果固定采用独立验证的 FP32、batch=8、`imgsz=640` 口径；CA 权重固定为 `/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt`。
 - 现有证据已经足以进入小论文写作：coarse/identity 完全恒等，CA 哈希不变，mAP50-95 为 `0.454137→0.562504`，AP75 为 `0.439822→0.558800`，匹配 proposal 平均 IoU 增量为 `+0.046647`。
 - AP95 为 `0.099024→0.097174`，且当前仅有 seed0；论文采用“在当前固定实验设置下取得明确正向改善”的保守表述，不声称统计显著性。
 - 后续只补统一 Baseline、H1/H2、复杂度、定性结果和必要的多种子复验。这些属于证据补全，不再因小幅数值波动触发 Refine 结构迭代。
@@ -149,11 +149,11 @@ python -m myscripts.V3_1_1.audit_reproductions_v311 \
 ```bash
 export OMP_NUM_THREADS=1
 
-BASELINE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-REFINE=/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-IVC_EXPORT=/root/autodl-tmp/paper_exports/ivc_evidence
+BASELINE=/workspace/workdir/yolo11_obb_640_811_baseline/weights/best.pt
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+REFINE=/workspace/workdir/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+IVC_EXPORT=/workspace/workdir/paper_exports/ivc_evidence
 ```
 
 ### 7.1 完整 detector + NMS + Refine 性能采集
@@ -243,7 +243,7 @@ python -m myscripts.paper_visuals.generate_fig6_qualitative `
 再在云端采集。这样旧 commit 的结果不能通过 `--resume` 混入新证据包。
 
 ```bash
-cd /root/Myultralytics
+cd /workspace/code
 export OMP_NUM_THREADS=1
 
 python -m myscripts.V3_1_1.collect_ivc_evidence
@@ -252,20 +252,20 @@ python -m myscripts.V3_1_1.collect_ivc_evidence
 默认固定使用：
 
 ```text
-Baseline: /root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt
-CA:       /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-Refine:   /root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
-Data:     /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
+Baseline: /workspace/workdir/yolo11_obb_640_811_baseline/weights/best.pt
+CA:       /workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+Refine:   /workspace/workdir/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
+Data:     /workspace/datasets/TTPLA-640-811/dataset.yaml
 ```
 
 未传 `--output-dir` 时会创建
-`/root/autodl-tmp/paper_exports/ivc_evidence_YYYYMMDD_HHMMSS`。每个子任务的
+`/workspace/workdir/paper_exports/ivc_evidence_YYYYMMDD_HHMMSS`。每个子任务的
 标准输出单独写入 `logs/`，`run_state.json` 保存命令、用时、返回码和阶段状态。
 若任务中断，使用控制台最后打印的目录继续：
 
 ```bash
 python -m myscripts.V3_1_1.collect_ivc_evidence \
-  --output-dir /root/autodl-tmp/paper_exports/ivc_evidence_YYYYMMDD_HHMMSS \
+  --output-dir /workspace/workdir/paper_exports/ivc_evidence_YYYYMMDD_HHMMSS \
   --resume
 ```
 

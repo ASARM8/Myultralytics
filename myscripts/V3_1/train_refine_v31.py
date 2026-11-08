@@ -11,7 +11,7 @@ from typing import Any
 from myscripts.V3.train_refine_v3 import focal_binary_loss, write_csv, write_json
 
 
-CANONICAL_CA_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt"
+CANONICAL_CA_WEIGHTS = "/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt"
 EXPERIMENTS = ("geometry_only", "quality_aux")
 
 

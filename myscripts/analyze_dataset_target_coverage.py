@@ -21,10 +21,10 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 DEFAULT_DATASETS = [
-    ("TTPLA-1024", "E:/WorkPlace/my-autodl-mmdet/dataset/TTPLA/sliced_claude/dataset.yaml"),
-    ("TTPLA-640", "E:/WorkPlace/my-autodl-mmdet/dataset/TTPLA/sliced_640/dataset.yaml"),
+    ("TTPLA-1024", "/workspace/datasets/TTPLA-1024/dataset.yaml"),
+    ("TTPLA-640", "/workspace/datasets/TTPLA-640-811/dataset.yaml"),
 ]
-DEFAULT_OUTPUT_DIR = "E:/WorkPlace/my-autodl-mmdet/dataset/TTPLA/640-1024-compare_results"
+DEFAULT_OUTPUT_DIR = "/workspace/workdir/640-1024-compare_results"
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 LONG_EDGE_BINS = [0, 32, 64, 128, 256, 512, float("inf")]
 SHORT_EDGE_BINS = [0, 4, 8, 12, 16, 32, 64, float("inf")]

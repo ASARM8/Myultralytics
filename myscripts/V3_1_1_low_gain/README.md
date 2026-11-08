@@ -34,10 +34,10 @@ scaled_residual = residual_scale × checkpoint_residual
 ```bash
 export OMP_NUM_THREADS=1
 
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-REFINE=/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
-EXPORT=/root/autodl-tmp/paper_exports/refine_v311_low_gain
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+REFINE=/workspace/workdir/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt
+EXPORT=/workspace/workdir/paper_exports/refine_v311_low_gain
 
 python -m myscripts.V3_1_1_low_gain.sweep_residual_scale_v311 \
   --checkpoint "$REFINE" \
@@ -80,10 +80,10 @@ python -m myscripts.V3_1_1_low_gain.validate_low_gain_v311 \
 export OMP_NUM_THREADS=1
 
 python -m myscripts.V3_1_1_low_gain.collect_low_gain_evidence \
-  --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml \
-  --baseline-weights /root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt \
-  --ca-weights /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt \
-  --checkpoint /root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt \
+  --data /workspace/datasets/TTPLA-640-811/dataset.yaml \
+  --baseline-weights /workspace/workdir/yolo11_obb_640_811_baseline/weights/best.pt \
+  --ca-weights /workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt \
+  --checkpoint /workspace/workdir/paper_exports/refine_v311_seed0/train_geometry_only/checkpoints/best.pt \
   --residual-scale 0.42 \
   --device 0 \
   --workers 8
@@ -93,7 +93,7 @@ python -m myscripts.V3_1_1_low_gain.collect_low_gain_evidence \
 
 ```bash
 python -m myscripts.V3_1_1_low_gain.collect_low_gain_evidence \
-  --output-dir /root/autodl-tmp/paper_exports/ivc_low_gain_evidence_YYYYMMDD_HHMMSS \
+  --output-dir /workspace/workdir/paper_exports/ivc_low_gain_evidence_YYYYMMDD_HHMMSS \
   --resume
 ```
 

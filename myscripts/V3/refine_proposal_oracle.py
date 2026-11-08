@@ -31,7 +31,7 @@ VARIANTS = (
     "postnms_oracle_scale_center",
     "postnms_oracle_full_geometry",
 )
-CANONICAL_CA_WEIGHTS = Path("/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt")
+CANONICAL_CA_WEIGHTS = Path("/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt")
 
 
 def parse_iou_thresholds(value: str) -> tuple[float, ...]:

@@ -5,7 +5,7 @@
 - 纯 CA 权重固定为：
 
   ```text
-  /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
+  /workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
   ```
 
 - 输入固定为 `imgsz=640`。
@@ -33,9 +33,9 @@
 
 ```bash
 export OMP_NUM_THREADS=1
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-EXPORT=/root/autodl-tmp/paper_exports/refine_v3_seed0_01
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+EXPORT=/workspace/workdir/paper_exports/refine_v3_seed0_01
 
 python -m pytest -q \
   tests/V3/test_refine_proposal_oracle.py \
@@ -68,9 +68,9 @@ python -m myscripts.V3.smoke_refine_v3 \
 旧 D1 显式使用 `proposal_conf=0.001`，而当前仓库 OBB 验证默认使用 `0.01`，因此得到的 standard CA mAP50-95=0.421885 不能与训练记录的 0.45413 直接比较。修正版统一为 `0.01`、增加预期基线硬检查，并同时输出 V3 实际处理对象（post-NMS proposal）的 oracle。
 
 ```bash
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-EXPORT=/root/autodl-tmp/paper_exports/refine_v3_seed0_01
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+EXPORT=/workspace/workdir/paper_exports/refine_v3_seed0_01
 
 python -m myscripts.V3.refine_proposal_oracle \
   --weights "$BASE" \

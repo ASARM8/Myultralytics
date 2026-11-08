@@ -13,8 +13,8 @@ from pathlib import Path
 from typing import Any
 
 
-CANONICAL_BASELINE_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_baseline/weights/best.pt"
-CANONICAL_CA_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt"
+CANONICAL_BASELINE_WEIGHTS = "/workspace/workdir/yolo11_obb_640_811_baseline/weights/best.pt"
+CANONICAL_CA_WEIGHTS = "/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt"
 REQUIRED_ARCHITECTURE = "OBBProposalRefinerV311"
 
 

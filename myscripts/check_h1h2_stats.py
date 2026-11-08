@@ -8,8 +8,8 @@ DFL 回归截断 & 正样本层级分配 验证统计脚本 (H1 + H2)
 正式统计推荐直接加载对应方法的完整 checkpoint，例如：
   python myscripts/check_h1h2_stats.py \
     --method ca-refine \
-    --model /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca_refine_scratch/weights/best.pt \
-    --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
+    --model /workspace/workdir/yolo11_obb_640_811_ca_refine_scratch/weights/best.pt \
+    --data /workspace/datasets/TTPLA-640-811/dataset.yaml
 
 原始模型、CA和CA-Refine必须分别使用自己的checkpoint运行，不能把一种结构的
 YAML与另一种结构的权重做参数交集后作为正式统计结果。

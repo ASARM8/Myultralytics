@@ -4,7 +4,7 @@
 
 - 使用原有数据划分，不重新划分数据集。
 - CA 权重固定为
-  `/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt`。
+  `/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt`。
 - 图像尺寸固定为 640。
 - CA 始终处于 `eval()` 且参数冻结；优化器只接收 V3.1 参数。
 - V3.1 对全部 CA 后 NMS proposal 进行一次精修，不使用推理质量门控，不执行第二次 NMS。
@@ -29,9 +29,9 @@
 ```bash
 export OMP_NUM_THREADS=1
 
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-EXPORT=/root/autodl-tmp/paper_exports/refine_v31_seed0
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+EXPORT=/workspace/workdir/paper_exports/refine_v31_seed0
 
 python -m myscripts.V3_1.smoke_refine_v31 \
   --experiment geometry_only \

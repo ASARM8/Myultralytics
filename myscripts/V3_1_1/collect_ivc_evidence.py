@@ -35,13 +35,13 @@ from myscripts.V3_1_1.profile_refine_v311 import OFFICIAL_WARMUP_PASSES, PROFILE
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CANONICAL_DATA = "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml"
+CANONICAL_DATA = "/workspace/datasets/TTPLA-640-811/dataset.yaml"
 CANONICAL_REFINE = (
-    "/root/autodl-tmp/paper_exports/refine_v311_seed0/"
+    "/workspace/workdir/paper_exports/refine_v311_seed0/"
     "train_geometry_only/checkpoints/best.pt"
 )
-CANONICAL_TRAINING_DIR = "/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only"
-DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/paper_exports"
+CANONICAL_TRAINING_DIR = "/workspace/workdir/paper_exports/refine_v311_seed0/train_geometry_only"
+DEFAULT_OUTPUT_ROOT = "/workspace/workdir/paper_exports"
 EVIDENCE_PROTOCOL_VERSION = PROFILE_PROTOCOL_VERSION
 
 
@@ -70,7 +70,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="省略时在 /root/autodl-tmp/paper_exports 下创建带时间戳的新目录。",
+        help="省略时在 /workspace/workdir/paper_exports 下创建带时间戳的新目录。",
     )
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=8)

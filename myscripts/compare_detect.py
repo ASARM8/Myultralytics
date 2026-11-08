@@ -34,19 +34,19 @@ from ultralytics import YOLO
 CONFIG = {
     # ---------- 模型配置 ----------
     # 模型 A（例如原版 reg_max=16）
-    "model_a": "/root/autodl-tmp/work-dirs/yolo11_obb-v2.1full/weights/best.pt",
+    "model_a": "/workspace/workdir/yolo11_obb-v2.1full/weights/best.pt",
     "label_a": "Baseline (reg_max=16)",
 
     # 模型 B（例如 CA 版 reg_max=32 + Coverage-Aware）
-    "model_b": "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt",
+    "model_b": "/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt",
     "label_b": "CA (reg_max=32)",
 
     # ---------- 数据配置 ----------
     # 图片目录或单张图片路径
-    "image_dir": "/root/autodl-tmp/dataset/TTPLA-1024/images/val",
+    "image_dir": "/workspace/datasets/TTPLA-1024/images/val",
     # GT 标注目录（与图片同名 .txt，YOLO OBB 格式）
     # 留空则不绘制 GT
-    "gt_label_dir": "/root/autodl-tmp/dataset/TTPLA-1024/labels/val",
+    "gt_label_dir": "/workspace/datasets/TTPLA-1024/labels/val",
     # 类别名称
     "class_names": ["cable"],
 
@@ -57,7 +57,7 @@ CONFIG = {
     "device": 0,                # GPU 设备
 
     # ---------- 输出配置 ----------
-    "output_dir": "/root/autodl-tmp/work-dirs/compare_detect_output",
+    "output_dir": "/workspace/workdir/compare_detect_output",
     "max_images": 20,           # 最多处理图片数（0=全部）
     "line_width": 2,            # 检测框线宽
     "font_scale": 0.6,          # 字体大小

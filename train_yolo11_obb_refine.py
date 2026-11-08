@@ -70,8 +70,8 @@ REFINE_EXPERIMENT_CONFIGS = {
 }
 REFINE_EXPERIMENTS = tuple(REFINE_EXPERIMENT_CONFIGS)
 
-VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
-RESUME_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/epoch290.pt"
+VAL_WEIGHTS = f"/workspace/workdir/{RUN_NAME}/weights/best.pt"
+RESUME_WEIGHTS = f"/workspace/workdir/{RUN_NAME}/weights/epoch290.pt"
 RESUME_TOTAL_EPOCHS = 400
 RESUME_LR0 = 5e-6
 RESUME_LRF = 1.0
@@ -84,7 +84,7 @@ CONFIG = {
     "model": MODEL_YAML,
 
     # ---------- 数据集配置 ----------
-    "data": "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml",
+    "data": "/workspace/datasets/TTPLA-640-811/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,
@@ -95,7 +95,7 @@ CONFIG = {
     "patience": 0,
 
     # ---------- 输出目录配置 ----------
-    "project": "/root/autodl-tmp/work-dirs",
+    "project": "/workspace/workdir",
     "name": RUN_NAME,
     "exist_ok": False,
 

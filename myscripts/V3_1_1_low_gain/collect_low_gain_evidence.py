@@ -19,9 +19,9 @@ from myscripts.V3_1_1_low_gain.config import DEFAULT_RESIDUAL_SCALE
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CANONICAL_DATA = "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml"
+CANONICAL_DATA = "/workspace/datasets/TTPLA-640-811/dataset.yaml"
 CANONICAL_REFINE = (
-    "/root/autodl-tmp/paper_exports/refine_v311_seed0/"
+    "/workspace/workdir/paper_exports/refine_v311_seed0/"
     "train_geometry_only/checkpoints/best.pt"
 )
 PROTOCOL_VERSION = 1
@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument(
         "--output-dir",
-        default=f"/root/autodl-tmp/paper_exports/ivc_low_gain_evidence_{timestamp}",
+        default=f"/workspace/workdir/paper_exports/ivc_low_gain_evidence_{timestamp}",
     )
     return parser
 

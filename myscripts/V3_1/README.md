@@ -31,12 +31,12 @@ V3.1 等预算结果表明两个版本均因短边边界比例超过 10% 而未�
 ```bash
 export OMP_NUM_THREADS=1
 
-BASE=/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt
-DATA=/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml
-V3_EXPORT=/root/autodl-tmp/paper_exports/refine_v3_seed0_01
+BASE=/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt
+DATA=/workspace/datasets/TTPLA-640-811/dataset.yaml
+V3_EXPORT=/workspace/workdir/paper_exports/refine_v3_seed0_01
 V3_RUN=$V3_EXPORT/train_seed0_scale_only
 CHECKPOINT=$V3_RUN/checkpoints/best.pt
-V31_EXPORT=/root/autodl-tmp/paper_exports/refine_v31_prefreeze_seed0
+V31_EXPORT=/workspace/workdir/paper_exports/refine_v31_prefreeze_seed0
 ```
 
 - 纯 CA 路径必须使用上面的 canonical 路径；
@@ -156,7 +156,7 @@ python -m myscripts.V3_1.summarize_prefreeze_v31 \
 下载整个目录：
 
 ```text
-/root/autodl-tmp/paper_exports/refine_v31_prefreeze_seed0
+/workspace/workdir/paper_exports/refine_v31_prefreeze_seed0
 ```
 
 必须至少包含：
