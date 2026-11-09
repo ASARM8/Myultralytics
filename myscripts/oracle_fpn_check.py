@@ -41,11 +41,11 @@ from diag_val import (
 # ========================== 配置 ==========================
 CONFIG = {
     # ---------- 模型 ----------
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb_sp_ca/weights/best.pt",
+    "model": "/workspace/workdir/yolo11_obb_sp_ca/weights/best.pt",
     "model_label": "CA (reg_max=32)",
 
     # ---------- 数据集 ----------
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/workspace/datasets/TTPLA-1024/dataset.yaml",
 
     # ---------- 推理参数 ----------
     "conf": 0.001,
@@ -55,7 +55,7 @@ CONFIG = {
     "max_det": 1000,
 
     # ---------- 输出 ----------
-    "output_dir": "/root/autodl-tmp/work-dirs/oracle_fpn_check_sp_ca",
+    "output_dir": "/workspace/workdir/oracle_fpn_check_sp_ca",
 }
 
 # 排查用 IoU 阈值

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 
-CANONICAL_CA_WEIGHTS = "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt"
+CANONICAL_CA_WEIGHTS = "/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt"
 
 
 def parse_thresholds(value: str) -> tuple[float, ...]:

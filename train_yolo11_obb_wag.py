@@ -93,10 +93,10 @@ class Logger(object):
 CONFIG = {
     # ---------- 模型配置 ----------
     # CA 预训练权重 (reg_max=32 + Coverage-Aware TAL)
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt",
+    "model": "/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt",
 
     # ---------- 数据集配置 ----------
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/workspace/datasets/TTPLA-1024/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 150,              # 训练总轮数
@@ -106,7 +106,7 @@ CONFIG = {
     "workers": 16,              # 数据加载线程数
 
     # ---------- 输出目录配置 ----------
-    "project": "/root/autodl-tmp/work-dirs",
+    "project": "/workspace/workdir",
     "name": "yolo11_obb-ca-wag",        # WAG = Width-Aware Geometric
     "exist_ok": False,
 

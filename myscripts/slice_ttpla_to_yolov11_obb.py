@@ -35,8 +35,7 @@ def parse_csv_set(raw: str) -> Set[str]:
 
 
 def parse_args() -> argparse.Namespace:
-    script_dir = Path(__file__).resolve().parent
-    ttpla_root = script_dir.parent
+    ttpla_root = Path("/workspace/datasets")
 
     parser = argparse.ArgumentParser(
         description=(
@@ -59,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=script_dir,
+        default=ttpla_root / "TTPLA-1024",
         help="Output root folder (will create train/val/test subfolders)",
     )
     parser.add_argument(

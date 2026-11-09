@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 
-CANONICAL_CA_WEIGHTS = Path("/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt")
+CANONICAL_CA_WEIGHTS = Path("/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt")
 TARGET_NAMES = ("dshort", "dlong", "dcenter_long", "dcenter_short")
 STATE_NAMES = (
     "confidence",

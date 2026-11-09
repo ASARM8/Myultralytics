@@ -12,6 +12,7 @@ import re
 os.environ["OMP_NUM_THREADS"] = "8"  # 修复 libgomp 警告
 
 import torch
+from myscripts.workspace_ttpla import SERVER_DATA_YAML, prepare_detector_yaml
 from ultralytics import YOLO
 from ultralytics.utils.torch_utils import intersect_dicts
 
@@ -96,18 +97,18 @@ CONFIG = {
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
-    "data": "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml",
+    "data": str(SERVER_DATA_YAML),
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,              # 训练总轮数
     "batch": 16,                # 批次大小
     "imgsz": 640,              # 输入图片尺寸
-    "device": 0,                # GPU 设备编号
+    "device": int(os.environ.get("GPU_ID", "0")),  # GPU 设备编号
     "workers": 16,               # 数据加载线程数（5090 性能强，可用更多线程）
     "patience": 0,
 
     # ---------- 输出目录配置 ----------
-    "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
+    "project": "/workspace/workdir",          # 输出主目录
     "name": "yolo11_obb_640_811_ca",        # 实验名称（子目录）
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 
@@ -163,6 +164,8 @@ CONFIG = {
 
 def main():
     """主训练函数"""
+    if CONFIG["data"] == str(SERVER_DATA_YAML):
+        CONFIG["data"] = str(prepare_detector_yaml())
     # --- 拦截控制台输出（暂存在内存） ---
     sys.stdout = Logger(sys.stdout)
     sys.stderr = Logger(sys.stderr)

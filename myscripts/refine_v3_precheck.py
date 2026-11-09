@@ -12,12 +12,12 @@ checkpoint.  Probes are fitted on ``train`` and evaluated once on ``val``.
 
 Example:
     python -m myscripts.refine_v3_precheck \
-      --ca-weights /root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt \
-      --refine-weights /root/autodl-tmp/work-dirs/REFINE_V22/weights/epoch0.pt \
-      --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml \
+      --ca-weights /workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt \
+      --refine-weights /workspace/workdir/REFINE_V22/weights/epoch0.pt \
+      --data /workspace/datasets/TTPLA-640-811/dataset.yaml \
       --imgsz 640 --batch 8 --device 0 --workers 8 \
       --train-split train --eval-split val \
-      --output-dir /root/autodl-tmp/paper_exports/refine_v3_precheck
+      --output-dir /workspace/workdir/paper_exports/refine_v3_precheck
 """
 
 from __future__ import annotations

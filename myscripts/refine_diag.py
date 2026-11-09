@@ -7,11 +7,11 @@ coupling. Use ``collect_refine_ab_curve.py`` for full-dataset metric controls.
 
 Example:
     python myscripts/refine_diag.py \
-        --weights /root/autodl-tmp/work-dirs/exp/weights/best.pt \
-        --data /root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml \
+        --weights /workspace/workdir/exp/weights/best.pt \
+        --data /workspace/datasets/TTPLA-640-811/dataset.yaml \
         --imgsz 640 --split val --batch 8 --device 0 --workers 8 \
         --max-batches 50 \
-        --output-dir /root/autodl-tmp/paper_exports/refine_diag_best
+        --output-dir /workspace/workdir/paper_exports/refine_diag_best
 """
 
 from __future__ import annotations

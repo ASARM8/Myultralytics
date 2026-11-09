@@ -16,13 +16,14 @@ from dataclasses import dataclass
 
 from myscripts.V3_1_1.evidence_runtime import CANONICAL_BASELINE_WEIGHTS, CANONICAL_CA_WEIGHTS
 from myscripts.V3_1_1_low_gain.config import DEFAULT_RESIDUAL_SCALE
+from myscripts.workspace_ttpla import SERVER_DATA_YAML, prepare_detector_yaml, refine_training_dir
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CANONICAL_DATA = "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml"
+CANONICAL_DATA = str(SERVER_DATA_YAML)
 CANONICAL_REFINE = (
-    "/root/autodl-tmp/paper_exports/refine_v311_seed0/"
-    "train_geometry_only/checkpoints/best.pt"
+    "/workspace/workdir/refine_v311_ca_seed0/"
+    "checkpoints/best.pt"
 )
 PROTOCOL_VERSION = 1
 
@@ -64,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-dirty", action="store_true")
     parser.add_argument(
         "--output-dir",
-        default=f"/root/autodl-tmp/paper_exports/ivc_low_gain_evidence_{timestamp}",
+        default=f"/workspace/workdir/paper_exports/ivc_low_gain_evidence_{timestamp}",
     )
     return parser
 
@@ -373,6 +374,10 @@ def _finalize(args: argparse.Namespace, output_dir: Path, state: dict) -> None:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if args.checkpoint == CANONICAL_REFINE:
+        args.checkpoint = str(refine_training_dir() / "checkpoints/best.pt")
+    if args.data == CANONICAL_DATA:
+        args.data = str(prepare_detector_yaml())
     validate_args(parser, args)
     if not args.allow_dirty:
         dirty = subprocess.run(

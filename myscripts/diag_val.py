@@ -34,11 +34,11 @@ from ultralytics.utils.metrics import batch_probiou
 # ========================== 配置 ==========================
 CONFIG = {
     # ---------- 模型 ----------
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb_640_811_ca/weights/best.pt",
+    "model": "/workspace/workdir/yolo11_obb_640_811_ca/weights/best.pt",
     "model_label": "CA (reg_max=32)",  # 报告中显示的模型名
 
     # ---------- 数据集 ----------
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/workspace/datasets/TTPLA-1024/dataset.yaml",
 
     # ---------- 推理参数 ----------
     "conf": 0.001,              # 极低置信度以获得完整 P-R 曲线
@@ -48,7 +48,7 @@ CONFIG = {
     "max_det": 1000,            # 每张图最大检测数
 
     # ---------- 输出 ----------
-    "output_dir": "/root/autodl-tmp/work-dirs/diag_val_output",
+    "output_dir": "/workspace/workdir/diag_val_output",
 }
 
 # ========================== 分析参数 ==========================

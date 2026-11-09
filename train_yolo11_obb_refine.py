@@ -28,6 +28,7 @@ from pathlib import Path
 os.environ.setdefault("OMP_NUM_THREADS", "8")
 
 import torch
+from myscripts.workspace_ttpla import SERVER_DATA_YAML, prepare_detector_yaml
 from ultralytics import YOLO
 from ultralytics.utils.logger import ConsoleLogger
 from ultralytics.utils.torch_utils import unwrap_model
@@ -70,8 +71,8 @@ REFINE_EXPERIMENT_CONFIGS = {
 }
 REFINE_EXPERIMENTS = tuple(REFINE_EXPERIMENT_CONFIGS)
 
-VAL_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/best.pt"
-RESUME_WEIGHTS = f"/root/autodl-tmp/work-dirs/{RUN_NAME}/weights/epoch290.pt"
+VAL_WEIGHTS = f"/workspace/workdir/{RUN_NAME}/weights/best.pt"
+RESUME_WEIGHTS = f"/workspace/workdir/{RUN_NAME}/weights/epoch290.pt"
 RESUME_TOTAL_EPOCHS = 400
 RESUME_LR0 = 5e-6
 RESUME_LRF = 1.0
@@ -84,7 +85,7 @@ CONFIG = {
     "model": MODEL_YAML,
 
     # ---------- 数据集配置 ----------
-    "data": "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml",
+    "data": str(SERVER_DATA_YAML),
 
     # ---------- 训练基本参数 ----------
     "epochs": 300,
@@ -95,7 +96,7 @@ CONFIG = {
     "patience": 0,
 
     # ---------- 输出目录配置 ----------
-    "project": "/root/autodl-tmp/work-dirs",
+    "project": "/workspace/workdir",
     "name": RUN_NAME,
     "exist_ok": False,
 
@@ -734,6 +735,8 @@ def main(
 
 if __name__ == "__main__":
     cli_args = parse_args()
+    if cli_args.data == str(SERVER_DATA_YAML):
+        cli_args.data = str(prepare_detector_yaml())
     if cli_args.mode == "val_ab":
         run_val_ab(cli_args)
     elif cli_args.mode == "refine_only":
@@ -785,4 +788,4 @@ if __name__ == "__main__":
             },
         )
     else:
-        main()
+        main(train_overrides={"data": cli_args.data})

@@ -19,9 +19,9 @@ from wag_diag_patch import apply_wag_diag_patch, save_diag_results, print_diag_s
 
 CONFIG = {
     # 使用 WAG 训练的最新权重，或 CA best.pt
-    "model": "/root/autodl-tmp/work-dirs/yolo11_obb-ca-wag/weights/last.pt",
+    "model": "/workspace/workdir/yolo11_obb-ca-wag/weights/last.pt",
 
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/workspace/datasets/TTPLA-1024/dataset.yaml",
 
     # 只跑 2 个 epoch 做诊断
     "epochs": 2,
@@ -30,7 +30,7 @@ CONFIG = {
     "device": 0,
     "workers": 16,
 
-    "project": "/root/autodl-tmp/work-dirs",
+    "project": "/workspace/workdir",
     "name": "wag_diag",
     "exist_ok": False,
 

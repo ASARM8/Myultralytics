@@ -106,11 +106,11 @@ CONFIG = {
     # ---------- 迁移学习配置 ----------
     # 指定已有权重路径，用于迁移训练（留空或注释掉则从零训练）
     # StripPooling 层在已有权重中不存在，会自动随机初始化（零初始化保证平稳过渡）
-    "pretrained_weights": "/root/autodl-tmp/work-dirs/yolo11_obb-v2.1full/weights/best.pt",
+    "pretrained_weights": "/workspace/workdir/yolo11_obb-v2.1full/weights/best.pt",
 
     # ---------- 数据集配置 ----------
     # 指向你的自定义数据集 yaml 文件
-    "data": "/root/autodl-tmp/dataset/TTPLA-1024/dataset.yaml",
+    "data": "/workspace/datasets/TTPLA-1024/dataset.yaml",
 
     # ---------- 训练基本参数 ----------
     "epochs": 150,              # 迁移训练建议 100~150 轮（主干已成熟，不需要 300 轮）
@@ -120,7 +120,7 @@ CONFIG = {
     "workers": 16,              # 数据加载线程数
 
     # ---------- 输出目录配置 ----------
-    "project": "/root/autodl-tmp/work-dirs",          # 输出主目录
+    "project": "/workspace/workdir",          # 输出主目录
     "name": "yolo11_obb_sp_ca",    # 实验名称（子目录）—— 区分于原版和 CA 版
     "exist_ok": False,                      # 是否允许覆盖已有同名目录
 

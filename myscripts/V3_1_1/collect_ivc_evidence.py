@@ -31,17 +31,18 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from myscripts.V3_1_1.evidence_runtime import CANONICAL_BASELINE_WEIGHTS, CANONICAL_CA_WEIGHTS
+from myscripts.workspace_ttpla import SERVER_DATA_YAML, prepare_detector_yaml, refine_training_dir
 from myscripts.V3_1_1.profile_refine_v311 import OFFICIAL_WARMUP_PASSES, PROFILE_PROTOCOL_VERSION
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CANONICAL_DATA = "/root/autodl-tmp/datasets/TTPLA-640-811/dataset.yaml"
+CANONICAL_DATA = str(SERVER_DATA_YAML)
 CANONICAL_REFINE = (
-    "/root/autodl-tmp/paper_exports/refine_v311_seed0/"
-    "train_geometry_only/checkpoints/best.pt"
+    "/workspace/workdir/refine_v311_ca_seed0/"
+    "checkpoints/best.pt"
 )
-CANONICAL_TRAINING_DIR = "/root/autodl-tmp/paper_exports/refine_v311_seed0/train_geometry_only"
-DEFAULT_OUTPUT_ROOT = "/root/autodl-tmp/paper_exports"
+CANONICAL_TRAINING_DIR = "/workspace/workdir/refine_v311_ca_seed0"
+DEFAULT_OUTPUT_ROOT = "/workspace/workdir/paper_exports"
 EVIDENCE_PROTOCOL_VERSION = PROFILE_PROTOCOL_VERSION
 
 
@@ -70,7 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         default=None,
-        help="省略时在 /root/autodl-tmp/paper_exports 下创建带时间戳的新目录。",
+        help="省略时在 /workspace/workdir/paper_exports 下创建带时间戳的新目录。",
     )
     parser.add_argument("--device", default="0")
     parser.add_argument("--workers", type=int, default=8)
@@ -1010,6 +1011,12 @@ def create_archive(output_dir: Path) -> Path:
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.checkpoint == CANONICAL_REFINE:
+        args.checkpoint = str(refine_training_dir() / "checkpoints/best.pt")
+    if args.training_dir == CANONICAL_TRAINING_DIR:
+        args.training_dir = str(Path(args.checkpoint).parent.parent)
+    if args.data == CANONICAL_DATA:
+        args.data = str(prepare_detector_yaml())
     validate_args(parser, args)
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["PYTHONHASHSEED"] = "0"
