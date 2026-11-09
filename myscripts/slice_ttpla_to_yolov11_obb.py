@@ -641,7 +641,7 @@ def process_single_json(
             yolo_lines: List[str] = []
             tile_shapes: List[Dict[str, object]] = []
 
-            for original_label, poly, bounds in wire_polygons:
+            for polygon_index, (original_label, poly, bounds) in enumerate(wire_polygons):
                 minx, miny, maxx, maxy = bounds
                 if maxx <= x or minx >= x + tile_size:
                     continue
@@ -672,6 +672,8 @@ def process_single_json(
                     tile_shapes.append(
                         {
                             "label": original_label,
+                            # Clipping a curved wire can leave multiple pieces in one tile.
+                            "group_id": polygon_index,
                             "points": local_points,
                             "shape_type": "polygon",
                             "flags": {},
