@@ -45,6 +45,12 @@ def parser():
         cmd.add_argument("--output", required=name != "audit", help="Report, model checkpoint or prediction folder")
         if name == "train":
             cmd.add_argument("--prompt", choices=("target", "points", "boxes", "axes"), default="axes")
+            cmd.add_argument("--batch-size", type=int, default=1, help="Maximum proposals per optimizer update")
+            cmd.add_argument("--max-batch-pixels", type=int, default=2097152,
+                             help="Maximum padded crop pixels per batch; a larger single crop runs alone")
+            cmd.add_argument("--workers", type=int, default=0, help="CPU processes preparing native-resolution crops")
+            cmd.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False,
+                             help="CUDA mixed precision, preferring BF16 on supported GPUs")
             cmd.add_argument("--epochs", type=int, default=15)
             cmd.add_argument("--lr", type=float, default=0.0003)
             cmd.add_argument("--seed", type=int, default=0)
@@ -79,6 +85,8 @@ def main(argv=None):
         if args.output:
             save_json(args.output, report)
     elif args.command == "train":
+        if args.batch_size < 1 or args.max_batch_pixels < 1 or args.workers < 0:
+            cli.error("--batch-size and --max-batch-pixels must be positive; --workers must be nonnegative")
         if args.epochs < 1 or not (math.isfinite(args.lr) and args.lr > 0):
             cli.error("--epochs and --lr must be positive")
         from myscripts.wire_seg.learning import train

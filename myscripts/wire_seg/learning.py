@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import random
 import tempfile
+from time import monotonic
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .data import WireTiles, example, near_parallel, source_groups
+from .batching import InstanceBatches, WireBatchDataset
 from .proposals import save_json
 
 
@@ -27,46 +29,125 @@ class WireMaskHead(nn.Sequential):
         layers.append(nn.Conv2d(24, 1, 1))
         super().__init__(*layers)
 
+    def forward(self, x, extent=None):
+        if extent is None:
+            return super().forward(x)
+        # GroupNorm must see the original crop only. Clear its padded border
+        # after every block so the next dilation sees the usual zero boundary.
+        pixels = extent.sum((2, 3), dtype=torch.float32)
+        for offset in range(0, len(self) - 1, 3):
+            x = self[offset](x)
+            norm = self[offset + 1]
+            n, c, h, w = x.shape
+            group = x.float().reshape(n, norm.num_groups, c // norm.num_groups, h, w)
+            keep = extent[:, :, None]
+            denom = pixels * (c // norm.num_groups)
+            mean = (group * keep).sum((2, 3, 4)) / denom
+            centered = (group - mean[:, :, None, None, None]) * keep
+            var = centered.square().sum((2, 3, 4)) / denom
+            normalized = (centered * torch.rsqrt(var + norm.eps)[:, :, None, None, None]).reshape_as(x)
+            affine = normalized * norm.weight[None, :, None, None] + norm.bias[None, :, None, None]
+            x = self[offset + 2](affine.to(x.dtype)) * extent
+        return self[-1](x)
+
 
 def plane(array, device):
     return torch.from_numpy(array).unsqueeze(0).to(device)
 
 
+class TileProgress:
+    """Flush a line on the first tile, every 15 seconds, and on completion."""
+
+    def __init__(self, total, unit="tiles"):
+        self.total = total
+        self.unit = unit
+        self.started = self.last_log = monotonic()
+        self.first = True
+
+    def update(self, done, label, detail=""):
+        now = monotonic()
+        if not self.first and done != self.total and now - self.last_log < 15:
+            return
+        self.first = False
+        self.last_log = now
+        elapsed = max(now - self.started, 1e-6)
+        rate = done / elapsed
+        hours, remainder = divmod(round((self.total - done) / rate), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        print(f"{label} | {self.unit} {done}/{self.total} ({100*done/self.total:.1f}%) | "
+              f"{rate:.2f} {self.unit}/s | ETA {hours:02d}:{minutes:02d}:{seconds:02d} {detail}", flush=True)
+
+
+def instance_losses(logits, labels):
+    """One BCE plus foreground-only Dice loss per instance regardless of crop size."""
+    keep = labels >= 0
+    truth = (labels == 1).float()
+    logits = logits.float()
+    bce = F.binary_cross_entropy_with_logits(logits, truth, reduction="none")
+    bce = (bce * keep).sum((1, 2)) / keep.sum((1, 2)).clamp_min(1)
+    prob = logits.sigmoid() * keep
+    area = truth.sum((1, 2))
+    dice = 1 - (2 * (prob * truth).sum((1, 2)) + 1) / (prob.sum((1, 2)) + area + 1)
+    return bce + dice * (area > 0), area > 0
+
+
 def train(args):
+    print(f"[train {args.prompt}] loading proposal cache {args.cache}", flush=True)
     tiles = WireTiles(args)
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     model = WireMaskHead().to(args.device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    device = torch.device(args.device)
+    cuda = device.type == "cuda"
+    amp = args.amp and cuda
+    amp_dtype = torch.float16
+    if amp:
+        with torch.cuda.device(device):
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and amp_dtype == torch.float16)
+    sampler = InstanceBatches(tiles, args)
+    if not sampler.instances:
+        raise ValueError("No cached training proposals")
+    loader = torch.utils.data.DataLoader(
+        WireBatchDataset(tiles, sampler, args), batch_size=None, sampler=sampler,
+        num_workers=args.workers, pin_memory=cuda, persistent_workers=args.workers > 0,
+        prefetch_factor=1 if args.workers else None,
+    )
+    precision = str(amp_dtype) if amp else "float32"
+    print(f"[train {args.prompt}] batch limit {args.batch_size} | workers {args.workers} | "
+          f"pixel budget {args.max_batch_pixels} | {precision}", flush=True)
+    progress = TileProgress(args.epochs * sampler.instances, "proposals")
+    done = 0
+    if cuda:
+        torch.cuda.reset_peak_memory_stats(device)
     for epoch in range(args.epochs):
-        order = list(range(len(tiles.paths)))
-        random.shuffle(order)
+        sampler.epoch = epoch
         loss_sum = count = positives = 0
-        for index in order:
-            image, boxes, _, masks, void, pairs, _ = tiles.read(index)
-            ids = list(range(len(boxes)))
-            random.shuffle(ids)
-            for i in ids:
-                crop, feature = example(image, boxes, i, args.prompt, args.margin)
-                target = masks[pairs[i]] if i in pairs else np.zeros_like(void)
-                # Ignore phantom padding as well as void pixels.
-                valid = np.asarray(crop.crop(Image.fromarray(~void), mask=True)).copy()
-                if not valid.any():
-                    continue
-                truth = np.asarray(crop.crop(Image.fromarray(target), mask=True), dtype=np.float32)
-                keep = plane(valid, args.device)
-                y = plane(truth.copy(), args.device)[keep]
-                pred = model(plane(feature, args.device))[:, 0][keep]
-                loss = F.binary_cross_entropy_with_logits(pred, y)
-                if y.any():
-                    prob = pred.sigmoid()
-                    loss = loss + 1 - (2 * (prob*y).sum() + 1) / (prob.sum() + y.sum() + 1)
-                    positives += 1
-                optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                optimizer.step()
-                count += 1
-                loss_sum += float(loss.detach())
+        print(f"[train {args.prompt}] starting epoch {epoch+1}/{args.epochs}, {len(tiles.paths)} tiles", flush=True)
+        for features, labels, padded, proposed in loader:
+            done += proposed
+            if not len(features):
+                continue
+            features = features.to(device, non_blocking=cuda)
+            labels = labels.to(device, non_blocking=cuda)
+            extent = (labels != -2)[:, None] if padded else None
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp):
+                logits = model(features, extent)[:, 0]
+            losses, foreground = instance_losses(logits, labels)
+            scaler.scale(losses.mean()).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            batch_loss, batch_positives = torch.stack((losses.detach().sum(), foreground.sum())).tolist()
+            positives += int(batch_positives)
+            count += len(features)
+            loss_sum += batch_loss
+            detail = f"| batch {len(features)} | mean loss {loss_sum/count:.5f}"
+            if cuda:
+                detail += f" | peak allocated {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB"
+            progress.update(done, f"[train {args.prompt}] epoch {epoch+1}/{args.epochs}", detail)
         if not positives:
             raise ValueError("No matched foreground pixels in training; check proposal coordinates, polygons and matching")
         print(f"epoch {epoch+1}  instances {count}  positives {positives}  loss {loss_sum/count:.5f}", flush=True)
@@ -77,6 +158,7 @@ def train(args):
         try:
             torch.save({"format": 1, "state": model.state_dict(), "prompt": args.prompt, "margin": args.margin,
                         "boxes": args.boxes, "detector": tiles.provenance, "epoch": epoch+1, "seed": args.seed,
+                        "batch_size": args.batch_size, "max_batch_pixels": args.max_batch_pixels, "precision": precision,
                         "train_sources": sorted({source_groups(p.stem)[0] for p in tiles.paths}),
                         "train_videos": sorted({source_groups(p.stem)[1] for p in tiles.paths})}, name)
             os.replace(name, path)
@@ -129,6 +211,7 @@ class MaskStats:
 @torch.inference_mode()
 def run_masks(args):
     evaluate = args.command == "eval"
+    print(f"[{args.command}] loading {args.weights} and {args.cache}", flush=True)
     checkpoint = torch.load(args.weights, map_location="cpu", weights_only=True)
     if checkpoint["format"] != 1:
         raise ValueError("Unsupported wire mask checkpoint")
@@ -145,6 +228,7 @@ def run_masks(args):
     stats, exposed, parallel = MaskStats(), MaskStats(), MaskStats()
     swap_trials = swap_wins = 0
     detections, results, n_truth = [], {}, 0
+    progress = TileProgress(len(tiles.paths))
     for index, path in enumerate(tiles.paths):
         image, boxes, scores, masks, void, pairs, truth_boxes = tiles.read(index)
         masks = [m & ~void for m in masks]
@@ -206,9 +290,11 @@ def run_masks(args):
                                 return np.count_nonzero(mask & truth) / max(1, np.count_nonzero(mask | truth))
                             swap_trials += 1
                             swap_wins += int(iou(visible, a) > iou(visible, b) and iou(switched, b) > iou(switched, a))
+        progress.update(index + 1, f"[{args.command} {checkpoint['prompt']}]")
     if not evaluate:
         save_json(output / "instances.json", results)
         return
+    print(f"[eval {checkpoint['prompt']}] computing final mask AP for {len(detections)} detections", flush=True)
     ap = mask_ap(detections, n_truth)
     report = {"boxes": args.boxes, "prompt": checkpoint["prompt"], "margin_px": checkpoint["margin"],
               "tiles": len(tiles.paths), "ground_truth_instances": n_truth, "mask_AP_by_IoU": ap,

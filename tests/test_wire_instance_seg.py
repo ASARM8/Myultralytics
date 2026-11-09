@@ -10,12 +10,56 @@ import numpy as np
 from PIL import Image
 
 from myscripts.wire_seg.data import audit
+from myscripts.wire_seg.batching import InstanceBatches
 from myscripts.wire_seg.geometry import WireCrop, annotations, corners, match_boxes, paint, polygon_box
 from myscripts.wire_seg.proposals import save_json
 from train_wire_seg import main, parser
 
 
 class WireGeometryTest(unittest.TestCase):
+    def test_batch_pixel_budget_preserves_all_instances(self):
+        from types import SimpleNamespace
+
+        paths = [Path("a.png"), Path("b.png")]
+        tiles = SimpleNamespace(paths=paths, variant="refined", cache={
+            p.name: {"refined": [[0, 0, w, 3, 0] for w in (20, 30, 50, 500)]} for p in paths})
+        args = SimpleNamespace(margin=4, seed=4, batch_size=3, max_batch_pixels=1000)
+        sampler = InstanceBatches(tiles, args)
+        batches = list(sampler)
+        self.assertEqual(sorted(pair for batch in batches for pair in batch), [(t, i) for t in range(2) for i in range(4)])
+        self.assertEqual(batches, list(sampler))
+        self.assertTrue(any(len(batch) > 1 for batch in batches))
+        for batch in batches:
+            w, h = map(max, zip(*(sampler.sizes[t][i] for t, i in batch)))
+            self.assertLessEqual(len(batch), 3)
+            self.assertTrue(len(batch) == 1 or w * h * len(batch) <= args.max_batch_pixels)
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "Run batched model parity on the server")
+    def test_padded_batch_matches_separate_crops_and_gradients(self):
+        import torch
+        from myscripts.wire_seg.learning import WireMaskHead, instance_losses
+
+        model = WireMaskHead()
+        shapes = [(17, 33), (11, 23)]
+        features = torch.zeros(2, 5, 17, 33)
+        labels = torch.full((2, 17, 33), -2, dtype=torch.int8)
+        separate = []
+        for i, (h, w) in enumerate(shapes):
+            crop = torch.randn(1, 5, h, w)
+            features[i, :, :h, :w] = crop[0]
+            labels[i, :h, :w] = i
+            labels[i, 0, :w] = -1
+            separate.append(model(crop)[:, 0])
+        together = model(features, (labels != -2)[:, None])[:, 0]
+        losses, _ = instance_losses(together, labels)
+        reference = []
+        for i, (h, w) in enumerate(shapes):
+            torch.testing.assert_close(together[i, :h, :w], separate[i][0], atol=1e-5, rtol=1e-4)
+            reference.extend(instance_losses(separate[i], labels[i:i+1, :h, :w])[0].unbind())
+        grad = torch.autograd.grad(losses.mean(), model[0].weight)[0]
+        expected = torch.autograd.grad(torch.stack(reference).mean(), model[0].weight)[0]
+        torch.testing.assert_close(grad, expected, atol=1e-5, rtol=1e-4)
+
     def test_oriented_crop_and_prompt_switch(self):
         boxes = [(40, 40, 50, 3, math.pi/4), (36, 44, 50, 3, math.pi/4)]
         crop = WireCrop(boxes[0], 12)
@@ -81,7 +125,7 @@ class WirePipelineTest(unittest.TestCase):
         from myscripts.wire_seg.learning import mask_ap
         self.assertEqual(mask_ap([(0.9, 0, [(0, 1.0)]), (0.8, 0, [(0, 1.0)])], 2)["50"], 51/101)
         weights = self.root / "mask.pt"
-        main(["train", *self.inputs, "--epochs", "1", "--device", "cpu", "--output", str(weights)])
+        main(["train", *self.inputs, "--epochs", "1", "--batch-size", "2", "--device", "cpu", "--output", str(weights)])
         report = self.root / "eval.json"
         main(["eval", *self.inputs, "--weights", str(weights), "--device", "cpu", "--swap-target", "--output", str(report)])
         metric = json.loads(report.read_text())
