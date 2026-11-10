@@ -12,11 +12,72 @@ from PIL import Image
 from myscripts.wire_seg.data import audit
 from myscripts.wire_seg.batching import InstanceBatches
 from myscripts.wire_seg.geometry import WireCrop, annotations, corners, match_boxes, paint, polygon_box
+from myscripts.wire_seg.paired import evaluate_tile, summarize, validate_geometry
 from myscripts.wire_seg.proposals import save_json
 from train_wire_seg import main, parser
 
 
 class WireGeometryTest(unittest.TestCase):
+    def test_paired_json_round_trip_with_numpy_iou_deltas(self):
+        coarse = {"tile_obb_iou": 0.5, "mask_iou": 0.5, "hits": 1, "covered_target_pixels": 2,
+                  "predicted_pixels": 1, "neighbor_pixels": 0, "swap_success": None}
+        rows = []
+        # All boxes stay identical while the masks change in three different directions.
+        for hits in (2, 1, 0, 0):
+            refined = {**coarse, "hits": hits, "predicted_pixels": hits, "mask_iou": np.float64(hits / 2)}
+            rows.append({"target_pixels": 2, "coarse": coarse, "refined": refined,
+                         "mask_iou_delta": refined["mask_iou"] - coarse["mask_iou"]})
+        report = {"matched": summarize(rows), "empty": summarize([]), "paired_instances": rows}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "paired.json"
+            save_json(path, report)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        expected = {"improved": 1, "unchanged": 1, "worsened": 2}
+        counts = saved["matched"]["iou_change"]
+        self.assertEqual(counts, expected)
+        self.assertTrue(all(type(count) is int for count in counts.values()))
+        self.assertEqual(saved["matched"]["box_iou_change_by_mask_iou_change"]["unchanged"], expected)
+        self.assertEqual(saved["empty"]["iou_change"], dict.fromkeys(expected, 0))
+        self.assertIsNone(saved["empty"]["coarse"]["mean_instance_iou"])
+
+    def test_paired_geometry_keeps_neighbor_when_refined_crop_loses_it(self):
+        size = (60, 42)
+        truth = [[30, 18, 36, 2, 0], [30, 24, 36, 2, 0]]
+        masks = [np.asarray(paint(size, [corners(box)])) > 0 for box in truth]
+        coarse = [[30, y, 36, 16, 0] for y in (18, 24)]
+        refined = [[30, y, 16, 3, 0] for y in (18, 24)]
+        entry = {"coarse": coarse, "refined": refined, "scores": [.9, .8]}
+        validate_geometry(entry, "pair")
+        rows, detections, count = evaluate_tile(
+            Image.new("RGB", size), entry, masks, np.zeros(size[::-1], bool), {0: 0, 1: 1},
+            truth, 0, lambda feature: feature[3] > .9
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual([r["swap_neighbor_proposal_id"] for r in rows], [1, 0])
+        self.assertTrue(all(r["exposed"] and r["near_parallel"] for r in rows))
+        self.assertEqual([s for s, _ in detections["refined"]], [.9, .8])
+        result = summarize(rows)
+        self.assertEqual(result["swap_pairs"], 2)
+        self.assertEqual(result["swap_transitions"]["coarse_only"], 2)
+        self.assertLess(result["refined_minus_coarse"]["target_crop_coverage"], 0)
+        self.assertGreater(result["refined_minus_coarse"]["mean_tile_obb_iou"], 0)
+        self.assertIsNone(summarize([])["refined_minus_coarse"]["mean_instance_iou"])
+        with self.assertRaisesRegex(ValueError, "proposal 0"):
+            validate_geometry({**entry, "refined": refined[::-1]}, "unpaired")
+
+    def test_paired_ap_includes_unmatched_detections_and_missed_truth(self):
+        size = (20, 20)
+        image = Image.new("RGB", size)
+        box = [10, 10, 8, 2, 0]
+        mask = np.asarray(paint(size, [corners(box)])) > 0
+        entry = {"coarse": [box], "refined": [box], "scores": [.8]}
+        rows, detections, count = evaluate_tile(image, entry, [mask], np.zeros_like(mask), {},
+                                                [box], 1, lambda feature: feature[3] < 0)
+        self.assertEqual(rows, [])
+        self.assertEqual(count, 1)
+        for arm in ("coarse", "refined"):
+            self.assertEqual(detections[arm], [(.8, [])])
+
     def test_batch_pixel_budget_preserves_all_instances(self):
         from types import SimpleNamespace
 
@@ -131,6 +192,16 @@ class WirePipelineTest(unittest.TestCase):
         metric = json.loads(report.read_text())
         self.assertEqual(metric["matched"]["instances"], 2)
         self.assertEqual(metric["swap_target_pairs"], 2)
+        paired_path = self.root / "paired.json"
+        main(["paired", *self.inputs, "--weights", str(weights), "--device", "cpu", "--output", str(paired_path)])
+        paired = json.loads(paired_path.read_text())
+        self.assertEqual(len(paired["paired_instances"]), 2)
+        self.assertEqual(paired["matched"]["swap_pairs"], 2)
+        self.assertEqual(paired["mask_AP_by_IoU"]["refined"], metric["mask_AP_by_IoU"])
+        self.assertEqual(paired["mask_mAP50_95_delta"], 0)
+        self.assertEqual(paired["matched"]["iou_change"]["unchanged"], 2)
+        for delta in paired["matched"]["refined_minus_coarse"].values():
+            self.assertIn(delta, (0, None))
         output = self.root / "pred"
         main(["predict", "--images", str(self.images), "--cache", str(self.cache), "--weights", str(weights),
               "--device", "cpu", "--output", str(output)])

@@ -23,12 +23,16 @@ def parser():
     for name, desc in [("audit", "Measure available geometry and interference without training"),
                        ("train", "Fit only the instance mask head on frozen proposals"),
                        ("eval", "Evaluate all proposals and the matched, exposed subset"),
+                       ("paired", "Compare CA vs Refine geometry with the same frozen axes head and swap pairs"),
                        ("predict", "Export per-instance binary PNG masks and their detections")]:
         cmd = commands.add_parser(name, help=desc)
         cmd.add_argument("--images", required=True)
         cmd.add_argument("--limit", type=int, help="Use evenly spaced tiles for a quick probe")
-        cmd.add_argument("--boxes", choices=("coarse", "refined"), default="refined" if name in {"train","audit"} else None,
-                         help="CA or refined proposal geometry; inference defaults to checkpoint setting")
+        if name == "paired":
+            cmd.set_defaults(boxes="coarse")
+        else:
+            cmd.add_argument("--boxes", choices=("coarse", "refined"), default="refined" if name in {"train","audit"} else None,
+                             help="CA or refined proposal geometry; inference defaults to checkpoint setting")
         cmd.add_argument("--match-iou", type=float, default=0.30, help="Minimum coarse OBB IoU for instance pairing")
         if name == "audit":
             source = cmd.add_mutually_exclusive_group(required=True)
@@ -54,7 +58,7 @@ def parser():
             cmd.add_argument("--epochs", type=int, default=15)
             cmd.add_argument("--lr", type=float, default=0.0003)
             cmd.add_argument("--seed", type=int, default=0)
-        if name in {"predict", "eval"}:
+        if name in {"predict", "eval", "paired"}:
             cmd.add_argument("--weights", required=True)
             cmd.add_argument("--threshold", type=float, default=0.5)
         if name == "eval":
@@ -94,6 +98,10 @@ def main(argv=None):
     else:
         if not 0 < args.threshold < 1:
             cli.error("--threshold must be in (0, 1)")
+        if args.command == "paired":
+            from myscripts.wire_seg.paired import run_paired
+            run_paired(args)
+            return
         from myscripts.wire_seg.learning import run_masks
         run_masks(args)
 

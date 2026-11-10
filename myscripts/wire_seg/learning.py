@@ -208,19 +208,28 @@ class MaskStats:
                 "neighbor_pixel_leakage": self.leaks/self.predicted if self.predicted else None}
 
 
+def load_mask_head(weights, device):
+    checkpoint = torch.load(weights, map_location="cpu", weights_only=True)
+    if checkpoint["format"] != 1:
+        raise ValueError("Unsupported wire mask checkpoint")
+    model = WireMaskHead().to(device).eval()
+    model.load_state_dict(checkpoint["state"])
+    return checkpoint, model
+
+
+def infer_crop(model, feature, device, threshold):
+    return model(plane(feature, device))[0, 0].sigmoid().cpu().numpy() >= threshold
+
+
 @torch.inference_mode()
 def run_masks(args):
     evaluate = args.command == "eval"
     print(f"[{args.command}] loading {args.weights} and {args.cache}", flush=True)
-    checkpoint = torch.load(args.weights, map_location="cpu", weights_only=True)
-    if checkpoint["format"] != 1:
-        raise ValueError("Unsupported wire mask checkpoint")
+    checkpoint, model = load_mask_head(args.weights, args.device)
     args.boxes = args.boxes or checkpoint["boxes"]
     tiles = WireTiles(args, need_labels=evaluate)
     if tiles.provenance != checkpoint["detector"]:
         raise ValueError("Mask checkpoint and cached detector provenance do not match")
-    model = WireMaskHead().to(args.device).eval()
-    model.load_state_dict(checkpoint["state"])
     groups = [source_groups(p.stem) for p in tiles.paths]
     shared_sources = set(s for s, _ in groups).intersection(checkpoint["train_sources"])
     shared_videos = set(v for _, v in groups).intersection(checkpoint["train_videos"])
@@ -239,7 +248,7 @@ def run_masks(args):
             results[path.name] = []
         for i, box in enumerate(boxes):
             crop, feature = example(image, boxes, i, checkpoint["prompt"], checkpoint["margin"])
-            pred = model(plane(feature, args.device))[0, 0].sigmoid().cpu().numpy() >= args.threshold
+            pred = infer_crop(model, feature, args.device, args.threshold)
             restored = crop.restore(Image.fromarray(pred), image.size)
             if not evaluate:
                 file = Path(path.stem) / f"{i:04d}.png"
@@ -283,8 +292,8 @@ def run_masks(args):
                             _, k, other_id = max(choices)
                             swapped = feature.copy()
                             swapped[3:] = np.stack(crop.prompts(boxes, k, checkpoint["prompt"]))
-                            alternative = model(plane(swapped, args.device))[0, 0].sigmoid().cpu().numpy()
-                            switched = np.asarray(crop.restore(Image.fromarray(alternative >= args.threshold), image.size)) & ~void
+                            alternative = infer_crop(model, swapped, args.device, args.threshold)
+                            switched = np.asarray(crop.restore(Image.fromarray(alternative), image.size)) & ~void
                             a, b = target & footprint, masks[other_id] & footprint
                             def iou(mask, truth):
                                 return np.count_nonzero(mask & truth) / max(1, np.count_nonzero(mask | truth))
