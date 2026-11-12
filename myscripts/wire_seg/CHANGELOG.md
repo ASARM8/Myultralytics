@@ -1,5 +1,20 @@
 # 电线实例分割实验变更记录
 
+## 2026-11-12 · 漏分电线诊断资料一键导出
+
+运行 `bash myscripts/run_wire_seg_server.sh export-failures val`，复用现有 axes 权重、候选缓存、邻线对报告和粗框/精修框配对报告。默认选取两根均有掩膜评分、且只有一根达到 IoU 0.50 的邻线对，再按图块、候选和真值编号对漏分一侧去重。当前报告对应 42 条成对记录、37 根独立电线。
+
+输出位于 `/workspace/workdir/wire_seg/failure_diagnostics_val_<时间戳>/`，同时生成同名 `.tar.gz` 归档供下载。归档包含原始图块与标注、输入报告和权重、选中图块的完整候选、预测/真值/漏分掩膜、浮点提示与概率、逐像素数据、汇总表和离线 HTML 图册。重新推理后会核对历史 IoU 与像素计数，任何差异均写入 summary.json 的 reproduction_mismatches。
+
+宽度采用可见真值的细化骨架及距离变换估计，数值受栅格、端点和标注影响。分桶只统计所选漏分实例中的真值像素，不能据此直接判断全数据集误差分布或物理线径。SciPy 是现有工程依赖，导出无需新增环境。
+
+| 文件 | 用途 |
+| --- | --- |
+| myscripts/wire_seg/export_failures.py | 选择漏分实例、复现预测、计算轴线距离/沿线位置/宽度估计、导出图表与压缩包。 |
+| myscripts/run_wire_seg_server.sh | 增加 export-failures 入口，并在 smoke 中纳入导出回归检查。 |
+| tests/test_wire_failure_export.py | 检查实例去重、轴线方向、宽度估计、像素表一致性和完整打包流程。 |
+| myscripts/wire_seg/CHANGELOG.md | 记录选样口径、文件用途和归档位置。 |
+
 ## 2026-11-12 · 四组提示的真值邻线对评估
 
 在已有划分上运行 `bash myscripts/run_wire_seg_server.sh neighbor-pairs val` 或将 `val` 换成 `test`。输入为该划分的缓存和同一运行目录下 target、points、boxes、axes 的四个 mask.pt。候选匹配使用粗框，四组掩膜预测均使用精修框、各候选自己的裁剪及全部邻候选。全程只做推理。
