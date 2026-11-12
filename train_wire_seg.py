@@ -24,12 +24,15 @@ def parser():
                        ("train", "Fit only the instance mask head on frozen proposals"),
                        ("eval", "Evaluate all proposals and the matched, exposed subset"),
                        ("paired", "Compare CA vs Refine geometry with the same frozen axes head and swap pairs"),
+                       ("neighbor-pairs", "Score four frozen heads on all ground-truth neighboring wire pairs"),
                        ("predict", "Export per-instance binary PNG masks and their detections")]:
         cmd = commands.add_parser(name, help=desc)
         cmd.add_argument("--images", required=True)
         cmd.add_argument("--limit", type=int, help="Use evenly spaced tiles for a quick probe")
         if name == "paired":
             cmd.set_defaults(boxes="coarse")
+        elif name == "neighbor-pairs":
+            cmd.set_defaults(boxes="refined")
         else:
             cmd.add_argument("--boxes", choices=("coarse", "refined"), default="refined" if name in {"train","audit"} else None,
                              help="CA or refined proposal geometry; inference defaults to checkpoint setting")
@@ -58,9 +61,12 @@ def parser():
             cmd.add_argument("--epochs", type=int, default=15)
             cmd.add_argument("--lr", type=float, default=0.0003)
             cmd.add_argument("--seed", type=int, default=0)
-        if name in {"predict", "eval", "paired"}:
-            cmd.add_argument("--weights", required=True)
+        if name in {"predict", "eval", "paired", "neighbor-pairs"}:
             cmd.add_argument("--threshold", type=float, default=0.5)
+            if name == "neighbor-pairs":
+                cmd.add_argument("--weights-dir", required=True, help="Parent of target/points/boxes/axes mask.pt directories")
+            else:
+                cmd.add_argument("--weights", required=True)
         if name == "eval":
             cmd.add_argument("--swap-target", action="store_true",
                              help="Also switch identity on the very same crop when a matched neighbor is visible")
@@ -101,6 +107,10 @@ def main(argv=None):
         if args.command == "paired":
             from myscripts.wire_seg.paired import run_paired
             run_paired(args)
+            return
+        if args.command == "neighbor-pairs":
+            from myscripts.wire_seg.neighbor_pairs import run_neighbor_pairs
+            run_neighbor_pairs(args)
             return
         from myscripts.wire_seg.learning import run_masks
         run_masks(args)

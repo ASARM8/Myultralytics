@@ -9,15 +9,55 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from myscripts.wire_seg.data import audit
+from myscripts.wire_seg.data import WireTiles, audit
 from myscripts.wire_seg.batching import InstanceBatches
 from myscripts.wire_seg.geometry import WireCrop, annotations, corners, match_boxes, paint, polygon_box
 from myscripts.wire_seg.paired import evaluate_tile, summarize, validate_geometry
+from myscripts.wire_seg.neighbor_pairs import PROMPTS, evaluate_pairs, summarize_pairs
 from myscripts.wire_seg.proposals import save_json
 from train_wire_seg import main, parser
 
 
 class WireGeometryTest(unittest.TestCase):
+    def test_neighbor_cohort_is_unordered_gt_only_and_keeps_misses(self):
+        size = (80, 80)
+        truth = [[35, y, 40, 2, 0] for y in (16, 21, 26, 30, 65)]
+        masks = [np.asarray(paint(size, [corners(box)])) > 0 for box in truth]
+        # Wire 2 is missed, 3 is entirely void, and 4 is distant.
+        boxes = [truth[1], truth[0], truth[4]]
+        image = Image.new("RGB", size)
+        def empty_mask(prompt, feature):
+            return np.zeros(feature.shape[1:], bool)
+        rows = evaluate_pairs(image, boxes, masks, masks[3], {0: 1, 1: 0, 2: 4}, truth, 12, empty_mask)
+        self.assertEqual([r["truth_ids"] for r in rows], [[0, 1], [0, 2], [1, 2]])
+        self.assertEqual([r["proposal_ids"] for r in rows], [[1, 0], [1, None], [0, None]])
+        self.assertTrue(all(r["near_parallel"] for r in rows))
+        self.assertEqual(rows[1]["mask_ious"]["axes"], [0., None])
+        result = summarize_pairs(rows)
+        self.assertEqual(result["both_detected"], 1)
+        self.assertEqual(result["detection_coverage"], 1/3)
+        missed = evaluate_pairs(image, [], masks, masks[3], {}, truth, 12, empty_mask)
+        self.assertEqual([r["truth_ids"] for r in missed], [r["truth_ids"] for r in rows])
+        axes = summarize_pairs(missed)["by_mask_iou"]["0.50"]["axes"]
+        self.assertEqual(axes["fraction_all"], 0)
+        self.assertIsNone(axes["fraction_both_detected"])
+        self.assertIsNone(summarize_pairs([])["by_mask_iou"]["0.50"]["axes"]["fraction_all"])
+
+    def test_neighbor_thresholds_and_paired_wins(self):
+        rows = [
+            {"proposal_ids": [1, 2], "mask_ious": {p: [.75, .50] for p in PROMPTS}},
+            {"proposal_ids": [1, 3], "mask_ious": {p: [.75, .75] for p in PROMPTS}},
+            {"proposal_ids": [1, None], "mask_ious": {p: [.90, None] for p in PROMPTS}},
+        ]
+        rows[0]["mask_ious"]["points"] = [.75, .49]
+        rows[1]["mask_ious"]["axes"] = [.75, .74]
+        metrics = summarize_pairs(rows)["by_mask_iou"]
+        self.assertEqual(metrics["0.50"]["axes"]["fraction_all"], 2/3)
+        self.assertEqual(metrics["0.50"]["axes"]["fraction_both_detected"], 1)
+        self.assertEqual(metrics["0.50"]["points"]["axes_only"], 1)
+        self.assertEqual(metrics["0.75"]["points"]["comparator_only"], 1)
+        self.assertEqual(metrics["0.75"]["points"]["successful_pairs"], 1)
+
     def test_paired_json_round_trip_with_numpy_iou_deltas(self):
         coarse = {"tile_obb_iou": 0.5, "mask_iou": 0.5, "hits": 1, "covered_target_pixels": 2,
                   "predicted_pixels": 1, "neighbor_pixels": 0, "swap_success": None}
@@ -170,6 +210,34 @@ class WirePipelineTest(unittest.TestCase):
         self.assertEqual(wide["matched"], 2)
         self.assertEqual(wide["targets_with_neighbor_pixels"], 2)
         self.assertEqual(wide["neighbor_detected_fraction"], 1)
+
+    def test_neighbor_matching_retains_original_truth_ids_after_void_filter(self):
+        self.annotation["shapes"].append({"label": "void", "points": [[0, 0], [51, 0], [51, 19], [0, 19]]})
+        save_json(self.jsons / (self.name + ".json"), self.annotation)
+        tiles = WireTiles(parser().parse_args(["audit", *self.inputs]))
+        self.assertEqual(tiles.read(0, match_visible_only=True)[5], {1: 1})
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "Run the four-head inference test on the server")
+    def test_neighbor_pairs_cli_uses_all_four_heads_without_training(self):
+        import torch
+        from myscripts.wire_seg.learning import WireMaskHead
+
+        model = WireMaskHead()
+        for prompt in PROMPTS:
+            folder = self.root / prompt
+            folder.mkdir()
+            torch.save({"format": 1, "prompt": prompt, "boxes": "refined", "margin": 12,
+                        "detector": {"version": 1}, "state": model.state_dict(), "epoch": 15,
+                        "seed": 0, "train_sources": [], "train_videos": []}, folder / "mask.pt")
+        output = self.root / "pairs.json"
+        main(["neighbor-pairs", *self.inputs, "--weights-dir", str(self.root), "--device", "cpu",
+              "--output", str(output)])
+        report = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(report["summary"]["all"]["both_detected"], 1)
+        self.assertEqual(report["summary"]["near_parallel"]["gt_pairs"], 1)
+        self.assertEqual(len(report["pairs"]), 1)
+        self.assertEqual(set(report["pairs"][0]["mask_ious"]), set(PROMPTS))
+        self.assertEqual(report["pairs"][0]["proposal_ids"], [0, 1])
 
     def test_void_and_grouped_pieces(self):
         for shape in self.annotation["shapes"]:

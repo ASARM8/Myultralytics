@@ -10,12 +10,13 @@ usage() {
     echo "       Training controls: WIRE_BATCH, WIRE_BATCH_PIXELS, WIRE_WORKERS, WIRE_AMP (0 or 1)"
     echo "       bash myscripts/run_wire_seg_server.sh eval|predict [target|points|boxes|axes] [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh paired [val|test]"
+    echo "       bash myscripts/run_wire_seg_server.sh neighbor-pairs [val|test]"
 }
 stage=${1:-help}
 case "$stage" in
     help|-h|--help) usage; exit 0 ;;
     smoke) exec python -m unittest discover -s tests -p test_wire_instance_seg.py -v ;;
-    ca|refine|cache|audit|train|bench|eval|predict|paired) ;;
+    ca|refine|cache|audit|train|bench|eval|predict|paired|neighbor-pairs) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -35,7 +36,7 @@ case "$stage" in
         exec python -m myscripts.V3_1_1.train_refine_v311 --data "$config" \
             --ca-weights "$ca" --output-dir "$refine_dir" --device "$gpu"
         ;;
-    cache|audit|paired)
+    cache|audit|paired|neighbor-pairs)
         split=${2:-val}
         ;;
     train|bench|eval|predict)
@@ -51,6 +52,11 @@ jsons="$data/jsons/$split"
 cache="$run/proposals/$split.json"
 
 case "$stage" in
+    neighbor-pairs)
+        if [[ "$split" == train ]]; then usage >&2; exit 2; fi
+        exec python train_wire_seg.py neighbor-pairs --images "$images" --jsons "$jsons" --cache "$cache" \
+            --weights-dir "$run" --device "cuda:$gpu" --output "$run/neighbor_pairs_$split.json"
+        ;;
     paired)
         if [[ "$split" == train ]]; then usage >&2; exit 2; fi
         exec python train_wire_seg.py paired --images "$images" --jsons "$jsons" --cache "$cache" \

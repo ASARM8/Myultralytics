@@ -1,5 +1,19 @@
 # 电线实例分割实验变更记录
 
+## 2026-11-12 · 四组提示的真值邻线对评估
+
+在已有划分上运行 `bash myscripts/run_wire_seg_server.sh neighbor-pairs val` 或将 `val` 换成 `test`。输入为该划分的缓存和同一运行目录下 target、points、boxes、axes 的四个 mask.pt。候选匹配使用粗框，四组掩膜预测均使用精修框、各候选自己的裁剪及全部邻候选。全程只做推理。
+
+同图块中，任一电线的真值 OBB 条带（短边两侧各加 12 像素，长边两端各加 4 像素）包含另一根线至少一个有效独占像素，即计入一个无序真值对。对两根均有独立匹配且各自掩膜 IoU 达到 0.50 或 0.75 的成功对，分别报告占全部真值对、占两根均已匹配真值对的比例。另列方向差不超过 15° 的子集，以及 axes 和各对照单独成功的数量。报告存放在 `/workspace/workdir/wire_seg/neighbor_pairs_<split>.json`，明细中缺失匹配的编号与 IoU 记为 null，已匹配但无命中记为零。
+
+| 文件 | 用途 |
+| --- | --- |
+| myscripts/wire_seg/neighbor_pairs.py | 定义真值邻线对、运行四个冻结分割头、输出逐对 IoU 和统一分母的汇总。 |
+| myscripts/wire_seg/data.py | 允许匹配时跳过完全位于忽略区的标注并保留原实例编号。 |
+| train_wire_seg.py、myscripts/run_wire_seg_server.sh | 提供通用命令行与服务器入口。 |
+| tests/test_wire_instance_seg.py | 验证漏检、对称去重、忽略区、阈值边界以及四权重推理与报告写入。 |
+| myscripts/wire_seg/CHANGELOG.md | 登记版本用途、评价口径与输出位置。 |
+
 ## 2026-11-10 · CA 粗框与精修框的配对分割评估
 
 分支为 `innovation2`，父提交为 `e3e2956a2`。本次修订通过 amend 替换首版 `b8c3bd20d`。可用 `git log --oneline -- myscripts/wire_seg/CHANGELOG.md` 查询修订后的提交号。

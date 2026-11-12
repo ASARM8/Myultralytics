@@ -34,7 +34,7 @@ class WireTiles:
             ids = np.linspace(0, len(self.paths)-1, min(args.limit, len(self.paths)), dtype=int)
             self.paths = [self.paths[i] for i in ids]
 
-    def read(self, index):
+    def read(self, index, *, match_visible_only=False):
         path = self.paths[index]
         with Image.open(path) as source:
             image = source.convert("RGB")
@@ -49,7 +49,13 @@ class WireTiles:
             raise ValueError(f"Inconsistent cache entry for {path}")
         for box in boxes:
             long_axis(box)
-        pairs = match_boxes(coarse, truth, image.size, self.match_iou) if truth else {}
+        if match_visible_only:
+            valid = ~void
+            ids = [j for j, mask in enumerate(masks) if np.any(mask & valid)]
+            matched = match_boxes(coarse, [truth[j] for j in ids], image.size, self.match_iou) if ids else {}
+            pairs = {i: ids[j] for i, j in matched.items()}
+        else:
+            pairs = match_boxes(coarse, truth, image.size, self.match_iou) if truth else {}
         return image, boxes, scores, masks, void, pairs, truth
 
 
