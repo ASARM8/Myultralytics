@@ -11,13 +11,14 @@ usage() {
     echo "       bash myscripts/run_wire_seg_server.sh eval|predict [target|points|boxes|axes] [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh paired [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh neighbor-pairs [val|test]"
+    echo "       bash myscripts/run_wire_seg_server.sh threshold-scan [target|points|boxes|axes] [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh export-failures [val|test]"
 }
 stage=${1:-help}
 case "$stage" in
     help|-h|--help) usage; exit 0 ;;
     smoke) exec python -m unittest discover -s tests -p 'test_wire_*.py' -v ;;
-    ca|refine|cache|audit|train|bench|eval|predict|paired|neighbor-pairs|export-failures) ;;
+    ca|refine|cache|audit|train|bench|eval|predict|paired|neighbor-pairs|export-failures|threshold-scan) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -40,7 +41,7 @@ case "$stage" in
     cache|audit|paired|neighbor-pairs|export-failures)
         split=${2:-val}
         ;;
-    train|bench|eval|predict)
+    train|bench|eval|predict|threshold-scan)
         prompt=${2:-axes}
         case "$prompt" in target|points|boxes|axes) ;; *) usage >&2; exit 2 ;; esac
         split=${3:-val}
@@ -53,6 +54,11 @@ jsons="$data/jsons/$split"
 cache="$run/proposals/$split.json"
 
 case "$stage" in
+    threshold-scan)
+        if [[ "$split" == train ]]; then usage >&2; exit 2; fi
+        exec python -u train_wire_seg.py threshold-scan --images "$images" --jsons "$jsons" --cache "$cache" \
+            --weights "$run/$prompt/mask.pt" --device "cuda:$gpu" --output "$run/$prompt/threshold_scan_$split.json"
+        ;;
     export-failures)
         if [[ "$split" == train ]]; then usage >&2; exit 2; fi
         output="$run/failure_diagnostics_${split}_$(date +%Y%m%d_%H%M%S)"

@@ -55,24 +55,24 @@ def evaluate_pairs(image, boxes, masks, void, matches, truth_boxes, margin, pred
     ]
 
 
-def summarize_pairs(rows):
+def summarize_pairs(rows, prompts=PROMPTS):
     total = len(rows)
     detected = sum(None not in row["proposal_ids"] for row in rows)
     results = {}
     for threshold in IOU_THRESHOLDS:
         key = f"{threshold:.2f}"
-        successes = {p: set() for p in PROMPTS}
+        successes = {p: set() for p in prompts}
         for index, row in enumerate(rows):
             for prompt, (a, b) in row["mask_ious"].items():
                 if a is not None and b is not None and min(a, b) >= threshold:
                     successes[prompt].add(index)
-        axes = successes["axes"]
         by_prompt = {}
         for prompt, passed in successes.items():
             by_prompt[prompt] = {"successful_pairs": len(passed),
                                  "fraction_all": len(passed) / total if total else None,
                                  "fraction_both_detected": len(passed) / detected if detected else None}
-            if prompt != "axes":
+            if prompt != "axes" and "axes" in successes:
+                axes = successes["axes"]
                 by_prompt[prompt]["axes_only"] = len(axes - passed)
                 by_prompt[prompt]["comparator_only"] = len(passed - axes)
         results[key] = by_prompt

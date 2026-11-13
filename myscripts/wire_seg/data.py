@@ -12,6 +12,13 @@ from .geometry import WireCrop, annotations, long_axis, match_boxes
 from .proposals import image_paths
 
 
+def match_visible_boxes(coarse, truth, visible_ids, size, threshold):
+    if not visible_ids:
+        return {}
+    matched = match_boxes(coarse, [truth[j] for j in visible_ids], size, threshold)
+    return {i: visible_ids[j] for i, j in matched.items()}
+
+
 class WireTiles:
     def __init__(self, args, *, need_labels=True):
         self.paths = image_paths(args.images)
@@ -52,8 +59,7 @@ class WireTiles:
         if match_visible_only:
             valid = ~void
             ids = [j for j, mask in enumerate(masks) if np.any(mask & valid)]
-            matched = match_boxes(coarse, [truth[j] for j in ids], image.size, self.match_iou) if ids else {}
-            pairs = {i: ids[j] for i, j in matched.items()}
+            pairs = match_visible_boxes(coarse, truth, ids, image.size, self.match_iou)
         else:
             pairs = match_boxes(coarse, truth, image.size, self.match_iou) if truth else {}
         return image, boxes, scores, masks, void, pairs, truth

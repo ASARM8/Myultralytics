@@ -239,6 +239,31 @@ class WirePipelineTest(unittest.TestCase):
         self.assertEqual(set(report["pairs"][0]["mask_ious"]), set(PROMPTS))
         self.assertEqual(report["pairs"][0]["proposal_ids"], [0, 1])
 
+        # A multi-cutoff pass must reproduce both existing evaluators with only one forward per proposal.
+        from unittest.mock import patch
+        from myscripts.wire_seg.learning import crop_probability
+        weights = str(self.root / "axes" / "mask.pt")
+        scan = self.root / "scan.json"
+        with patch("myscripts.wire_seg.threshold_scan.crop_probability", wraps=crop_probability) as forward:
+            main(["threshold-scan", *self.inputs, "--weights", weights, "--thresholds", "0.25", "0.5",
+                  "--device", "cpu", "--output", str(scan)])
+        self.assertEqual(forward.call_count, len(self.boxes))
+        results = json.loads(scan.read_text())["results"]
+        self.assertEqual([row["mask_threshold"] for row in results], [.25, .5])
+        for row in results:
+            single = self.root / "single.json"
+            main(["eval", *self.inputs, "--weights", weights, "--threshold", str(row["mask_threshold"]),
+                  "--device", "cpu", "--output", str(single)])
+            reference = json.loads(single.read_text())
+            for key in ("mask_AP_by_IoU", "mask_mAP50_95", "matched", "matched_with_neighbors",
+                        "matched_with_neighbor_within_15deg"):
+                self.assertEqual(row[key], reference[key])
+        self.assertEqual(results[1]["pairs"][0]["mask_ious"]["axes"], report["pairs"][0]["mask_ious"]["axes"])
+        for cohort in ("all", "near_parallel"):
+            for cutoff in ("0.50", "0.75"):
+                self.assertEqual(results[1]["neighbor_pairs"][cohort]["by_mask_iou"][cutoff]["axes"],
+                                 report["summary"][cohort]["by_mask_iou"][cutoff]["axes"])
+
     def test_void_and_grouped_pieces(self):
         for shape in self.annotation["shapes"]:
             shape["group_id"] = 7

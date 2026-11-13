@@ -25,13 +25,14 @@ def parser():
                        ("eval", "Evaluate all proposals and the matched, exposed subset"),
                        ("paired", "Compare CA vs Refine geometry with the same frozen axes head and swap pairs"),
                        ("neighbor-pairs", "Score four frozen heads on all ground-truth neighboring wire pairs"),
+                       ("threshold-scan", "Scan mask cutoffs in one pass per proposal using a frozen refined head"),
                        ("predict", "Export per-instance binary PNG masks and their detections")]:
         cmd = commands.add_parser(name, help=desc)
         cmd.add_argument("--images", required=True)
         cmd.add_argument("--limit", type=int, help="Use evenly spaced tiles for a quick probe")
         if name == "paired":
             cmd.set_defaults(boxes="coarse")
-        elif name == "neighbor-pairs":
+        elif name in {"neighbor-pairs", "threshold-scan"}:
             cmd.set_defaults(boxes="refined")
         else:
             cmd.add_argument("--boxes", choices=("coarse", "refined"), default="refined" if name in {"train","audit"} else None,
@@ -67,6 +68,10 @@ def parser():
                 cmd.add_argument("--weights-dir", required=True, help="Parent of target/points/boxes/axes mask.pt directories")
             else:
                 cmd.add_argument("--weights", required=True)
+        if name == "threshold-scan":
+            cmd.add_argument("--weights", required=True)
+            cmd.add_argument("--thresholds", nargs="+", type=float, default=[.1, .2, .3, .4, .5],
+                             help="Distinct mask foreground probabilities, each strictly between 0 and 1")
         if name == "eval":
             cmd.add_argument("--swap-target", action="store_true",
                              help="Also switch identity on the very same crop when a matched neighbor is visible")
@@ -101,6 +106,11 @@ def main(argv=None):
             cli.error("--epochs and --lr must be positive")
         from myscripts.wire_seg.learning import train
         train(args)
+    elif args.command == "threshold-scan":
+        if any(not 0 < t < 1 for t in args.thresholds) or len(set(args.thresholds)) != len(args.thresholds):
+            cli.error("--thresholds must be distinct and in (0, 1)")
+        from myscripts.wire_seg.threshold_scan import run_scan
+        run_scan(args)
     else:
         if not 0 < args.threshold < 1:
             cli.error("--threshold must be in (0, 1)")

@@ -217,8 +217,29 @@ def load_mask_head(weights, device):
     return checkpoint, model
 
 
+def crop_probability(model, feature, device):
+    return model(plane(feature, device))[0, 0].sigmoid().cpu().numpy()
+
+
 def infer_crop(model, feature, device, threshold):
-    return model(plane(feature, device))[0, 0].sigmoid().cpu().numpy() >= threshold
+    return crop_probability(model, feature, device) >= threshold
+
+
+def mask_overlaps(visible, masks):
+    overlaps = []
+    for j, target in enumerate(masks):
+        intersection = np.count_nonzero(visible & target)
+        if intersection:
+            overlaps.append((j, intersection / np.count_nonzero(visible | target)))
+    return sorted(overlaps, key=lambda pair: -pair[1])
+
+
+def neighbor_context(crop, size, others, masks, truth_id, truth_boxes):
+    if crop.crop(Image.fromarray(others), mask=True).getbbox() is None:
+        return None, False
+    footprint = np.asarray(crop.restore(Image.new("1", crop.size, 1), size))
+    neighbors = [j for j, mask in enumerate(masks) if j != truth_id and np.any(mask & others & footprint)]
+    return footprint, near_parallel(truth_id, neighbors, truth_boxes)
 
 
 @torch.inference_mode()
@@ -258,24 +279,17 @@ def run_masks(args):
             visible = np.asarray(restored) & ~void
             if not visible.any() and np.asarray(restored).any():
                 continue  # an entire prediction fell inside ignored pixels
-            overlaps = []
-            for j, target in enumerate(masks):
-                intersection = np.count_nonzero(visible & target)
-                if intersection:
-                    overlaps.append((j, intersection / np.count_nonzero(visible | target)))
-            detections.append((scores[i], index, sorted(overlaps, key=lambda pair: -pair[1])))
+            detections.append((scores[i], index, mask_overlaps(visible, masks)))
             if i in pairs:
                 target = masks[pairs[i]]
                 if not target.any():
                     continue
                 others = (counts > 0) & ~target
                 stats.add(visible, target, others)
-                local_neighbors = crop.crop(Image.fromarray(others), mask=True)
-                if local_neighbors.getbbox() is not None:
+                footprint, is_parallel = neighbor_context(crop, image.size, others, masks, pairs[i], truth_boxes)
+                if footprint is not None:
                     exposed.add(visible, target, others)
-                    footprint = np.asarray(crop.restore(Image.new("1", crop.size, 1), image.size))
-                    neighbors = [j for j, m in enumerate(masks) if j != pairs[i] and np.any(m & ~target & footprint)]
-                    if near_parallel(pairs[i], neighbors, truth_boxes):
+                    if is_parallel:
                         parallel.add(visible, target, others)
                     if args.swap_target:
                         # Choose the matched neighbor with most exclusive visible pixels.

@@ -47,3 +47,18 @@
 | `myscripts/wire_seg/CHANGELOG.md` | 记录版本沿革、实验比较口径、修复原因和文件用途。 |
 
 在服务器的 `/workspace/code` 下执行 `bash myscripts/run_wire_seg_server.sh smoke`，通过后运行 `bash myscripts/run_wire_seg_server.sh paired val`。验证集报告保存在 `/workspace/workdir/wire_seg/axes/paired_geometry_val.json`。
+
+
+## 2026-11-13　完整验证集掩码阈值扫描
+
+基于上一版失败诊断（b5ee1b0e5），在相同权重、候选、置信度和匹配规则下，每个候选只推理一次，按原图概率比较 0.1、0.2、0.3、0.4、0.5 五个前景阈值。按阈值记录 Mask AP、匹配实例像素召回与精确率、邻线泄漏、全部及近平行邻线对的双实例成功率（IoU 0.50 / 0.75）与逐对 IoU。报告附权重及缓存 SHA-256、样本量和训练来源重叠量。
+
+- `myscripts/wire_seg/threshold_scan.py` 实现扫描、进度与 JSON 报告。
+- `myscripts/wire_seg/learning.py` 抽取原评估的概率输出、掩码 IoU 排序和邻线分组，供扫描复用。
+- `myscripts/wire_seg/data.py` 共用可见标注的粗框匹配和原始实例编号。
+- `myscripts/wire_seg/neighbor_pairs.py` 使邻线对汇总支持扫描所选的单组权重。
+- `train_wire_seg.py` 新增 threshold-scan 子命令及自定义阈值校验。
+- `myscripts/run_wire_seg_server.sh` 新增服务器入口，默认 axes、val。
+- `tests/test_wire_instance_seg.py` 对照逐阈值 eval 和 neighbor-pairs，检查每个候选的前向次数。
+
+服务器在 /workspace/code 运行 `bash myscripts/run_wire_seg_server.sh smoke && bash myscripts/run_wire_seg_server.sh threshold-scan axes val`。下载 /workspace/workdir/wire_seg/axes/threshold_scan_val.json。当前记录为实现版本，完整验证集指标由服务器运行产生。
