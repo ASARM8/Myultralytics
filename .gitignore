@@ -154,6 +154,7 @@ wandb/
 .DS_Store
 .mplconfig/
 /_qa_ivc/
+/.report-build/
 
 # Neural Network weights -----------------------------------------------------------------------------------------------
 weights/
