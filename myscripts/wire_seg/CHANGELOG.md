@@ -1,5 +1,22 @@
 # 电线实例分割实验变更记录
 
+## 2026-11-14 · 有限/无限邻线轴线端点约束消融
+
+新增 `axes_infinite` 提示组，与 `axes` 共用有限目标轴线、原图尺度裁剪、邻线集合及高斯宽度，仅将邻线的有限线段距离改为无限支撑直线距离。无限邻线不使用有限线段包围范围进行剔除，以覆盖线段在裁剪外、延长线穿过裁剪的情形。该实验检验邻线端点范围条件，不同时改变目标提示。
+
+服务器运行 `bash myscripts/run_wire_endpoint_ablation.sh`。复用已有 train/val 缓存和 axes 权重，新增一组15轮训练，重新计算两组默认阈值评估（含互换）及多阈值扫描。汇总时核对两组训练元数据及评价队列，输出 finite−infinite 差值和可下载ZIP。原四提示邻线对汇总命令仍按原四组工作；新组的邻线对结果由 threshold-scan 单独计算。
+
+| 文件 | 用途 |
+| --- | --- |
+| geometry.py | 新增仅邻线无限延长的提示构造，原axes保持原行为。 |
+| ../../train_wire_seg.py | 训练入口接受axes_infinite。 |
+| ../run_wire_seg_server.sh | train/eval/threshold-scan等入口接受新提示组。 |
+| ../run_wire_endpoint_ablation.sh | 串行执行服务器测试、新组训练、双组评估与打包。 |
+| endpoint_ablation.py | 核对元数据，汇总原始比例/计数及差值，生成CSV、JSON、ZIP。 |
+| ../../tests/test_wire_endpoint_prompt.py | 覆盖目标保持不变、线段内部一致、端点外延长和远处线段剔除问题。 |
+
+本机只进行语法检查，没有安装依赖或运行模型；几何单元测试与完整smoke由服务器脚本执行。训练轮数、采样队列与运行参数保持一致，直接复用已训练的axes作为有限对照。
+
 ## 2026-11-12 · 漏分电线诊断资料一键导出
 
 运行 `bash myscripts/run_wire_seg_server.sh export-failures val`，复用现有 axes 权重、候选缓存、邻线对报告和粗框/精修框配对报告。默认选取两根均有掩膜评分、且只有一根达到 IoU 0.50 的邻线对，再按图块、候选和真值编号对漏分一侧去重。当前报告对应 42 条成对记录、37 根独立电线。

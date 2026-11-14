@@ -52,7 +52,8 @@ def parser():
             cmd.add_argument("--device", default="cuda:0", help="PyTorch device, e.g. cuda:0 or cpu")
         cmd.add_argument("--output", required=name != "audit", help="Report, model checkpoint or prediction folder")
         if name == "train":
-            cmd.add_argument("--prompt", choices=("target", "points", "boxes", "axes"), default="axes")
+            cmd.add_argument("--prompt", choices=("target", "points", "boxes", "axes", "axes_infinite"), default="axes",
+                             help="axes_infinite removes neighbor endpoint limits; target axis stays finite")
             cmd.add_argument("--batch-size", type=int, default=1, help="Maximum proposals per optimizer update")
             cmd.add_argument("--max-batch-pixels", type=int, default=2097152,
                              help="Maximum padded crop pixels per batch; a larger single crop runs alone")

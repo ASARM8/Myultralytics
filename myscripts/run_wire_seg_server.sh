@@ -7,6 +7,7 @@ usage() {
     echo "Usage: bash myscripts/run_wire_seg_server.sh ca|refine|smoke"
     echo "       bash myscripts/run_wire_seg_server.sh cache|audit [train|val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh train|bench [target|points|boxes|axes]"
+    echo "       Prompt axes_infinite is also supported (infinite neighbor axes, finite target)."
     echo "       Training controls: WIRE_BATCH, WIRE_BATCH_PIXELS, WIRE_WORKERS, WIRE_AMP (0 or 1)"
     echo "       bash myscripts/run_wire_seg_server.sh eval|predict [target|points|boxes|axes] [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh paired [val|test]"
@@ -46,7 +47,7 @@ case "$stage" in
         ;;
     train|bench|eval|predict|threshold-scan|profile)
         prompt=${2:-axes}
-        case "$prompt" in target|points|boxes|axes) ;; *) usage >&2; exit 2 ;; esac
+        case "$prompt" in target|points|boxes|axes|axes_infinite) ;; *) usage >&2; exit 2 ;; esac
         split=${3:-val}
         if [[ "$stage" == train || "$stage" == bench ]]; then split=train; fi
         ;;

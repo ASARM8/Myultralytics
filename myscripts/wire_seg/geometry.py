@@ -149,7 +149,7 @@ class WireCrop:
         return mask.transform(size, Image.Transform.AFFINE, self.inverse.ravel(), Image.Resampling.NEAREST)
 
     def prompts(self, boxes, target, kind):
-        """Soft distances to finite segments. Neighbors are other post-NMS predictions."""
+        """Finite target axis; optionally remove only neighbors' endpoint constraint."""
         xx = np.arange(self.size[0], dtype=np.float32)[None, :] + 0.5
         yy = np.arange(self.size[1], dtype=np.float32)[:, None] + 0.5
         target_map = np.zeros(self.size[::-1], np.float32)
@@ -161,13 +161,18 @@ class WireCrop:
             center = self.inverse[:, :2] @ (center + 0.5) + self.inverse[:, 2]
             along = self.inverse[:, :2] @ along
             sigma = max(1.5, min(width / 2, 6))
+            infinite = i != target and kind == "axes_infinite"
             radius = abs(along) * length / 2 + width / 2 + 5 * sigma
-            if np.any(center + radius < 0) or np.any(center - radius > self.size):
+            # A remote finite segment may still have an infinite supporting line
+            # crossing this crop. Do not reject that line by segment bounds.
+            if not infinite and (np.any(center + radius < 0) or np.any(center - radius > self.size)):
                 continue
             dx, dy = xx - center[0], yy - center[1]
             u = along[0] * dx + along[1] * dy
             v = -along[1] * dx + along[0] * dy
             end = np.maximum(np.abs(u) - length / 2, 0)
+            if infinite:
+                end = np.zeros_like(end)
             if i != target and kind == "boxes":
                 field = (end == 0) & (np.abs(v) <= width / 2)
             else:
