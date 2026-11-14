@@ -29,8 +29,58 @@ def save_json(path, data):
         Path(f.name).unlink(missing_ok=True)
 
 
-def cache_proposals(args):
+def infer_frame(bundle, image, wire_class, measure=None):
+    """Run the same online geometry path for cache creation and timing.
+
+    ``measure(name, operation)`` optionally times a stage without changing its
+    outputs. Coordinates, class filtering and residual gain match the cache.
+    """
     import cv2
+    import torch
+    from myscripts.V3_1_1_low_gain.config import DEFAULT_RESIDUAL_SCALE
+
+    measure = measure or (lambda _name, operation: operation())
+    w, h = image.size
+    gain = 640 / max(h, w)
+    rw, rh = max(1, round(w * gain)), max(1, round(h * gain))
+    left, top = (640 - rw) // 2, (640 - rh) // 2
+
+    def prepare():
+        canvas = np.full((640, 640, 3), 114, np.uint8)
+        canvas[top:top + rh, left:left + rw] = cv2.resize(
+            np.asarray(image), (rw, rh), interpolation=cv2.INTER_LINEAR)
+        return torch.from_numpy(canvas).permute(2, 0, 1)[None]
+
+    batch = measure("detector_input_ms", prepare)
+    imgs, p2, p3, detections = measure("detector_and_nms_ms", lambda: bundle.extractor.infer({"img": batch}))
+    detection = detections[0]
+    boxes, scores = detection["bboxes"], detection["conf"]
+
+    def refine():
+        if not len(boxes):
+            return boxes.clone()
+        output = bundle.refiner(p2, p3, boxes[None], scores[None], imgs.shape[2:])
+        return bundle.refiner.apply_residual(boxes, DEFAULT_RESIDUAL_SCALE * output["residual"][0])
+
+    refined = measure("refine_ms", refine)
+
+    def download():
+        keep = detection["cls"] == wire_class
+
+        def pixels(tensor):
+            original = tensor[keep].float().clone()
+            original[:, 0] -= left
+            original[:, 1] -= top
+            original[:, :4] /= gain
+            return original.cpu().tolist()
+
+        return {"size": [w, h], "coarse": pixels(boxes), "refined": pixels(refined),
+                "scores": scores[keep].cpu().tolist()}
+
+    return measure("geometry_transfer_ms", download), tuple(imgs.shape[2:])
+
+
+def cache_proposals(args):
     import torch
     from myscripts.V3_1_1.evidence_runtime import load_refine_bundle
     from myscripts.V3_1_1_low_gain.config import DEFAULT_RESIDUAL_SCALE
@@ -48,31 +98,8 @@ def cache_proposals(args):
         with torch.inference_mode():
             for path in paths:
                 with Image.open(path) as source:
-                    rgb = np.asarray(source.convert("RGB"))
-                h, w = rgb.shape[:2]
-                gain = 640 / max(h, w)
-                rw, rh = max(1, round(w * gain)), max(1, round(h * gain))
-                left, top = (640-rw)//2, (640-rh)//2
-                canvas = np.full((640, 640, 3), 114, np.uint8)
-                canvas[top:top+rh, left:left+rw] = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_LINEAR)
-                batch = torch.from_numpy(canvas).permute(2, 0, 1)[None]
-                imgs, p2, p3, detections = bundle.extractor.infer({"img": batch})
-                detection = detections[0]
-                boxes = detection["bboxes"]
-                scores = detection["conf"]
-                refined = boxes.clone()
-                if len(boxes):
-                    output = bundle.refiner(p2, p3, boxes[None], scores[None], imgs.shape[2:])
-                    refined = bundle.refiner.apply_residual(boxes, DEFAULT_RESIDUAL_SCALE * output["residual"][0])
-                keep = detection["cls"] == wire_class
-                def pixels(tensor):
-                    original = tensor[keep].float().clone()
-                    original[:, 0] -= left
-                    original[:, 1] -= top
-                    original[:, :4] /= gain
-                    return original.cpu().tolist()
-                frames[path.name] = {"size": [w, h], "coarse": pixels(boxes), "refined": pixels(refined),
-                                     "scores": scores[keep].cpu().tolist()}
+                    image = source.convert("RGB")
+                frames[path.name], _ = infer_frame(bundle, image, wire_class)
         save_json(args.output, {"version": 1, "ca_sha256": bundle.ca_hash, "refine_sha256": bundle.checkpoint_hash,
                                 "scale": DEFAULT_RESIDUAL_SCALE, "wire_class": wire_class, "frames": frames})
     finally:

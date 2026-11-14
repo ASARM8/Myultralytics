@@ -13,12 +13,15 @@ usage() {
     echo "       bash myscripts/run_wire_seg_server.sh neighbor-pairs [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh threshold-scan [target|points|boxes|axes] [val|test]"
     echo "       bash myscripts/run_wire_seg_server.sh export-failures [val|test]"
+    echo "       bash myscripts/run_wire_seg_server.sh profile [target|points|boxes|axes] [val|test]"
+    echo "       Profiling controls: WIRE_PROFILE_LIMIT, WIRE_PROFILE_WARMUP, WIRE_PROFILE_REPEATS, WIRE_PROFILE_STAGE_REPEATS"
+    echo "                           WIRE_PROFILE_CPU_THREADS, WIRE_PROFILE_THRESHOLD"
 }
 stage=${1:-help}
 case "$stage" in
     help|-h|--help) usage; exit 0 ;;
     smoke) exec python -m unittest discover -s tests -p 'test_wire_*.py' -v ;;
-    ca|refine|cache|audit|train|bench|eval|predict|paired|neighbor-pairs|export-failures|threshold-scan) ;;
+    ca|refine|cache|audit|train|bench|eval|predict|paired|neighbor-pairs|export-failures|threshold-scan|profile) ;;
     *) usage >&2; exit 2 ;;
 esac
 
@@ -41,7 +44,7 @@ case "$stage" in
     cache|audit|paired|neighbor-pairs|export-failures)
         split=${2:-val}
         ;;
-    train|bench|eval|predict|threshold-scan)
+    train|bench|eval|predict|threshold-scan|profile)
         prompt=${2:-axes}
         case "$prompt" in target|points|boxes|axes) ;; *) usage >&2; exit 2 ;; esac
         split=${3:-val}
@@ -54,6 +57,16 @@ jsons="$data/jsons/$split"
 cache="$run/proposals/$split.json"
 
 case "$stage" in
+    profile)
+        if [[ "$split" == train ]]; then usage >&2; exit 2; fi
+        refine=${REFINE_WEIGHTS:-"$(python -m myscripts.workspace_ttpla refine-dir)/checkpoints/best.pt"}
+        output="$run/efficiency_${prompt}_${split}_$(date +%Y%m%d_%H%M%S)"
+        exec python -u -m myscripts.wire_seg.profile_pipeline --images "$images" --ca "$ca" --refine "$refine" \
+            --weights "$run/$prompt/mask.pt" --cache "$cache" --device "$gpu" --output-dir "$output" \
+            --limit "${WIRE_PROFILE_LIMIT:-0}" --warmup "${WIRE_PROFILE_WARMUP:-50}" \
+            --repeats "${WIRE_PROFILE_REPEATS:-3}" --stage-repeats "${WIRE_PROFILE_STAGE_REPEATS:-1}" \
+            --cpu-threads "${WIRE_PROFILE_CPU_THREADS:-1}" --threshold "${WIRE_PROFILE_THRESHOLD:-0.5}"
+        ;;
     threshold-scan)
         if [[ "$split" == train ]]; then usage >&2; exit 2; fi
         exec python -u train_wire_seg.py threshold-scan --images "$images" --jsons "$jsons" --cache "$cache" \
